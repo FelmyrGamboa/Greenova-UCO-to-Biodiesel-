@@ -13,18 +13,34 @@ export default function Register() {
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [errors, setErrors] = useState<{name?: string, email?: string, password?: string, confirm?: string}>({});
+  const [nameError, setNameError] = useState('');
+  const [emailError, setEmailError] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const [confirmError, setConfirmError] = useState('');
 
   if (user) return <Navigate to="/dashboard" replace />;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError('');
-    if (!name.trim()) { setError('Full name is required.'); return; }
-    if (!email) { setError('Email address is required.'); return; }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
-    if (password.length < 6) { setError('Password must be at least 6 characters.'); return; }
-    if (password !== confirm) { setError('Passwords do not match.'); return; }
-    if (!agreed) { setError('Please agree to the Terms and Privacy Policy.'); return; }
+    setErrors({});
+    const newErrors: {
+      name?: string,
+      email?: string,
+      password?: string,
+      confirm?: string,
+    } = {};
+
+    if (!name.trim()) { newErrors.name = 'Full name is required.'; }
+    if (!email) { newErrors.email = 'Email address is required.'; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { newErrors.email = 'Please enter a valid email address.';}
+    if (password.length < 6) { newErrors.password = 'Password must be at least 6 characters.';}
+    if (password !== confirm) { newErrors.password = 'Passwords do not match.'; }
+    if (!agreed) { setError('Please agree to the Terms and Privacy Policy.'); }
+    
+    setErrors(newErrors);
+    if (Object.keys(newErrors).length > 0) return;
     setLoading(true);
     const res = await register(name, email, password);
     setLoading(false);
@@ -47,28 +63,40 @@ export default function Register() {
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="gv-label">Full Name</label>
-              <input type="text" placeholder="Juan Dela Cruz" value={name} onChange={(e) => setName(e.target.value)} className="gv-input" autoComplete="name" />
+              <label className="gv-label">Full Name <span className="text-red-400"> * </span></label>
+              <input type="text" placeholder="Juan Dela Cruz" value={name} onChange={(e) => setName(e.target.value)}
+                className={`gv-input ${errors.name ? "!border-red-500" : ""} pr-100`} autoComplete="name" />
+              {errors.name && (
+                <p className='text-red-400 text-xs mt-1.5'>
+                  {errors.name}
+                </p>
+              )}
             </div>
 
             <div>
-              <label className="gv-label">Email Address</label>
-              <input type="email" placeholder="juan.delacruz@example.com" value={email} onChange={(e) => setEmail(e.target.value)} className="gv-input" autoComplete="email" />
+              <label className="gv-label">Email Address <span className="text-red-400"> * </span></label>
+              <input type="email" placeholder="juan.delacruz@example.com" value={email} onChange={(e) => setEmail(e.target.value)}
+                className={`gv-input ${errors.email ? "!border-red-500" : ""} pr-100`} autoComplete="email" />
+              {errors.email && (
+                <p className='text-red-400 text-xs mt-1.5'>
+                  {errors.email}
+                </p>
+              )}
             </div>
 
             <div>
-              <label className="gv-label">Password</label>
+              <label className="gv-label">Password <span className="text-red-400"> * </span></label>
               <div className="relative">
                 <input
                   type={showPw ? 'text' : 'password'}
                   placeholder="Min. 6 characters"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="gv-input pr-10"
+                  className={`gv-input ${errors.password ? "!border-red-500" : ""} pr-100`}
                   autoComplete="new-password"
                 />
                 <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300" tabIndex={-1}>
-                  {showPw ? (
+                  {!showPw ? (
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
                       <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24" strokeLinecap="round" /><path d="M1 1l22 22" strokeLinecap="round" />
                     </svg>
@@ -79,11 +107,22 @@ export default function Register() {
                   )}
                 </button>
               </div>
+              {errors.password && (
+                <p className='text-red-400 text-xs mt-1.5'>
+                  {errors.password}
+                </p>
+                )}
             </div>
 
             <div>
-              <label className="gv-label">Confirm Password</label>
-              <input type="password" placeholder="Repeat password" value={confirm} onChange={(e) => setConfirm(e.target.value)} className="gv-input" autoComplete="new-password" />
+              <label className="gv-label">Confirm Password <span className="text-red-400"> * </span></label>
+              <input type="password" placeholder="Repeat password" value={confirm} onChange={(e) => setConfirm(e.target.value)}
+                className={`gv-input ${errors.password ? "!border-red-500" : ""} pr-100`} autoComplete="new-password" />
+              {errors.password && (
+                <p className='text-red-400 text-xs mt-1.5'>
+                  {errors.password}
+                </p>
+              )}
             </div>
 
             <label className="flex items-start gap-3 cursor-pointer">
@@ -96,9 +135,9 @@ export default function Register() {
               </span>
             </label>
 
-            {error && (
+            {/* {error && (
               <div className="glass rounded-lg px-3 py-2.5 border border-red-500/20 text-red-400 text-sm">{error}</div>
-            )}
+            )} */}
 
             <button type="submit" disabled={loading} className="btn-primary w-full justify-center py-3">
               {loading ? (

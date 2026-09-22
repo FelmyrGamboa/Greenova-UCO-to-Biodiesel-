@@ -26,7 +26,6 @@ export default function Login() {
     } = {};
     // setEmailError('');
     // setPasswordError('');
-    let hasError = false;
     if (!email.trim()) { newErrors.email = 'Email address is required.';}
     if (!password.trim()) { newErrors.password = 'Password is required.';}
     setErrors(newErrors);
