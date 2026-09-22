@@ -11,23 +11,31 @@ export default function Login() {
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [emailError, setEmailError] = useState('');
-  const [passwordError, setPasswordError] = useState('');
+  const [errors, setErrors] = useState<{email?: string, password?: string}>({});
+  // const [emailError, setEmailError] = useState('');
+  // const [passwordError, setPasswordError] = useState('');
 
   if (user) return <Navigate to="/dashboard" replace />;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    setError('');
-    setEmailError('');
-    setPasswordError('');
+    setErrors({});
+    const newErrors: {
+      email?: string,
+      password?: string
+    } = {};
+    // setEmailError('');
+    // setPasswordError('');
     let hasError = false;
-    if (!email) { setEmailError('Email address is required.'); hasError = true; }
-    if (!password) { setPasswordError('Password is required.'); hasError  = true; }
-    if (hasError) return;
+    if (!email.trim()) { newErrors.email = 'Email address is required.';}
+    if (!password.trim()) { newErrors.password = 'Password is required.';}
+    setErrors(newErrors);
+    if (Object.keys(newErrors).length > 0) return;
+
     setLoading(true);
     const res = await login(email, password);
     setLoading(false);
+
     if (res.ok) navigate('/dashboard');
     else setError(res.error ?? 'Login failed.');
   }
@@ -110,12 +118,12 @@ export default function Login() {
                 placeholder="Enter your email address"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className={`gv-input ${emailError ? "!border-red-500" : ""}`}
+                className={`gv-input ${errors.email ? "!border-red-500" : ""}`}
                 autoComplete="email"
               />
-              {emailError && (
+              {errors.email && (
                 <p className='text-red-400 text-xs mt-1.5'>
-                  {emailError}
+                  {errors.email}
                 </p>
               )}
             </div>
@@ -134,7 +142,7 @@ export default function Login() {
                   placeholder="Enter your password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className={`gv-input ${passwordError ? "!border-red-500" : ""} pr-100`}
+                  className={`gv-input ${errors.password ? "!border-red-500" : ""} pr-100`}
                   autoComplete="current-password"
                 />
                 <button
@@ -154,9 +162,9 @@ export default function Login() {
                   )}
                 </button>
               </div>
-              {passwordError && (
+              {errors.password && (
                 <p className='text-red-400 text-xs mt-1.5'>
-                  {passwordError}
+                  {errors.password}
                 </p>
               )}
             </div>
