@@ -1,15 +1,4 @@
 """Greenova backend. Start it with:  uvicorn app.main:app --host 0.0.0.0 --port 8000"""
-import os
-import sys
-
-# Support running with: python3 app/main.py
-if __name__ == "__main__" and not __package__:
-    sys.path.insert(
-        0,
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    __package__ = "app"
-
 import asyncio
 import uvicorn
 import logging
@@ -19,11 +8,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from app import config, db
-from app.api import auto_start_purification, router
-from app.hardware import create_hardware
-from app.purification import PurificationRunner
-from app.stages import StageRunner
+from . import config, db
+from .api import auto_start_purification, router
+from .hardware import create_hardware
+from .purification import PurificationRunner
+from .stages import StageRunner
 
 log = logging.getLogger("greenova")
 
@@ -98,7 +87,7 @@ if config.FRONTEND_DIR.is_dir():
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        "app.main:app",
         host="0.0.0.0",
         port=8000,
         reload=False,
