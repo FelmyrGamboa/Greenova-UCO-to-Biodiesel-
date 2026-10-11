@@ -1,6 +1,5 @@
 """Greenova backend. Start it with:  uvicorn app.main:app --host 0.0.0.0 --port 8000"""
 import asyncio
-import uvicorn
 import logging
 from contextlib import asynccontextmanager
 
@@ -84,11 +83,3 @@ if config.FRONTEND_DIR.is_dir():
         if full_path and file.is_file() and frontend in file.parents:
             return FileResponse(file)
         return FileResponse(frontend / "index.html")   # let the website handle its own pages
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-    )
