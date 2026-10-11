@@ -63,7 +63,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           >
             <GreenovaLogo size="md" />
           </Link>
-          <Button variant="ghost" className="nav-close-button lg:hidden" onClick={onClose} aria-label="Close navigation">×</Button>
+          <Button variant="ghost" className="!p-2 lg:hidden" onClick={onClose} aria-label="Close navigation">×</Button>
         </div>
         <nav className="flex-1 px-3 py-6">
           <div className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-600">Workspace</div>

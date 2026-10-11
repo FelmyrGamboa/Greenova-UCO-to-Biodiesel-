@@ -542,14 +542,3 @@ html[data-theme="light"] *::-webkit-scrollbar-thumb {
 html[data-theme="light"] *::-webkit-scrollbar-track {
   background: rgba(0, 0, 0, 0.04) !important;
 }
-
-
-.nav-close-button {
-  padding: 0.5rem !important;
-}
-
-@media screen and (min-width: 1024px) {
-  .nav-close-button {
-    display: none;
-  }
-}
