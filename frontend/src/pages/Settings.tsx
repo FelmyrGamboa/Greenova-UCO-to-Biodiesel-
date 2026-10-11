@@ -22,7 +22,8 @@ export default function Settings() {
   const [systemName, setSystemName] = useState(String(initialSettings.systemName || "Greenova Production System"));
   const [operator, setOperator] = useState(String(initialSettings.operator || "Operator 01"));
   const [units, setUnits] = useState(String(initialSettings.units || "metric"));
-  const [format, setFormat] = useState(String(initialSettings.format || "B-{YEAR}-{SEQ}"));
+  // const [format, setFormat] = useState(String(initialSettings.format || "B-{YEAR}-{SEQ}"));
+  const [format, setFormat] = useState(String());
   const [purificationTargetTemperature, setPurificationTargetTemperature] = useState(
     String(initialSettings.purificationTargetTemperature || 70),
   );
@@ -153,7 +154,7 @@ export default function Settings() {
           <Field label="Temperature" placeholder="Project-defined" unit="°C" />
           <Field label="Reaction time" placeholder="Project-defined" unit="min" />
           <Field label="Stirring speed" placeholder="Project-defined" unit="RPM" />
-          <Field label="Batch naming format" value={format} onChange={(event) => setFormat(event.target.value)} />
+          <Field label="Batch naming format" value={format} placeholder="B-{YEAR}-{SEQ}" onChange={(event) => setFormat(event.target.value)} />
         </div>
       </Card>
 
