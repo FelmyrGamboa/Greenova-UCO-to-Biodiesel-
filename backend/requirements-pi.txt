@@ -1,0 +1,2 @@
+# Only on the Raspberry Pi (gpiozero and lgpio come from apt: python3-gpiozero python3-lgpio)
+adafruit-circuitpython-tcs34725
