@@ -57,7 +57,18 @@ class Settings(CamelModel):
     drain_time: float = 3                     # minutes at most, valve open after the flow, so the bed drains
     heating_timeout: float = 10               # minutes to reach the target before it stops (expected: about 1 min)
     purification_auto_start: bool = True      # start by itself after separation, once the level switch sees biodiesel
-    ffa_range_boundaries: str = "0,2,4,6,8,10"
+    purification_stirring_speed: float = 300  # RPM of the dry wash stirrer during heating and hold (0 = off)
+    # Esterification: the FFA strip reads only up to strip_max_ffa, so every batch above the
+    # threshold gets one uniform dose, calculated as if the oil had esterification_design_ffa.
+    esterification_design_ffa: float = 10     # %
+    strip_max_ffa: float = 5                  # %, the strip's darkest color
+    # Dosing pumps (A: NaOH/KOH + methanol, B: H2SO4 + methanol) and outlet valves
+    pump_catalyst_rate: float = 100           # mL/min of pump A, for its time limit (and dosing without a load cell)
+    pump_acid_rate: float = 100               # mL/min of pump B
+    reactor_drain_time: float = 3             # minutes the reactor outlet stays open after transesterification
+    centrifuge_drain_time: float = 3          # minutes the centrifuge outlet stays open after separation
+    centrifuge_spin_down_time: float = 30     # seconds to wait for the centrifuge to stop when there's no RPM reading
+    ffa_range_boundaries: str = "0,2,4,5"
     proven_batch_count: int = 3
     proven_yield_tolerance: float = 2         # ± percentage points
     oil_price: float = 45                     # ₱/L
@@ -95,7 +106,15 @@ class Settings(CamelModel):
     minimum_flow_time: float = 2              # minutes; shortest mesh bed flow, for very small batches
     stirrer_max_rpm: float = 900              # RPM at full PWM, for the open-loop speed setting
     centrifuge_max_rpm: float = 3000
+    purification_stirrer_max_rpm: float = 600
+    pump_no_flow_seconds: float = 20          # a pump stops with a fault when the load cell doesn't rise for this long
     heater_power_watts: float = 0             # set it to include heater energy in "energy"
+
+    @field_validator("batch_format", mode="before")
+    @classmethod
+    def _blank_format_is_default(cls, value):
+        """An empty batch naming format would give IDs like "-001": use the default instead."""
+        return value if isinstance(value, str) and value.strip() else "B-{YEAR}-{SEQ}"
 
     @field_validator("ffa_range_boundaries", mode="before")
     @classmethod
@@ -118,6 +137,13 @@ class Settings(CamelModel):
             raise ValueError("purificationHoldTime and drainTime can't be negative.")
         if self.heating_timeout <= 0:
             raise ValueError("heatingTimeout must be more than 0 min.")
+        if not self.ffa_threshold < self.esterification_design_ffa <= 30:
+            raise ValueError("esterificationDesignFfa must be above the 4% threshold and at most 30%.")
+        if self.pump_catalyst_rate <= 0 or self.pump_acid_rate <= 0:
+            raise ValueError("Pump rates must be more than 0 mL/min.")
+        if (self.reactor_drain_time < 0 or self.centrifuge_drain_time < 0 or self.centrifuge_spin_down_time < 0
+                or self.purification_stirring_speed < 0):
+            raise ValueError("Drain times and the stirring speed can't be negative.")
         return self
 
     def planned_flow_seconds(self, biodiesel_ml: Optional[float]) -> int:
@@ -161,12 +187,14 @@ class PurificationRecord(CamelModel):
     safety_stop_occurred: bool = False
     safety_stop_reason: Optional[str] = None
     output_weight_g: Optional[float] = None
+    stirring_speed: Optional[float] = None    # dry wash stirrer RPM during heating and hold
 
 
 class EsterificationStage(CamelModel):
     stage: int = Field(ge=1)
     ffa_before: float
     ffa_after: Optional[float] = None
+    dose_ffa: Optional[float] = None           # FFA the dose was calculated for (the uniform design FFA in stage 1)
     methanol_ml: float
     sulfuric_acid_ml: float
     acetone_ml: float = 0
@@ -188,6 +216,7 @@ class Batch(CamelModel):
     lab_result: LabResult = "Pending"
     lab_reference: Optional[str] = None
     ffa: float = 0
+    ffa_above_strip: bool = False              # the strip showed its darkest color: FFA is at least ffa
     esterification_run: bool = False
     temperature: float = 0                     # average reaction temperature, °C
     reaction_time: float = 0                   # transesterification minutes
@@ -262,6 +291,33 @@ class PurificationStart(CamelModel):
 
 class DemoOilIn(CamelModel):
     volume_ml: float = Field(gt=0, le=2000)
+
+
+class DemoAddIn(CamelModel):
+    """Demo mode: put something on a simulated load cell (e.g. acetone poured into the reactor)."""
+    place: Literal["reactor", "purificationTank"] = "reactor"
+    grams: float = Field(gt=0, le=3000)
+
+
+class PumpStart(CamelModel):
+    """Load one dose with a dosing pump. The pump stops when the reactor load cell has risen by
+    target_g (or, without a load cell, after volume_ml at the pump's rate)."""
+    pump: Literal["catalyst", "acid"]
+    target_g: float = Field(gt=0, le=2500)
+    volume_ml: float = Field(gt=0, le=3000)
+    batch_id: Optional[str] = None
+    stage: Optional[str] = None
+
+
+class DrainStart(CamelModel):
+    """Open an outlet valve again for its drain time (when something is left behind)."""
+    valve: Literal["reactor_outlet", "centrifuge_outlet"]
+    batch_id: Optional[str] = None
+
+
+class PumpIn(CamelModel):
+    name: Literal["catalyst", "acid"]
+    on: bool
 
 
 class SwitchIn(CamelModel):

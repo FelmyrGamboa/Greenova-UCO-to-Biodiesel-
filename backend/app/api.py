@@ -9,11 +9,13 @@ from fastapi import APIRouter, Body, HTTPException, Request, WebSocket, WebSocke
 from pydantic import ValidationError
 
 from . import analytics, calculations, config, db, system
-from .hardware import InterlockError
-from .models import (AfterEsterificationRequest, Batch, BatchIn, CalculateRequest, DemoOilIn,
-                     EsterificationStage, LabResultIn, MotorIn, PurificationRecord, PurificationStart,
-                     Settings, StageStart, SwitchIn, TimelineEvent, ValveIn)
+from .hardware import PUMP_LABELS, VALVE_LABELS, InterlockError
+from .models import (AfterEsterificationRequest, Batch, BatchIn, CalculateRequest, DemoAddIn, DemoOilIn,
+                     DrainStart, EsterificationStage, LabResultIn, MotorIn, PumpIn, PumpStart,
+                     PurificationRecord, PurificationStart, Settings, StageStart, SwitchIn, TimelineEvent,
+                     ValveIn)
 from .stages import REACTIONS, StageError
+from .transfers import TransferError
 
 router = APIRouter(prefix="/api")
 
@@ -38,8 +40,28 @@ def _live(app) -> dict:
     return {"mock": config.MOCK, "timestamp": datetime.now().isoformat(timespec="seconds"),
             "sensors": app.state.hw.read(), "alarm": app.state.alarm,
             "stage": app.state.stage.state, "purification": app.state.purification.state,
+            "pump": app.state.pump.state, "drain": app.state.drain.state,
             # batch ID waiting to start purification by itself (after separation), or None
             "purificationAutoStart": getattr(app.state, "purification_armed", None)}
+
+
+def _event(app, batch_id: Optional[str], label: str) -> None:
+    """Adds a line to the batch's timeline (saved batch, or measurements waiting for the save)."""
+    if not batch_id:
+        return
+    event = {"label": label, "time": datetime.now().isoformat()}
+    saved = db.get_batch(batch_id)
+    if saved is not None:
+        saved.timeline.append(TimelineEvent.model_validate(event))
+        db.save_batch(saved)
+    else:
+        _pending(app, batch_id)["timeline"].append(event)
+
+
+async def stop_transfers(app, reason: str) -> None:
+    """Stops a dosing pump and closes a draining valve (emergency stop, shutdown)."""
+    await app.state.pump.stop(reason)
+    await app.state.drain.stop(reason)
 
 
 def _pending(app, batch_id: str) -> dict:
@@ -111,7 +133,8 @@ def process_config(request: Request):
                      "convention": "Molar methanol-to-triglyceride-oil ratio"},
         "catalyst": {"loadingDefault": s.catalyst_loading, "kohPurity": s.koh_purity, "naohPurity": s.naoh_purity},
         "acetone": {"volumeFractionDefault": s.acetone_fraction, "provisional": True},
-        "esterification": {**s.esterification.dump(), "sulfuricAcidMlPerGramFfa": calculations.H2SO4_ML_PER_G_FFA},
+        "esterification": {**s.esterification.dump(), "sulfuricAcidMlPerGramFfa": calculations.H2SO4_ML_PER_G_FFA,
+                           "designFfa": s.esterification_design_ffa, "stripMaxFfa": s.strip_max_ffa},
         "transesterification": s.transesterification.dump(),
         "separation": {"timeMinutes": s.separation_time, "speedRpm": s.separation_speed},
         "purification": {"targetTemperature": s.purification_target_temperature,
@@ -122,7 +145,12 @@ def process_config(request: Request):
                          "drainTimeMinutes": s.drain_time,
                          "heatingTimeoutMinutes": s.heating_timeout,
                          "automatic": s.purification_auto_start,
+                         "stirringSpeedRpm": s.purification_stirring_speed,
                          "targetRange": {"min": 40, "max": 70}},
+        "pumps": {"catalystRateMlPerMinute": s.pump_catalyst_rate, "acidRateMlPerMinute": s.pump_acid_rate,
+                  "noFlowSeconds": s.pump_no_flow_seconds},
+        "drains": {"reactorMinutes": s.reactor_drain_time, "centrifugeMinutes": s.centrifuge_drain_time,
+                   "centrifugeSpinDownSeconds": s.centrifuge_spin_down_time},
         "reactionMaximumTemperature": s.reaction_maximum_temperature,
     }
 
@@ -146,10 +174,17 @@ def put_settings(request: Request, updates: dict[str, Any] = Body(...)):
     return new.dump()
 
 
+@router.get("/network")
+def network():
+    """Addresses a phone on the same Wi-Fi can use to reach this computer ("Open on phone")."""
+    return {"addresses": system.lan_addresses()}
+
+
 @router.get("/system/status")
 def system_status(request: Request):
     app = request.app
-    return system.status(app.state.hw.read(), app.state.stage.state, app.state.purification.state)
+    return system.status(app.state.hw.read(), app.state.stage.state, app.state.purification.state,
+                         app.state.pump.state, app.state.drain.state)
 
 
 @router.get("/live")
@@ -182,6 +217,17 @@ def demo_load_oil(data: DemoOilIn, request: Request):
     if not config.MOCK or not hasattr(hw, "demo_load_oil"):
         raise HTTPException(409, "Only available in demonstration mode.")
     hw.demo_load_oil(data.volume_ml, _settings(request).oil_density)
+    return hw.refresh()
+
+
+@router.post("/demo/add")
+def demo_add(data: DemoAddIn, request: Request):
+    """Demo mode: something poured by hand lands on a simulated load cell (acetone into the
+    reactor, or biodiesel straight into the purification tank)."""
+    hw = request.app.state.hw
+    if not config.MOCK or not hasattr(hw, "demo_add"):
+        raise HTTPException(409, "Only available in demonstration mode.")
+    hw.demo_add(data.place, data.grams)
     return hw.refresh()
 
 
@@ -313,14 +359,61 @@ def analytics_cost(request: Request):
 
 
 # ---------- reaction and separation stages ----------
+def _arm_purification(app, batch_id: Optional[str]) -> None:
+    """Purification starts by itself once the level switch sees biodiesel at the heater
+    (checked every second in main.sensor_loop)."""
+    if batch_id and app.state.settings.purification_auto_start:
+        app.state.purification_armed = batch_id
+
+
+def start_drain(app, valve: str, batch_id: Optional[str]) -> None:
+    """Opens an outlet valve for its drain time, then closes it:
+    reactor outlet -> centrifuge, centrifuge outlet -> purification tank (then purification is armed).
+    Raises TransferError or InterlockError."""
+    s = app.state.settings
+    minutes = s.reactor_drain_time if valve == "reactor_outlet" else s.centrifuge_drain_time
+    label = VALVE_LABELS[valve]
+
+    def finished(st: dict) -> None:
+        if st["phase"] == "done":
+            _event(app, batch_id, f"{label} closed ({st['elapsedSeconds']} s open)")
+            if valve == "centrifuge_outlet":
+                _arm_purification(app, batch_id)
+        else:
+            _event(app, batch_id, f"{label} closed early ({st['faultReason']})")
+            if st["phase"] == "fault":
+                app.state.alarm = f"{label}: {st['faultReason']}"
+
+    centrifuge = valve == "centrifuge_outlet"
+    app.state.drain.start(valve, minutes * 60, batch_id, finished,
+                          wait_rpm="centrifugeRpm" if centrifuge else None,
+                          spin_down_seconds=s.centrifuge_spin_down_time if centrifuge else 0,
+                          on_open=lambda: _event(app, batch_id, f"{label} opened"))
+
+
+def _after_stage(app, valve: str, batch_id: Optional[str]) -> None:
+    """Drain after transesterification / separation. A drain time of 0 means the operator moves
+    the liquid by hand."""
+    s = app.state.settings
+    minutes = s.reactor_drain_time if valve == "reactor_outlet" else s.centrifuge_drain_time
+    if minutes <= 0:
+        if valve == "centrifuge_outlet":
+            _arm_purification(app, batch_id)
+        return
+    try:
+        start_drain(app, valve, batch_id)
+    except (TransferError, InterlockError) as e:
+        app.state.alarm = f"{VALVE_LABELS[valve]} did not open: {e}"
+
+
 def _stage_event(app):
     def record(label: str, st: dict) -> None:
         rec = _pending(app, st["batchId"])
         rec["timeline"].append({"label": label, "time": datetime.now().isoformat()})
-        if label == "Separation completed" and app.state.settings.purification_auto_start:
-            # Purification starts by itself once the level switch sees biodiesel at the heater
-            # (checked every second in main.sensor_loop).
-            app.state.purification_armed = st["batchId"]
+        if label == "Transesterification completed":
+            _after_stage(app, "reactor_outlet", st["batchId"])
+        elif label == "Separation completed":
+            _after_stage(app, "centrifuge_outlet", st["batchId"])
         if st["stage"] in REACTIONS:
             rec["energyKwh"][st["stage"]] = st["energyKwh"]
             if st["averageTemperature"] is not None:
@@ -338,6 +431,11 @@ async def start_stage(data: StageStart, request: Request):
     app = request.app
     if app.state.purification.running:
         raise HTTPException(409, "Purification is running.")
+    if app.state.pump.running:
+        raise HTTPException(409, f"{PUMP_LABELS[app.state.pump.state['pump']]} is still loading.")
+    if app.state.drain.running:
+        raise HTTPException(409, f"Wait for the {VALVE_LABELS[app.state.drain.state['valve']].lower()} "
+                                 "to finish draining.")
     app.state.purification_armed = None
     try:
         app.state.stage.start(data.stage, _settings(request), data.batch_id, data.voltage, data.time,
@@ -360,6 +458,7 @@ async def stage_action(action: str, request: Request):
         elif action == "complete":
             runner.complete()
         elif action == "emergency-stop":
+            await stop_transfers(request.app, "emergency stop")
             await runner.emergency_stop()
         elif action == "reset":
             runner.reset()
@@ -368,6 +467,94 @@ async def stage_action(action: str, request: Request):
     except StageError as e:
         raise HTTPException(409, str(e))
     return runner.state
+
+
+# ---------- dosing pumps ----------
+@router.get("/process/pump")
+def pump_state(request: Request):
+    return request.app.state.pump.state
+
+
+@router.post("/process/pump/start")
+async def start_pump(data: PumpStart, request: Request):
+    """"Load": pump A (NaOH/KOH + methanol) or pump B (H2SO4 + methanol) adds one premixed dose
+    to the reactor and stops when the reactor load cell has gained targetG."""
+    app, s = request.app, _settings(request)
+    if app.state.stage.active:
+        raise HTTPException(409, f"{app.state.stage.state['stage']} is running. Load before starting the stage.")
+    if app.state.drain.running and app.state.drain.state["valve"] == "reactor_outlet":
+        raise HTTPException(409, "The reactor is still draining.")
+    rate = s.pump_catalyst_rate if data.pump == "catalyst" else s.pump_acid_rate
+    label = PUMP_LABELS[data.pump].split(" (")[0]
+
+    def finished(st: dict) -> None:
+        if st["phase"] == "done":
+            _event(app, data.batch_id, f"{label} loaded {st['deliveredG']:g} g"
+                                       + (f" for {data.stage}" if data.stage else ""))
+        else:
+            _event(app, data.batch_id, f"{label} stopped at {st['deliveredG']:g} of {st['targetG']:g} g "
+                                       f"({st['faultReason']})")
+
+    try:
+        app.state.pump.start(data.pump, data.target_g, data.volume_ml, rate, s.pump_no_flow_seconds,
+                             data.batch_id, data.stage, finished)
+    except (TransferError, InterlockError) as e:
+        raise HTTPException(409, str(e))
+    return app.state.pump.state
+
+
+@router.post("/process/pump/stop")
+async def stop_pump(request: Request):
+    await request.app.state.pump.stop()
+    return request.app.state.pump.state
+
+
+@router.post("/process/pump/skip")
+async def skip_pump(request: Request):
+    """Demo mode only: the rest of the dose arrives at once."""
+    if not config.MOCK:
+        raise HTTPException(409, "Only available in demonstration mode.")
+    request.app.state.pump.skip()
+    return request.app.state.pump.state
+
+
+# ---------- outlet valves (draining) ----------
+@router.get("/process/drain")
+def drain_state(request: Request):
+    return request.app.state.drain.state
+
+
+@router.post("/process/drain/start")
+async def start_drain_again(data: DrainStart, request: Request):
+    """Opens the reactor or centrifuge outlet again for its drain time (it opens by itself after
+    transesterification and separation)."""
+    app = request.app
+    if app.state.stage.active:
+        raise HTTPException(409, f"{app.state.stage.state['stage']} is running.")
+    if app.state.pump.running:
+        raise HTTPException(409, "A dosing pump is running.")
+    if data.valve == "centrifuge_outlet" and app.state.purification.running:
+        raise HTTPException(409, "Purification is running.")
+    try:
+        start_drain(app, data.valve, data.batch_id)
+    except (TransferError, InterlockError) as e:
+        raise HTTPException(409, str(e))
+    return app.state.drain.state
+
+
+@router.post("/process/drain/stop")
+async def stop_drain(request: Request):
+    await request.app.state.drain.stop("closed by operator")
+    return request.app.state.drain.state
+
+
+@router.post("/process/drain/skip")
+async def skip_drain(request: Request):
+    """Demo mode only: everything arrives now and the valve closes."""
+    if not config.MOCK:
+        raise HTTPException(409, "Only available in demonstration mode.")
+    request.app.state.drain.skip()
+    return request.app.state.drain.state
 
 
 # ---------- purification ----------
@@ -391,6 +578,8 @@ def _biodiesel_ml(app, s: Settings, batch_id: Optional[str], oil_volume_ml: Opti
 def begin_purification(app, s: Settings, target: float, batch_id: Optional[str], automatic: bool = False,
                        oil_volume_ml: Optional[float] = None) -> None:
     """Starts heating → hold → mesh bed flow → drain. Raises RuntimeError or InterlockError."""
+    if app.state.drain.running and app.state.drain.state["valve"] == "centrifuge_outlet":
+        raise RuntimeError("The centrifuge is still draining into the purification tank.")
     def save_record(record: dict) -> None:
         if not batch_id:
             return
@@ -421,6 +610,8 @@ def auto_start_purification(app) -> None:
     runner = app.state.purification
     # "complete" is the previous batch's finished run; a fault must be acknowledged first
     if not batch_id or runner.running or runner.state["phase"] not in ("ready", "complete") or app.state.stage.active:
+        return
+    if app.state.drain.running:   # wait until the centrifuge outlet has closed
         return
     if app.state.hw.read().get("heaterSubmerged") is not True:
         return
@@ -482,6 +673,8 @@ def _manual_allowed(request: Request) -> None:
     app = request.app
     if app.state.purification.running or app.state.stage.active:
         raise HTTPException(409, "A process stage is running. Stop it first.")
+    if app.state.pump.running or app.state.drain.running:
+        raise HTTPException(409, "A pump or an outlet valve is working. Stop it first.")
 
 
 @router.post("/control/heater")
@@ -515,6 +708,8 @@ async def control_valve(data: ValveIn, request: Request):
         request.app.state.hw.set_valve(data.name, data.open)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except InterlockError as e:
+        raise HTTPException(409, str(e))
     return request.app.state.hw.refresh()
 
 
@@ -525,6 +720,19 @@ async def control_motor(data: MotorIn, request: Request):
         request.app.state.hw.set_motor(data.name, data.duty)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except InterlockError as e:
+        raise HTTPException(409, str(e))
+    return request.app.state.hw.refresh()
+
+
+@router.post("/control/pump")
+async def control_pump(data: PumpIn, request: Request):
+    """Runs a dosing pump by hand (priming the line, cleaning). Use "Load" for doses."""
+    _manual_allowed(request)
+    try:
+        request.app.state.hw.set_pump(data.name, data.on)
+    except InterlockError as e:
+        raise HTTPException(409, str(e))
     return request.app.state.hw.refresh()
 
 
@@ -533,6 +741,7 @@ async def all_off(request: Request):
     """Emergency stop: stops any stage and purification, then switches everything off."""
     app = request.app
     app.state.purification_armed = None
+    await stop_transfers(app, "emergency stop")
     await app.state.purification.abort("emergency stop")
     await app.state.stage.emergency_stop()
     app.state.hw.all_off()

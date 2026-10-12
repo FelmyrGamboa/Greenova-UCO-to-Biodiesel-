@@ -21,6 +21,12 @@ export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
 export type PurificationPhase = "ready" | "heating" | "hold" | "flow" | "drain" | "complete" | "fault";
 export type TileState = "ready" | "checking" | "fault";
+/** Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H₂SO₄ in methanol. */
+export type PumpName = "catalyst" | "acid";
+export type PumpPhase = "idle" | "pumping" | "done" | "fault" | "stopped";
+/** Outlet valves that open by themselves: after transesterification and after separation. */
+export type DrainValve = "reactor_outlet" | "centrifuge_outlet";
+export type DrainPhase = "idle" | "waiting" | "draining" | "done" | "stopped" | "fault";
 
 export type BatchRecord = DemoBatch & {
   oilMassG?: number | null;
@@ -29,6 +35,8 @@ export type BatchRecord = DemoBatch & {
     stage: number;
     ffaBefore: number;
     ffaAfter?: number | null;
+    /** FFA the dose was calculated for (the uniform design FFA in stage 1). */
+    doseFfa?: number | null;
     methanolMl: number;
     sulfuricAcidMl: number;
     acetoneMl: number;
@@ -48,42 +56,96 @@ export type QuantityCards = {
   methanolRatio: number;
   catalyst: Catalyst;
   ffaMassG: number;
+  /** FFA the esterification dose is calculated for: the design FFA (default 10%). */
+  doseFfa: number;
+  uniformDose: boolean;
   esterificationNeeded: boolean;
   esterificationMethanolMl: number;
   sulfuricAcidMl: number;
   sulfuricAcidG: number;
   acetoneMl: number;
+  acetoneG: number;
+  /** Pump B premix (methanol + H₂SO₄): its volume and what the reactor load cell should gain. */
+  esterificationPremixMl: number;
+  esterificationPremixG: number;
   transesterificationMethanolMl: number;
   catalystBaseG: number;
   neutralizationG: number;
   catalystToWeighG: number;
   purity: number;
+  transesterificationAcetoneMl: number;
+  /** Pump A premix (methanol + NaOH/KOH). */
+  transesterificationPremixMl: number;
+  transesterificationPremixG: number;
   isEstimate: boolean;
   warnings: string[];
 };
 
 export type AfterEsterification =
-  | { action: "anotherStage"; stage: number; ffaMassG: number; esterificationMethanolMl: number;
-      sulfuricAcidMl: number; sulfuricAcidG: number; acetoneMl: number }
+  | { action: "anotherStage"; stage: number; doseFfa: number; uniformDose: boolean; ffaMassG: number;
+      esterificationMethanolMl: number; sulfuricAcidMl: number; sulfuricAcidG: number; acetoneMl: number;
+      acetoneG: number; esterificationPremixMl: number; esterificationPremixG: number }
   | { action: "transesterification"; ffa: number; isEstimate: false; transesterificationMethanolMl: number;
-      catalystBaseG: number; neutralizationG: number; catalystToWeighG: number; purity: number; acetoneMl: number };
+      catalystBaseG: number; neutralizationG: number; catalystToWeighG: number; purity: number; acetoneMl: number;
+      acetoneG: number; transesterificationPremixMl: number; transesterificationPremixG: number };
 
 export type Sensors = {
+  /** Reactor load cell: the oil, then everything poured or pumped in. */
   oilMassG: number | null;
+  /** Output load cell under the biodiesel container (the yield). */
   outputWeightG: number | null;
   temperature: number | null;
   voltage: number | null;
   current: number | null;
   stirrerRpm: number | null;
   centrifugeRpm: number | null;
+  /** Dry wash stirrer in the purification tank. */
+  purificationStirrerRpm: number | null;
   /** Level switch at the heater: true = biodiesel covers it, null = no switch installed. */
   heaterSubmerged: boolean | null;
   heaterOn: boolean;
   electrodePowerOn: boolean;
+  /** Purification outlet valve (to the mesh bed and the biodiesel container). */
   meshBedValveOpen: boolean;
+  reactorValveOpen: boolean;
+  centrifugeValveOpen: boolean;
   valves: Record<string, boolean>;
   motorDuty: Record<string, number>;
+  pumps: Record<PumpName, boolean>;
   timestamp: number;
+};
+
+/** A dose being loaded by pump A or B. It stops when the reactor load cell has gained targetG. */
+export type PumpStatus = {
+  pump: PumpName | null;
+  phase: PumpPhase;
+  batchId: string | null;
+  stage: string | null;
+  targetG: number;
+  volumeMl: number;
+  deliveredG: number;
+  startWeightG: number | null;
+  /** No load cell reading: dosed by time at the pump's rate. */
+  byTime: boolean;
+  elapsedSeconds: number;
+  maxSeconds: number;
+  faultReason: string | null;
+  /** When this run started: tells it apart from the previous run. */
+  startedAt: string | null;
+};
+
+/** An outlet valve open for its drain time. "waiting" = waiting for the centrifuge to stop. */
+export type DrainStatus = {
+  valve: DrainValve | null;
+  phase: DrainPhase;
+  batchId: string | null;
+  elapsedSeconds: number;
+  totalSeconds: number;
+  remainingSeconds: number;
+  waitingFor: string | null;
+  waitedSeconds: number;
+  faultReason: string | null;
+  startedAt: string | null;
 };
 
 export type StageStatus = {
@@ -133,6 +195,10 @@ export type PurificationStatus = {
   heaterOn: boolean;
   valveOpen: boolean;
   heaterOnSeconds: number;
+  /** Dry wash stirrer: runs during heating and hold. */
+  stirrerOn: boolean;
+  stirrerRpm: number | null;
+  stirringSpeed: number;
   /** E.g. less output than expected: check the mesh bed. */
   warning: string | null;
   safetyStopReason: string | null;
@@ -147,6 +213,8 @@ export type LiveData = {
   alarm: string | null;
   stage: StageStatus;
   purification: PurificationStatus;
+  pump: PumpStatus;
+  drain: DrainStatus;
   /** Batch ID waiting for purification to start by itself (after separation), or null. */
   purificationAutoStart: string | null;
 };
@@ -170,12 +238,14 @@ export type ProcessConfig = {
   methanol: { ratioDefault: number; ratioMin: number; ratioMax: number; molecularWeight: number; densityGPerMl: number; convention: string };
   catalyst: { loadingDefault: number; kohPurity: number; naohPurity: number };
   acetone: { volumeFractionDefault: number; provisional: boolean };
-  esterification: StageLimits & { sulfuricAcidMlPerGramFfa: number };
+  esterification: StageLimits & { sulfuricAcidMlPerGramFfa: number; designFfa: number; stripMaxFfa: number };
   transesterification: StageLimits;
   separation: { timeMinutes: number; speedRpm: number };
   purification: { targetTemperature: number; maximumTemperature: number; thermalFuseRating: number | null;
     holdTimeMinutes: number; meshBedFlowRate: number; drainTimeMinutes: number; heatingTimeoutMinutes: number;
-    automatic: boolean; targetRange: { min: number; max: number } };
+    automatic: boolean; stirringSpeedRpm: number; targetRange: { min: number; max: number } };
+  pumps: { catalystRateMlPerMinute: number; acidRateMlPerMinute: number; noFlowSeconds: number };
+  drains: { reactorMinutes: number; centrifugeMinutes: number; centrifugeSpinDownSeconds: number };
   reactionMaximumTemperature: number;
 };
 
@@ -192,6 +262,14 @@ export type Settings = Record<string, unknown> & {
   meshBedFlowRate: number;
   drainTime: number;
   heatingTimeout: number;
+  purificationStirringSpeed: number;
+  esterificationDesignFfa: number;
+  stripMaxFfa: number;
+  pumpCatalystRate: number;
+  pumpAcidRate: number;
+  reactorDrainTime: number;
+  centrifugeDrainTime: number;
+  centrifugeSpinDownTime: number;
   ffaRangeBoundaries: string;
   provenBatchCount: number;
   provenYieldTolerance: number;
@@ -433,6 +511,8 @@ export function saveSettings(changes: Partial<Settings>): Promise<Settings> {
 
 export const getProcessConfig = () => get<ProcessConfig>("/api/config");
 export const getSystemStatus = () => get<SystemStatus>("/api/system/status");
+/** This computer's addresses on the local network, for "Open on phone". */
+export const getNetworkAddresses = async () => (await get<{ addresses: string[] }>("/api/network")).addresses;
 export const getLive = () => get<LiveData>("/api/live");
 export const clearAlarm = () => send<{ alarm: null }>("POST", "/api/alarm/clear");
 
@@ -447,6 +527,23 @@ export const readFfaStrip = () => send<{ ffa: number; warnings: string[] }>("POS
 
 /** "Load demonstration sensor reading" (demo mode only). */
 export const loadDemoOil = (volumeMl: number) => send<Sensors>("POST", "/api/demo/load-oil", { volumeMl });
+
+/** Demo mode: something poured by hand lands on a simulated load cell (e.g. acetone). */
+export const demoAdd = (grams: number, place: "reactor" | "purificationTank" = "reactor") =>
+  send<Sensors>("POST", "/api/demo/add", { place, grams });
+
+// ---------- dosing pumps and outlet valves ----------
+/** "Load": the pump adds one premixed dose and stops when the reactor has gained targetG. */
+export const startPump = (input: { pump: PumpName; targetG: number; volumeMl: number; batchId?: string; stage?: string }) =>
+  send<PumpStatus>("POST", "/api/process/pump/start", input);
+
+export const pumpAction = (action: "stop" | "skip") => send<PumpStatus>("POST", `/api/process/pump/${action}`);
+
+/** Opens an outlet again for its drain time (it opens by itself after transesterification and separation). */
+export const startDrain = (valve: DrainValve, batchId?: string) =>
+  send<DrainStatus>("POST", "/api/process/drain/start", { valve, batchId });
+
+export const drainAction = (action: "stop" | "skip") => send<DrainStatus>("POST", `/api/process/drain/${action}`);
 
 // ---------- process stages ----------
 export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; oilMassG?: number }) =>
@@ -463,7 +560,7 @@ export const startPurification = (input: { heaterSubmerged?: boolean; targetTemp
 export const purificationAction = (action: "skip" | "abort" | "acknowledge") =>
   send<PurificationStatus>("POST", `/api/process/purification/${action}`);
 
-/** Emergency stop for everything: stage, purification, heater, valves and motors. */
+/** Emergency stop for everything: stage, pumps, purification, heater, valves and motors. */
 export const emergencyStop = () => send<LiveData>("POST", "/api/control/all-off");
 
 // ---------- analytics ----------

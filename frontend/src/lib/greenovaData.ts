@@ -9,6 +9,8 @@ export type DemoBatch = {
   labResult: "Pending" | "Passed" | "Failed" | "Not tested";
   labReference?: string;
   ffa: number;
+  /** The FFA strip showed its darkest color: FFA is at least `ffa` (the strip's maximum, 5%). */
+  ffaAboveStrip?: boolean;
   esterificationRun: boolean;
   temperature: number;
   reactionTime: number;
@@ -20,6 +22,19 @@ export type DemoBatch = {
   esterificationStirring?: number;
   biodieselOutputMl?: number;
   catalystType?: "NaOH" | "KOH";
+  /** Oil weighed by the reactor load cell. */
+  oilMassG?: number;
+  catalystToWeighG?: number;
+  /** One entry per esterification stage, with the FFA re-check after it. */
+  esterificationStages?: Array<{
+    stage: number;
+    ffaBefore: number;
+    ffaAfter?: number | null;
+    doseFfa?: number | null;
+    methanolMl: number;
+    sulfuricAcidMl: number;
+    acetoneMl: number;
+  }>;
   materials?: {
     oilL: number;
     methanolL: number;
@@ -40,14 +55,17 @@ export type DemoBatch = {
     automatic?: boolean;
     warning?: string | null;
     safetyStopOccurred: boolean;
+    /** Dry wash stirrer RPM during heating and hold. */
+    stirringSpeed?: number;
+    outputWeightG?: number | null;
   };
 };
 
 export const demoBatches: DemoBatch[] = [
   { id: "B-2026-024", date: "2026-10-18", oilVolume: 1000, ffa: 2.8, esterificationRun: false, yield: 88.4, duration: 132, energy: 1.84, status: "Completed", labResult: "Passed", temperature: 42, reactionTime: 58, stirringSpeed: 450 },
-  { id: "B-2026-023", date: "2026-10-16", oilVolume: 1000, ffa: 5.6, esterificationRun: true, yield: 86.9, duration: 138, energy: 1.91, status: "Completed", labResult: "Pending", temperature: 41, reactionTime: 62, stirringSpeed: 440 },
+  { id: "B-2026-023", date: "2026-10-16", oilVolume: 1000, ffa: 5, ffaAboveStrip: true, esterificationRun: true, yield: 86.9, duration: 138, energy: 1.91, status: "Completed", labResult: "Pending", temperature: 41, reactionTime: 62, stirringSpeed: 440 },
   { id: "B-2026-022", date: "2026-10-12", oilVolume: 1200, ffa: 3.4, esterificationRun: false, yield: 89.1, duration: 147, energy: 2.16, status: "Completed", labResult: "Passed", temperature: 43, reactionTime: 65, stirringSpeed: 470 },
-  { id: "B-2026-021", date: "2026-10-09", oilVolume: 1000, ffa: 7.2, esterificationRun: true, yield: 0, duration: 51, energy: 0.82, status: "Failed", labResult: "Not tested", temperature: 40, reactionTime: 31, stirringSpeed: 430 },
+  { id: "B-2026-021", date: "2026-10-09", oilVolume: 1000, ffa: 5, ffaAboveStrip: true, esterificationRun: true, yield: 0, duration: 51, energy: 0.82, status: "Failed", labResult: "Not tested", temperature: 40, reactionTime: 31, stirringSpeed: 430 },
   { id: "B-2026-020", date: "2026-10-04", oilVolume: 800, ffa: 4.6, esterificationRun: true, yield: 85.7, duration: 121, energy: 1.52, status: "Completed", labResult: "Passed", temperature: 41, reactionTime: 54, stirringSpeed: 420 },
   { id: "B-2026-019", date: "2026-09-29", oilVolume: 1000, ffa: 3.1, esterificationRun: false, yield: 87.6, duration: 135, energy: 1.88, status: "Completed", labResult: "Pending", temperature: 42, reactionTime: 60, stirringSpeed: 450 },
 ];
@@ -55,18 +73,55 @@ export const demoBatches: DemoBatch[] = [
 const STORAGE_KEY = "greenova_batches_v2";
 const LEGACY_SAMPLE_FFA: Record<string, number> = {
   "B-2026-024": 2.8,
-  "B-2026-023": 5.6,
+  "B-2026-023": 5,
   "B-2026-022": 3.4,
-  "B-2026-021": 7.2,
+  "B-2026-021": 5,
   "B-2026-020": 4.6,
   "B-2026-019": 3.1,
 };
+/** Sample values saved by older versions, before the strip's 5% limit. */
+const OLD_SAMPLE_FFA: Record<string, number> = { "B-2026-023": 5.6, "B-2026-021": 7.2 };
+
+export const DEFAULT_FFA_BOUNDARIES = "0,2,4,5";
+const OLD_DEFAULT_FFA_BOUNDARIES = "0,2,4,6,8,10";
+
+/** The FFA range boundaries from Settings. The last range is "5% and above": the strip's darkest
+ * color. The old default (ranges up to 10%) counts as the new default. */
+export function ffaBoundaries(value: unknown): number[] {
+  const text = String(value ?? "").replace(/\s/g, "");
+  const source = !text || text === OLD_DEFAULT_FFA_BOUNDARIES ? DEFAULT_FFA_BOUNDARIES : text;
+  const parsed = source.split(",").map(Number).filter((item) => Number.isFinite(item)).sort((a, b) => a - b);
+  const unique = [...new Set(parsed)];
+  return unique.length >= 2 ? unique : [0, 2, 4, 5];
+}
+
+/** FFA (%) every esterification dose is calculated for (Settings, default 10%). */
+export function esterificationDesignFfa(): number {
+  try {
+    const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
+    const value = Number(settings.esterificationDesignFfa);
+    return Number.isFinite(value) && value > 0 ? value : 10;
+  } catch {
+    return 10;
+  }
+}
+
+/** "5.0%", or "≥ 5.0%" when the strip showed its darkest color. */
+export function formatFfa(batch: Pick<DemoBatch, "ffa" | "ffaAboveStrip">): string {
+  return `${batch.ffaAboveStrip ? "≥ " : ""}${batch.ffa.toFixed(1)}%`;
+}
 
 function hydrateAnalyticsData(batch: DemoBatch): DemoBatch {
   const oilMassG = batch.oilVolume * 0.92;
   const ratio = batch.methanolRatio ?? 7;
   const transMethanolMl = (oilMassG * ratio * 40.45) / 880;
-  const esterMethanolMl = batch.esterificationRun ? oilMassG * (batch.ffa / 100) * 2.84 : 0;
+  // Uniform dose: every esterified batch is dosed as if its FFA were the design FFA.
+  const doseFfaMassG = oilMassG * (esterificationDesignFfa() / 100);
+  const stages = batch.esterificationStages ?? [];
+  const esterMethanolMl = !batch.esterificationRun ? 0
+    : stages.length ? stages.reduce((sum, stage) => sum + stage.methanolMl, 0) : doseFfaMassG * 2.84;
+  const sulfuricAcidMl = !batch.esterificationRun ? 0
+    : stages.length ? stages.reduce((sum, stage) => sum + stage.sulfuricAcidMl, 0) : doseFfaMassG * 0.027;
   return {
     ...batch,
     voltage: batch.voltage ?? 30,
@@ -80,7 +135,7 @@ function hydrateAnalyticsData(batch: DemoBatch): DemoBatch {
       oilL: batch.oilVolume / 1000,
       methanolL: (transMethanolMl + esterMethanolMl) / 1000,
       catalystKg: oilMassG * 0.01 / 1000,
-      sulfuricAcidL: batch.esterificationRun ? oilMassG * (batch.ffa / 100) * 0.027 / 1000 : 0,
+      sulfuricAcidL: sulfuricAcidMl / 1000,
       acetoneL: batch.oilVolume * 0.1 / 1000,
       bentoniteKg: batch.oilVolume * 0.02 / 1000,
     },
@@ -92,10 +147,12 @@ export function getBatches(): DemoBatch[] {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (!stored) return demoBatches.map(hydrateAnalyticsData);
     return (JSON.parse(stored) as Array<Partial<DemoBatch> & { engineTest?: string }>).map((batch) => {
-      const ffa = batch.ffa ?? LEGACY_SAMPLE_FFA[batch.id || ""] ?? 0;
+      const oldSample = batch.id !== undefined && batch.ffa === OLD_SAMPLE_FFA[batch.id];
+      const ffa = oldSample ? 5 : batch.ffa ?? LEGACY_SAMPLE_FFA[batch.id || ""] ?? 0;
       return {
         ...batch,
         ffa,
+        ffaAboveStrip: oldSample ? true : batch.ffaAboveStrip,
         esterificationRun: batch.esterificationRun ?? ffa > 4,
         labResult:
           batch.labResult ??
@@ -124,15 +181,10 @@ export function updateBatchLabResult(
 }
 
 export function getRecommendedParametersForFfa(ffa: number) {
-  let boundaries = [0, 2, 4, 6, 8, 10];
+  let boundaries = ffaBoundaries(DEFAULT_FFA_BOUNDARIES);
   try {
     const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
-    const parsed = String(settings.ffaRangeBoundaries || "")
-      .split(",")
-      .map(Number)
-      .filter((value) => Number.isFinite(value))
-      .sort((a, b) => a - b);
-    if (parsed.length >= 2) boundaries = [...new Set(parsed)];
+    boundaries = ffaBoundaries(settings.ffaRangeBoundaries);
   } catch {
     // Use the documented default ranges.
   }

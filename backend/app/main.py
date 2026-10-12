@@ -1,4 +1,17 @@
-"""Greenova backend. Start it with:  uvicorn app.main:app --host 0.0.0.0 --port 8000"""
+"""Greenova backend. Start it from the backend folder with any of:
+    python main.py                                (simplest: uses .venv by itself, restarts on edits)
+    python -m uvicorn app.main:app --reload       (development, restarts when you edit the code)
+    python -m app.main                            (or: python app/main.py)
+    start-backend.bat                             (Windows: also installs the packages the first time)
+"""
+if __name__ == "__main__" and not __package__:
+    # Started as "python app/main.py": make the "from . import ..." lines below work.
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "app"
+
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -8,10 +21,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import config, db
-from .api import auto_start_purification, router
+from .api import auto_start_purification, router, stop_transfers
 from .hardware import create_hardware
 from .purification import PurificationRunner
 from .stages import StageRunner
+from .transfers import DrainRunner, PumpRunner
 
 log = logging.getLogger("greenova")
 
@@ -46,12 +60,15 @@ async def lifespan(app: FastAPI):
     app.state.hw.all_off()                       # always start in the safe state
     app.state.purification = PurificationRunner(app.state.hw, config.TIME_SCALE)
     app.state.stage = StageRunner(app.state.hw, config.TIME_SCALE)
+    app.state.pump = PumpRunner(app.state.hw, config.TIME_SCALE)     # dosing pumps A and B
+    app.state.drain = DrainRunner(app.state.hw, config.TIME_SCALE)   # reactor and centrifuge outlets
     app.state.records = {}                       # measurements for batches not saved yet
     app.state.alarm = None
     app.state.purification_armed = None          # batch waiting to start purification by itself
     task = asyncio.create_task(sensor_loop(app))
     log.info("Greenova backend started (%s mode)", "demo" if config.MOCK else "hardware")
     yield
+    await stop_transfers(app, "backend shutting down")
     await app.state.purification.abort("backend shutting down")
     await app.state.stage.emergency_stop("backend shutting down")
     task.cancel()
@@ -83,3 +100,9 @@ if config.FRONTEND_DIR.is_dir():
         if full_path and file.is_file() and frontend in file.parents:
             return FileResponse(file)
         return FileResponse(frontend / "index.html")   # let the website handle its own pages
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)

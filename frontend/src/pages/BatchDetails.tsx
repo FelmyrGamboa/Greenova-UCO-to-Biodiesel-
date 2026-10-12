@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 import { Button, Card, Field, Heading, Metric, Status } from "../components/ui";
-import { getBatches } from "../lib/greenovaData";
+import { formatFfa, getBatches } from "../lib/greenovaData";
 import { getBatch, isOffline, updateBatchLabResult, type BatchRecord } from "../lib/api";
 
 const demoTimeline = [
@@ -76,9 +76,22 @@ export default function BatchDetails() {
         <Card className="p-6">
           <Heading as="h2" className="text-lg font-semibold">Process Parameters</Heading>
           <div className="mt-6 space-y-5">
+            <Metric label="Starting FFA" value={formatFfa(batch)} sub={batch.ffaAboveStrip ? "The strip showed its darkest color" : "Test strip"} />
+            {batch.esterificationRun && (
+              <Metric
+                label="Esterification"
+                value={batch.esterificationStages?.length ? `${batch.esterificationStages.length} stage${batch.esterificationStages.length > 1 ? "s" : ""}` : "Run"}
+                sub={batch.esterificationStages?.length
+                  ? `FFA ${[formatFfa(batch), ...batch.esterificationStages.map((stage) => `${(stage.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ")}`
+                  : undefined}
+              />
+            )}
             <Metric label="Temperature" value={`${batch.temperature} °C`} />
             <Metric label="Reaction time" value={`${batch.reactionTime} min`} />
             <Metric label="Stirring speed" value={`${batch.stirringSpeed} RPM`} />
+            {batch.biodieselOutputMl ? (
+              <Metric label="Biodiesel output" value={`${batch.biodieselOutputMl.toFixed(1)} mL`} sub={batch.purification?.outputWeightG ? `${batch.purification.outputWeightG.toFixed(1)} g on the output load cell` : undefined} />
+            ) : null}
             <div><div className="gv-label">Lab test</div><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{batch.labResult}</Status></div>
             {batch.labReference && <Metric label="Lab reference no." value={batch.labReference} />}
           </div>

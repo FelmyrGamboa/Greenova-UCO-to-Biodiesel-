@@ -8,13 +8,22 @@ const demoDevices = [
   { label: "Raspberry Pi", status: "Connected" },
   { label: "Temperature Sensor", status: "Connected" },
   { label: "Reaction Tank", status: "Ready" },
+  { label: "Pump A (NaOH/KOH + methanol)", status: "Ready" },
+  { label: "Pump B (H₂SO₄ + methanol)", status: "Ready" },
+  { label: "Reactor outlet valve", status: "Closed" },
   { label: "Centrifuge", status: "Ready" },
-  { label: "Dry Wash Filter", status: "Ready" },
+  { label: "Centrifuge outlet valve", status: "Closed" },
+  { label: "Dry wash stirrer", status: "Ready" },
+  { label: "Purification outlet valve", status: "Closed" },
+  { label: "Output load cell", status: "0.0 g" },
 ];
+
+const PUMP_LABELS = { catalyst: "Pump A · NaOH/KOH + methanol", acid: "Pump B · H₂SO₄ + methanol" } as const;
+const VALVE_LABELS = { reactor_outlet: "reactor outlet", centrifuge_outlet: "centrifuge outlet" } as const;
 
 function deviceTone(status: string) {
   if (["Fault", "No reading"].includes(status)) return "red" as const;
-  if (["On", "Running", "Open"].includes(status)) return "yellow" as const;
+  if (["On", "Running", "Open", "Pumping"].includes(status) || status.startsWith("Running")) return "yellow" as const;
   return "green" as const;
 }
 
@@ -45,12 +54,19 @@ export default function Dashboard() {
   const purification = live ? live.purification : null;
   const stageActive = stage !== null && stage.stage !== null && (stage.state === "running" || stage.state === "paused");
   const purifying = purification !== null && ["heating", "hold", "flow", "drain"].includes(purification.phase);
-  const activeBatchId = stageActive && stage ? stage.batchId : purifying && purification ? purification.batchId : null;
+  const pump = live && live.pump.phase === "pumping" ? live.pump : null;
+  const drain = live && (live.drain.phase === "waiting" || live.drain.phase === "draining") ? live.drain : null;
+  const activeBatchId = stageActive && stage ? stage.batchId : purifying && purification ? purification.batchId
+    : pump ? pump.batchId : drain ? drain.batchId : null;
   const activeStage = stageActive && stage
     ? `${stage.stage} · ${stage.state}`
     : purifying && purification
       ? `Purification · ${purification.phase === "flow" ? "mesh bed flow" : purification.phase === "drain" ? "draining" : purification.phase === "hold" ? "holding" : purification.phase}`
-      : null;
+      : pump && pump.pump
+        ? `Loading · ${pump.pump === "catalyst" ? "pump A" : "pump B"}`
+        : drain && drain.valve
+          ? `Draining · ${VALVE_LABELS[drain.valve]}`
+          : null;
   const devices = systemStatus?.devices ?? demoDevices;
   const readiness = systemStatus?.readiness ?? 100;
 
@@ -83,9 +99,9 @@ export default function Dashboard() {
           </div>
           <div className="p-6">
             {activeStage !== null && stage !== null ? (
-              <div className="rounded-xl border border-white/[0.07] bg-black/10 p-6">
+              <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-6">
                 <div className="grid gap-5 sm:grid-cols-4">
-                  <Metric label="Stage" value={stageActive ? stage.stage : "Purification"} />
+                  <Metric label="Stage" value={stageActive ? stage.stage : purifying ? "Purification" : pump ? "Loading" : "Draining"} />
                   <Metric label="Temperature" value={live?.sensors.temperature == null ? "—" : `${live.sensors.temperature.toFixed(1)} °C`} />
                   <Metric label="Voltage" value={live?.sensors.voltage == null ? "—" : `${live.sensors.voltage.toFixed(1)} V`} />
                   <Metric label="Current" value={live?.sensors.current == null ? "—" : `${live.sensors.current.toFixed(2)} A`} />
@@ -93,10 +109,21 @@ export default function Dashboard() {
                 {stageActive && stage.timeMinutes ? (
                   <div className="mt-5"><Progress value={(stage.elapsedSeconds / (stage.timeMinutes * 60)) * 100} /></div>
                 ) : null}
+                {pump && pump.pump && (
+                  <div className="mt-5">
+                    <div className="mb-2 flex justify-between text-xs text-gray-500"><span>{PUMP_LABELS[pump.pump]}</span><span className="font-mono">{pump.deliveredG.toFixed(1)} / {pump.targetG.toFixed(1)} g</span></div>
+                    <Progress value={pump.targetG ? (pump.deliveredG / pump.targetG) * 100 : 0} />
+                  </div>
+                )}
+                {drain && drain.valve && (
+                  <p className="mt-5 text-xs text-gray-500">
+                    {drain.phase === "waiting" ? `Waiting for ${drain.waitingFor ?? "the centrifuge to stop"}, then the ${VALVE_LABELS[drain.valve]} opens.` : `The ${VALVE_LABELS[drain.valve]} is open · ${Math.floor(drain.remainingSeconds / 60)}:${String(drain.remainingSeconds % 60).padStart(2, "0")} left.`}
+                  </p>
+                )}
                 <Link to="/process" className="btn-secondary mt-5">Open Process</Link>
               </div>
             ) : (
-              <div className="rounded-xl border border-dashed border-white/[0.1] bg-black/10 px-6 py-10 text-center">
+              <div className="rounded-xl border border-dashed border-white/[0.1] bg-gv-inset px-6 py-10 text-center">
                 <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-green-500/10 text-green-400">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="h-6 w-6">
                     <path d="M12 5v14M5 12h14" strokeWidth="1.7" strokeLinecap="round" />

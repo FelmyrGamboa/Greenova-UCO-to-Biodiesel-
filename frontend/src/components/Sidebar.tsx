@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import { Link, NavLink } from "react-router";
 import { useLiveData } from "../contexts/LiveContext";
+import { useTheme } from "../contexts/ThemeContext";
 import GreenovaLogo from "./GreenovaLogo";
+import PhoneAccess from "./PhoneAccess";
 import { Button, Status } from "./ui";
 
 interface SidebarProps {
@@ -49,11 +51,12 @@ function readOperator() {
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
   const { backend, mock, connecting } = useLiveData();
+  const { theme, setTheme } = useTheme();
   const operator = readOperator();
   return (
     <>
       {open && <div className="fixed inset-0 z-40 bg-black/70 lg:hidden" onClick={onClose} />}
-      <aside className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-white/[0.07] bg-[#0b120d] transition-transform lg:translate-x-0 ${open ? "translate-x-0" : "-translate-x-full"}`}>
+      <aside className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-white/[0.07] bg-gv-surface transition-transform lg:translate-x-0 ${open ? "translate-x-0" : "-translate-x-full"}`}>
         <div className="flex h-20 items-center justify-between border-b border-white/[0.07] px-6">
           <Link
             to="/"
@@ -63,7 +66,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           >
             <GreenovaLogo size="md" />
           </Link>
-          <Button variant="ghost" className="!p-2 lg:hidden" onClick={onClose} aria-label="Close navigation">×</Button>
+          <Button variant="ghost" className="nav-close-button lg:hidden" onClick={onClose} aria-label="Close navigation">×</Button>
         </div>
         <nav className="flex-1 px-3 py-6">
           <div className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-600">Workspace</div>
@@ -82,6 +85,22 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           </div>
         </nav>
         <div className="border-t border-white/[0.07] p-5">
+          <PhoneAccess className="mb-3" />
+          <div className="theme-switch mb-4" role="group" aria-label="Theme">
+            <button type="button" aria-pressed={theme === "light"} onClick={() => setTheme("light")}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" className="h-4 w-4" aria-hidden="true">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+              </svg>
+              Light
+            </button>
+            <button type="button" aria-pressed={theme === "dark"} onClick={() => setTheme("dark")}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" />
+              </svg>
+              Dark
+            </button>
+          </div>
           <div className="mb-4 flex items-center justify-between">
             <span className="text-xs text-gray-500">System</span>
             {backend && !mock ? (

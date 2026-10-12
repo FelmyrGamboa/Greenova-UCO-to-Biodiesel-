@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import {
   Button,
@@ -12,21 +12,31 @@ import {
 } from "../components/ui";
 import { useLiveData } from "../contexts/LiveContext";
 import {
+  demoAdd,
+  drainAction,
   getNextBatchId,
   getRecommendedParametersForFfa,
   getSystemStatus,
   isOffline,
   loadDemoOil,
+  pumpAction,
   purificationAction,
   saveCompletedBatch,
   stageAction,
+  startDrain,
+  startPump,
   startPurification,
   startStage,
   type BatchRecord,
+  type DrainPhase,
+  type DrainValve,
+  type PumpName,
+  type PumpPhase,
   type StageName,
   type StageStatus,
   type SystemStatus,
 } from "../lib/api";
+import { formatFfa } from "../lib/greenovaData";
 
 type DeviceState = "ready" | "checking" | "fault";
 type StageState = "ready" | "running" | "paused" | "complete" | "fault";
@@ -36,6 +46,20 @@ type ChemistrySettings = {
   oilMolarMass: number;
   kohPurity: number;
   naohPurity: number;
+  /** FFA every first esterification stage is dosed for (the strip can't read above stripMaxFfa). */
+  designFfa: number;
+  stripMaxFfa: number;
+  /** Esterification goes on until the FFA re-check is at or below this. */
+  ffaTarget: number;
+};
+type EsterStageRecord = {
+  stage: number;
+  ffaBefore: number;
+  ffaAfter: number | null;
+  doseFfa: number;
+  methanolMl: number;
+  sulfuricAcidMl: number;
+  acetoneMl: number;
 };
 
 export const PROCESS_CONFIG = {
@@ -131,7 +155,7 @@ function errorText(error: unknown) {
 }
 
 function getChemistrySettings(): ChemistrySettings {
-  const defaults = { oilMolarMass: 880, kohPurity: 90, naohPurity: 98 };
+  const defaults = { oilMolarMass: 880, kohPurity: 90, naohPurity: 98, designFfa: 10, stripMaxFfa: 5, ffaTarget: 1 };
   try {
     const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
     const positiveNumber = (value: unknown, fallback: number) => {
@@ -142,6 +166,28 @@ function getChemistrySettings(): ChemistrySettings {
       oilMolarMass: positiveNumber(settings.oilMolarMass, defaults.oilMolarMass),
       kohPurity: positiveNumber(settings.kohPurity, defaults.kohPurity),
       naohPurity: positiveNumber(settings.naohPurity, defaults.naohPurity),
+      designFfa: positiveNumber(settings.esterificationDesignFfa, defaults.designFfa),
+      stripMaxFfa: positiveNumber(settings.stripMaxFfa, defaults.stripMaxFfa),
+      ffaTarget: positiveNumber(settings.ffaTarget, defaults.ffaTarget),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+/** Pumps and outlet valves (Settings → Esterification and Dosing). */
+function getTransferSettings() {
+  const defaults = { reactorDrainMinutes: 3, centrifugeDrainMinutes: 3, stirringSpeed: 300 };
+  try {
+    const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
+    const nonNegative = (value: unknown, fallback: number) => {
+      const parsed = Number(value);
+      return value !== undefined && value !== null && value !== "" && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    };
+    return {
+      reactorDrainMinutes: nonNegative(settings.reactorDrainTime, defaults.reactorDrainMinutes),
+      centrifugeDrainMinutes: nonNegative(settings.centrifugeDrainTime, defaults.centrifugeDrainMinutes),
+      stirringSpeed: nonNegative(settings.purificationStirringSpeed, defaults.stirringSpeed),
     };
   } catch {
     return defaults;
@@ -272,6 +318,73 @@ function formatTimer(totalSeconds: number) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
+const METHANOL_DENSITY = 0.792;
+const ACETONE_DENSITY = 0.784;
+
+/** One esterification stage (same rules as the backend's calculations.py). Stage 1 is the uniform
+ * dose for the design FFA (default 10%), because the strip can't read above 5%. Later stages are
+ * dosed for the re-check reading, at 40:1 methanol to FFA; the acetone from stage 1 is still there. */
+function esterificationDose(
+  oilMassG: number,
+  oilVolumeMl: number | null,
+  ffa: number,
+  stage: number,
+  settings: ChemistrySettings,
+) {
+  const doseFfa = stage === 1 ? settings.designFfa : ffa;
+  const ffaMassG = oilMassG * (doseFfa / 100);
+  const methanolMl = ffaMassG * (stage === 1 ? 2.84 : 5.68);
+  const sulfuricAcidMl = ffaMassG * 0.027;
+  const sulfuricAcidG = ffaMassG * 0.05;
+  const acetoneMl = stage === 1 && oilVolumeMl !== null ? oilVolumeMl * 0.1 : 0;
+  return {
+    stage,
+    doseFfa,
+    uniform: stage === 1,
+    ffaMassG,
+    methanolMl,
+    sulfuricAcidMl,
+    sulfuricAcidG,
+    acetoneMl,
+    acetoneG: acetoneMl * ACETONE_DENSITY,
+    // pump B premix: what the reactor load cell should gain
+    premixMl: methanolMl + sulfuricAcidMl,
+    premixG: methanolMl * METHANOL_DENSITY + sulfuricAcidG,
+  };
+}
+
+/** Transesterification. acidPct = the last FFA re-check (exact), or the starting FFA. */
+function transesterificationDose(
+  oilMassG: number,
+  oilVolumeMl: number | null,
+  acidPct: number,
+  ratio: number,
+  catalyst: "NaOH" | "KOH",
+  settings: ChemistrySettings,
+) {
+  const catalystBaseG = oilMassG * 0.01;
+  const neutralizationG = oilMassG * (acidPct / 100) * (catalyst === "KOH" ? 0.199 : 0.142);
+  const purity = catalyst === "KOH" ? settings.kohPurity : settings.naohPurity;
+  const methanolMl = (oilMassG * ratio * 40.45) / settings.oilMolarMass;
+  const catalystToWeighG = (catalystBaseG + neutralizationG) / (purity / 100);
+  const acetoneMl = oilVolumeMl === null ? null : oilVolumeMl * 0.1;
+  return {
+    methanolMl,
+    catalystBaseG,
+    neutralizationG,
+    catalystToWeighG,
+    purity,
+    acetoneMl,
+    acetoneG: (acetoneMl ?? 0) * ACETONE_DENSITY,
+    // pump A premix (the dissolved catalyst barely changes the volume)
+    premixMl: methanolMl,
+    premixG: methanolMl * METHANOL_DENSITY + catalystToWeighG,
+  };
+}
+
+type EsterDose = ReturnType<typeof esterificationDose>;
+type TransDose = ReturnType<typeof transesterificationDose>;
+
 function calculateQuantityCards(
   oilMassG: number,
   oilVolumeMl: number | null,
@@ -280,27 +393,26 @@ function calculateQuantityCards(
   catalyst: "NaOH" | "KOH",
   settings: ChemistrySettings,
 ) {
-  const ffaMassG = oilMassG * (ffa / 100);
   const esterificationNeeded = ffa > PROCESS_CONFIG.ffaThreshold;
-  const catalystBaseG = oilMassG * 0.01;
-  const neutralizationFfa = esterificationNeeded ? 1 : ffa;
-  const neutralizationFactor = catalyst === "KOH" ? 0.199 : 0.142;
-  const neutralizationG =
-    oilMassG * (neutralizationFfa / 100) * neutralizationFactor;
-  const purity = catalyst === "KOH" ? settings.kohPurity : settings.naohPurity;
+  const ester = esterificationDose(oilMassG, oilVolumeMl, ffa, 1, settings);
+  // With esterification the catalyst is an "up to" amount (neutralizing the 1% target); the
+  // exact amount comes after the FFA re-check.
+  const trans = transesterificationDose(oilMassG, oilVolumeMl, esterificationNeeded ? settings.ffaTarget : ffa, ratio, catalyst, settings);
 
   return {
-    ffaMassG,
+    ffaMassG: ester.ffaMassG,
+    doseFfa: ester.doseFfa,
     esterificationNeeded,
-    esterificationMethanolMl: ffaMassG * 2.84,
-    sulfuricAcidMl: ffaMassG * 0.027,
+    esterificationMethanolMl: ester.methanolMl,
+    sulfuricAcidMl: ester.sulfuricAcidMl,
     acetoneMl: oilVolumeMl === null ? null : oilVolumeMl * 0.1,
-    transesterificationMethanolMl:
-      (oilMassG * ratio * 40.45) / settings.oilMolarMass,
-    catalystBaseG,
-    neutralizationG,
-    catalystToWeighG: (catalystBaseG + neutralizationG) / (purity / 100),
-    purity,
+    esterificationPremixG: ester.premixG,
+    transesterificationMethanolMl: trans.methanolMl,
+    catalystBaseG: trans.catalystBaseG,
+    neutralizationG: trans.neutralizationG,
+    catalystToWeighG: trans.catalystToWeighG,
+    purity: trans.purity,
+    transesterificationPremixG: trans.premixG,
   };
 }
 
@@ -346,7 +458,7 @@ function ReadOnlyTile({
   state?: DeviceState;
 }) {
   return (
-    <div className="rounded-xl border border-white/[0.07] bg-black/10 p-4">
+    <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-4">
       <div className="flex items-center justify-between gap-3">
         <div className="gv-label !mb-0">{label}</div>
         <div className="flex items-center gap-2">
@@ -443,6 +555,8 @@ function StageControls({
   continueLabel,
   onReset,
   error,
+  startBlocked,
+  hideContinue = false,
 }: {
   state: StageState;
   setState: (state: StageState) => void;
@@ -451,11 +565,19 @@ function StageControls({
   continueLabel: string;
   onReset?: () => void;
   error?: string | null;
+  /** Why the stage can't start yet (e.g. the dose isn't loaded), or nothing. */
+  startBlocked?: string | null;
+  hideContinue?: boolean;
 }) {
+  if (state === "complete" && hideContinue) {
+    // the next step is in the panel below (the FFA re-check)
+    return error ? <p className="mt-3 text-xs text-red-400">{error}</p> : null;
+  }
   return (
     <>
-    <div className="mt-7 flex flex-wrap gap-3">
-      {state === "ready" && <Button onClick={() => setState("running")}>{startLabel}</Button>}
+    <div className="mt-7 flex flex-wrap items-center gap-3">
+      {state === "ready" && <Button disabled={Boolean(startBlocked)} onClick={() => setState("running")}>{startLabel}</Button>}
+      {state === "ready" && startBlocked && <span className="text-xs text-amber-400">{startBlocked}</span>}
       {state === "running" && (
         <>
           <Button variant="secondary" onClick={() => setState("paused")}>Pause</Button>
@@ -468,7 +590,7 @@ function StageControls({
           <Button variant="secondary" onClick={() => setState("complete")}>Record completion</Button>
         </>
       )}
-      {state === "complete" && <Button onClick={onContinue}>{continueLabel} →</Button>}
+      {state === "complete" && !hideContinue && <Button onClick={onContinue}>{continueLabel} →</Button>}
       {(state === "running" || state === "paused") && (
         <Button variant="danger" onClick={() => setState("fault")}>Emergency stop</Button>
       )}
@@ -480,6 +602,249 @@ function StageControls({
   );
 }
 
+const PUMP_INFO: Record<PumpName, { label: string; short: string; tank: string }> = {
+  catalyst: { label: "Pump A · NaOH/KOH + methanol", short: "pump A", tank: "A" },
+  acid: { label: "Pump B · H₂SO₄ + methanol", short: "pump B", tank: "B" },
+};
+
+type PumpView = { phase: PumpPhase; deliveredG: number; faultReason: string | null; byTime: boolean };
+
+/** Before a reaction stage: acetone poured by hand (weighed by the reactor load cell), then the
+ * premixed dose loaded by pump A or B. The pump stops when the reactor has gained the dose weight. */
+function DosingPanel({
+  pump,
+  premixParts,
+  mixingNote,
+  targetG,
+  premixMl,
+  run,
+  completedG,
+  manual,
+  setManual,
+  onLoad,
+  onStop,
+  onSkip,
+  locked,
+  acetone,
+  reactorG,
+  live,
+}: {
+  pump: PumpName;
+  premixParts: string[];
+  mixingNote: string;
+  targetG: number;
+  premixMl: number;
+  /** The pump run for this dose, when one is running or just ended. */
+  run: PumpView | null;
+  completedG: number;
+  manual: boolean;
+  setManual: (value: boolean) => void;
+  onLoad: () => void;
+  onStop: () => void;
+  onSkip?: () => void;
+  /** Why loading isn't possible now (e.g. the reactor is draining), or nothing. */
+  locked?: string | null;
+  acetone?: { ml: number; g: number; addedG: number; onDemoAdd?: () => void } | null;
+  reactorG: number;
+  live: boolean;
+}) {
+  const info = PUMP_INFO[pump];
+  const pumping = run?.phase === "pumping";
+  const deliveredG = completedG + (pumping ? run.deliveredG : 0);
+  const loaded = deliveredG >= targetG - 1;
+  const remainingG = Math.max(targetG - deliveredG, 0);
+  const ended = run && (run.phase === "fault" || run.phase === "stopped") ? run : null;
+  const number = acetone ? 2 : 1;
+  return (
+    <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid={`dosing-${pump}`}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="gv-label">Load the reactor</div>
+          <p className="text-sm text-gray-300">Reactor load cell: <span className="font-mono text-white">{reactorG.toFixed(1)} g</span> <span className="text-xs text-gray-600">· {live ? "live" : "demonstration"}</span></p>
+        </div>
+        <Status tone={loaded || manual ? "green" : pumping ? "blue" : ended?.phase === "fault" ? "red" : "yellow"}>
+          {loaded ? "Dose loaded" : manual ? "Added by hand" : pumping ? "Pumping" : ended?.phase === "fault" ? "Pump fault" : "Waiting"}
+        </Status>
+      </div>
+      <div className={`mt-5 grid gap-4 ${acetone ? "lg:grid-cols-2" : ""}`}>
+        {acetone && (
+          <div className="rounded-xl border border-white/[0.07] p-4">
+            <div className="text-sm font-semibold text-white">1. Acetone · poured by hand</div>
+            <p className="mt-1 text-xs leading-5 text-gray-500">Pour {acetone.ml.toFixed(1)} mL ({acetone.g.toFixed(1)} g) of acetone through the inlet filter. The reactor load cell weighs it.</p>
+            <div className="mt-3 flex items-baseline justify-between gap-3 text-sm">
+              <span className="text-gray-400">Poured so far</span>
+              <span className="font-mono text-white">{acetone.addedG.toFixed(1)} / {acetone.g.toFixed(1)} g</span>
+            </div>
+            <div className="mt-2"><Progress value={acetone.g > 0 ? (acetone.addedG / acetone.g) * 100 : 100} /></div>
+            {acetone.onDemoAdd && acetone.addedG < acetone.g * 0.95 && (
+              <Button variant="secondary" className="mt-3" onClick={acetone.onDemoAdd}>Pour acetone (demo)</Button>
+            )}
+          </div>
+        )}
+        <div className="rounded-xl border border-white/[0.07] p-4">
+          <div className="text-sm font-semibold text-white">{number}. {info.label}</div>
+          <p className="mt-1 text-xs leading-5 text-gray-500">
+            Mix in tank {info.tank}: <span className="text-gray-300">{premixParts.join(" + ")}</span>. {mixingNote} Make about 10% extra in the same proportions so the line stays full; the pump stops at the dose weight.
+          </p>
+          <div className="mt-3 flex items-baseline justify-between gap-3 text-sm">
+            <span className="text-gray-400">Delivered</span>
+            <span className="font-mono text-white">{deliveredG.toFixed(1)} / {targetG.toFixed(1)} g</span>
+          </div>
+          <div className="mt-2"><Progress value={targetG > 0 ? (deliveredG / targetG) * 100 : 0} /></div>
+          <p className="mt-2 text-xs text-gray-600">Dose {targetG.toFixed(1)} g · about {premixMl.toFixed(1)} mL{pumping && run.byTime ? " · no load cell reading: dosing by time" : ""}</p>
+          {ended && !loaded && (
+            <p className={`mt-2 text-xs ${ended.phase === "fault" ? "text-red-400" : "text-amber-400"}`}>
+              Pump stopped at {deliveredG.toFixed(1)} g: {ended.faultReason}
+            </p>
+          )}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {!pumping && !loaded && !manual && (
+              <Button disabled={Boolean(locked)} onClick={onLoad}>
+                {completedG > 0 ? `Load the remaining ${remainingG.toFixed(1)} g` : `Load with ${info.short}`}
+              </Button>
+            )}
+            {pumping && <Button variant="danger" onClick={onStop}>Stop pump</Button>}
+            {pumping && onSkip && <Button variant="secondary" onClick={onSkip}>Skip (demo)</Button>}
+            {locked && !pumping && !loaded && <span className="text-xs text-amber-400">{locked}</span>}
+          </div>
+          {!loaded && !pumping && (
+            <label className="mt-3 flex items-center gap-2 text-xs text-gray-400">
+              <input className="gv-checkbox" type="checkbox" checked={manual} onChange={(event) => setManual(event.target.checked)} />
+              I added this dose by hand instead (pump not used)
+            </label>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type DrainView = { phase: DrainPhase; remainingSeconds: number; totalSeconds: number; waitingFor: string | null; faultReason: string | null };
+
+const DRAIN_INFO: Record<DrainValve, { label: string; to: string }> = {
+  reactor_outlet: { label: "Reactor outlet valve", to: "to the centrifuge" },
+  centrifuge_outlet: { label: "Centrifuge outlet valve", to: "to the purification tank" },
+};
+
+/** An outlet valve that opens by itself after a stage, stays open for its drain time, then closes. */
+function DrainPanel({
+  valve,
+  view,
+  minutes,
+  onAgain,
+  onStop,
+  onSkip,
+}: {
+  valve: DrainValve;
+  view: DrainView | null;
+  minutes: number;
+  onAgain?: () => void;
+  onStop?: () => void;
+  onSkip?: () => void;
+}) {
+  const info = DRAIN_INFO[valve];
+  const phase = view?.phase ?? "idle";
+  const active = phase === "waiting" || phase === "draining";
+  const tone = phase === "done" ? "green" : phase === "fault" ? "red" : active ? "blue" : "neutral";
+  const text =
+    minutes <= 0 && phase === "idle"
+      ? `Opens by hand: the outlet time in Settings is 0. Move the liquid ${info.to} yourself.`
+      : phase === "waiting"
+        ? `Waiting for ${view?.waitingFor ?? "the centrifuge to stop"} before opening.`
+        : phase === "draining"
+          ? `Open: draining ${info.to} · ${formatTimer(view?.remainingSeconds ?? 0)} left.`
+          : phase === "done"
+            ? `Closed after ${formatMinutes(view?.totalSeconds ?? minutes * 60)}: the liquid went ${info.to}.`
+            : phase === "stopped" || phase === "fault"
+              ? `Closed early: ${view?.faultReason ?? "stopped"}.`
+              : `Opens by itself for ${minutes} min.`;
+  return (
+    <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid={`drain-${valve}`}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="gv-label">{info.label}</div>
+          <p className="text-sm text-gray-300">{text}</p>
+        </div>
+        <Status tone={tone}>{phase === "waiting" ? "WAITING" : phase === "draining" ? "OPEN" : phase === "done" ? "CLOSED" : phase === "idle" ? "CLOSED" : "STOPPED"}</Status>
+      </div>
+      {phase === "draining" && view && view.totalSeconds > 0 && (
+        <div className="mt-4"><Progress value={((view.totalSeconds - view.remainingSeconds) / view.totalSeconds) * 100} /></div>
+      )}
+      {(active || ((phase === "done" || phase === "stopped" || phase === "fault") && onAgain)) && (
+        <div className="mt-4 flex flex-wrap gap-2">
+          {active && onStop && <Button variant="secondary" onClick={onStop}>Close now</Button>}
+          {active && onSkip && <Button variant="secondary" onClick={onSkip}>Skip (demo)</Button>}
+          {!active && onAgain && <Button variant="secondary" onClick={onAgain}>Open again ({minutes} min)</Button>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** After an esterification stage: the FFA re-check with a new strip decides what comes next. */
+function RecheckPanel({
+  stage,
+  value,
+  setValue,
+  aboveStrip,
+  setAboveStrip,
+  settings,
+  next,
+  catalyst,
+  onAnotherStage,
+  onContinue,
+}: {
+  stage: number;
+  value: string;
+  setValue: (value: string) => void;
+  aboveStrip: boolean;
+  setAboveStrip: (value: boolean) => void;
+  settings: ChemistrySettings;
+  next: { ffa: number; ester: EsterDose; trans: TransDose } | null;
+  catalyst: "NaOH" | "KOH";
+  onAnotherStage: () => void;
+  onContinue: () => void;
+}) {
+  const error = aboveStrip ? "" : decimalError(value, { min: 0, max: settings.stripMaxFfa }, {
+    empty: "Enter the re-check FFA.",
+    max: `The strip reads up to ${settings.stripMaxFfa}%. Tick the darkest color instead.`,
+  });
+  const done = next !== null && next.ffa <= settings.ffaTarget;
+  return (
+    <div className="mt-6 rounded-xl border border-green-500/20 bg-green-500/[0.03] p-5" data-testid="ffa-recheck">
+      <div className="gv-label">FFA re-check after stage {stage}</div>
+      <p className="text-sm text-gray-300">Test a sample from the oil layer with a new strip. At or below {settings.ffaTarget}%, go on to transesterification; above it, run another esterification stage.</p>
+      <div className="mt-4 grid gap-4 sm:grid-cols-2">
+        <div>
+          <Field label="FFA after esterification" inputMode="decimal" value={aboveStrip ? String(settings.stripMaxFfa) : value} disabled={aboveStrip} onChange={(event) => setValue(event.target.value)} unit="%" aria-invalid={Boolean(error) && value !== ""} />
+          {error && value !== "" && <p className="mt-2 text-xs text-red-400">{error}</p>}
+        </div>
+        <label className="flex items-center gap-2 self-end pb-3 text-sm text-gray-300">
+          <input className="gv-checkbox" type="checkbox" checked={aboveStrip} onChange={(event) => setAboveStrip(event.target.checked)} />
+          Still the darkest color ({settings.stripMaxFfa}% or more)
+        </label>
+      </div>
+      {next && !error && (
+        done ? (
+          <div className="mt-4 rounded-xl border border-green-500/20 bg-green-500/[0.05] p-4 text-sm text-green-400">
+            FFA {next.ffa.toFixed(1)}% is at or below {settings.ffaTarget}%. Transesterification uses the exact amount: <b>{next.trans.catalystToWeighG.toFixed(2)} g {catalyst}</b> ({next.trans.catalystBaseG.toFixed(2)} g catalyst + {next.trans.neutralizationG.toFixed(2)} g to neutralize {next.ffa.toFixed(1)}% FFA).
+          </div>
+        ) : (
+          <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm text-amber-400">
+            FFA is still {aboveStrip ? `${settings.stripMaxFfa}% or more` : `${next.ffa.toFixed(1)}%`}, above {settings.ffaTarget}%. Stage {stage + 1}: {next.ester.methanolMl.toFixed(1)} mL methanol (40:1) + {next.ester.sulfuricAcidMl.toFixed(2)} mL H₂SO₄, dosed for {next.ester.doseFfa.toFixed(1)}% FFA. No more acetone.
+            {aboveStrip && <span className="mt-1 block text-xs">The oil may have more than {settings.designFfa}% FFA. Stage {stage + 1} is dosed for {settings.designFfa}% again.</span>}
+            {stage >= 3 && <span className="mt-1 block text-xs">Several stages haven't brought the FFA down. Consider checking the strip, the reaction time, or using a different feedstock.</span>}
+          </div>
+        )
+      )}
+      <div className="mt-4 flex flex-wrap gap-3">
+        {done && <Button onClick={onContinue}>Continue to Transesterification →</Button>}
+        {next && !error && !done && <Button onClick={onAnotherStage}>Prepare esterification stage {stage + 1} →</Button>}
+      </div>
+    </div>
+  );
+}
+
 function ReactionStage({
   kind,
   state,
@@ -488,7 +853,10 @@ function ReactionStage({
   oilVolume,
   catalyst,
   ratio,
-  quantities,
+  esterDose,
+  transDose,
+  transExact,
+  esterStage = 1,
   voltage,
   time,
   stirring,
@@ -499,6 +867,10 @@ function ReactionStage({
   liveMock,
   onReset,
   error,
+  preparation,
+  footer,
+  startBlocked,
+  hideContinue,
 }: {
   kind: "Esterification" | "Transesterification";
   state: StageState;
@@ -507,7 +879,11 @@ function ReactionStage({
   oilVolume: number | null;
   catalyst: "NaOH" | "KOH";
   ratio: number;
-  quantities: ReturnType<typeof calculateQuantityCards>;
+  esterDose: EsterDose;
+  transDose: TransDose;
+  /** The catalyst amount is exact (after the FFA re-check, or without esterification). */
+  transExact: boolean;
+  esterStage?: number;
   voltage: number;
   time: number;
   stirring: number;
@@ -518,6 +894,12 @@ function ReactionStage({
   liveMock: boolean;
   onReset?: () => void;
   error?: string | null;
+  /** Loading the reactor (shown before the stage starts). */
+  preparation?: ReactNode;
+  /** Shown under the controls: the FFA re-check, or the reactor outlet. */
+  footer?: ReactNode;
+  startBlocked?: string | null;
+  hideContinue?: boolean;
 }) {
   const isEsterification = kind === "Esterification";
   const totalSeconds = time * 60;
@@ -526,15 +908,18 @@ function ReactionStage({
     : (state === "ready" ? 0 : state === "complete" ? time : Math.min(42, time)) * 60;
   const remainingSeconds = liveStage ? liveStage.remainingSeconds : Math.max(totalSeconds - elapsedSeconds, 0);
   const showTime = (seconds: number) => (liveStage ? formatTimer(seconds) : `${Math.round(seconds / 60)} min`);
+  const title = isEsterification && esterStage > 1 ? `Esterification · stage ${esterStage}` : kind;
   return (
     <Card className="p-6 sm:p-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <SectionHeader
           eyebrow={`Batch ${batchId}`}
-          title={kind}
+          title={title}
           description={
             isEsterification
-              ? "Acid pretreatment of high-FFA feedstock before transesterification."
+              ? esterStage > 1
+                ? "FFA was still above 1% after the last stage: another acid stage, dosed for the re-check reading."
+                : "Acid pretreatment of high-FFA feedstock before transesterification. The dose is the same for every oil above 4% FFA."
               : "Base-catalyzed conversion of the prepared oil into biodiesel."
           }
         />
@@ -554,14 +939,26 @@ function ReactionStage({
       </div>
 
       <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="p-5"><Metric label="Measured oil" value={`${oilMass.toFixed(1)} g`} sub={oilVolume === null ? "Volume unavailable" : `${oilVolume.toFixed(1)} mL configured conversion`} /></Card>
-        <Card className="p-5"><Metric label="Methanol" value={`${(isEsterification ? quantities.esterificationMethanolMl : quantities.transesterificationMethanolMl).toFixed(1)} mL`} sub={isEsterification ? "20:1 methanol to FFA · calculated" : `${ratio}:1 molar ratio · calculated`} /></Card>
+        <Card className="p-5"><Metric label="Oil in this batch" value={`${oilMass.toFixed(1)} g`} sub={oilVolume === null ? "Volume unavailable" : `${oilVolume.toFixed(1)} mL · recorded at oil loading`} /></Card>
+        <Card className="p-5">
+          <Metric
+            label="Methanol"
+            value={`${(isEsterification ? esterDose.methanolMl : transDose.methanolMl).toFixed(1)} mL`}
+            sub={isEsterification ? `${esterStage === 1 ? "20:1" : "40:1"} methanol to FFA · dose for ${esterDose.doseFfa.toFixed(1)}% FFA` : `${ratio}:1 molar ratio · calculated`}
+          />
+        </Card>
         {isEsterification ? (
-          <Card className="p-5"><Metric label="Sulfuric acid (H₂SO₄)" value={`${quantities.sulfuricAcidMl.toFixed(2)} mL`} sub="98% · 5% of FFA weight · added by hand" /></Card>
+          <Card className="p-5"><Metric label="Sulfuric acid (H₂SO₄)" value={`${esterDose.sulfuricAcidMl.toFixed(2)} mL`} sub="98% · 5% of the dose's FFA weight · mixed into the methanol" /></Card>
         ) : (
-          <Card className="p-5"><Metric label={`${catalyst} to weigh`} value={`${quantities.esterificationNeeded ? "Up to " : ""}${quantities.catalystToWeighG.toFixed(1)} g`} sub={`${quantities.catalystBaseG.toFixed(1)} g catalyst + ${quantities.neutralizationG.toFixed(1)} g to neutralize · ${quantities.purity}% purity`} /></Card>
+          <Card className="p-5"><Metric label={`${catalyst} to weigh`} value={`${transExact ? "" : "Up to "}${transDose.catalystToWeighG.toFixed(2)} g`} sub={`${transDose.catalystBaseG.toFixed(1)} g catalyst + ${transDose.neutralizationG.toFixed(2)} g to neutralize · ${transDose.purity}% purity${transExact ? " · exact" : ""}`} /></Card>
         )}
-        <Card className="p-5"><Metric label="Acetone" value={quantities.acetoneMl === null ? "Unavailable" : `${quantities.acetoneMl.toFixed(1)} mL`} sub="Provisional 10% calculation · not dispensed" /></Card>
+        <Card className="p-5">
+          <Metric
+            label="Acetone"
+            value={isEsterification && esterStage > 1 ? "None" : transDose.acetoneMl === null ? "Unavailable" : `${(isEsterification ? esterDose.acetoneMl : transDose.acetoneMl).toFixed(1)} mL`}
+            sub={isEsterification && esterStage > 1 ? "Still in the reactor from stage 1" : "Provisional 10% · poured by hand through the inlet"}
+          />
+        </Card>
       </div>
 
       <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -571,7 +968,9 @@ function ReactionStage({
         <Card className="p-5"><Metric label="Batch ID" value={batchId} /></Card>
       </div>
 
-      <div className="mt-6 rounded-xl border border-white/[0.07] bg-black/10 p-5">
+      {state === "ready" && preparation}
+
+      <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5">
         <div className="mb-4 flex items-center justify-between gap-4">
           <div>
             <div className="gv-label">Live monitoring</div>
@@ -597,21 +996,51 @@ function ReactionStage({
       <StageControls
         state={state}
         setState={setState}
-        startLabel={`Start ${kind}`}
+        startLabel={isEsterification && esterStage > 1 ? `Start esterification stage ${esterStage}` : `Start ${kind}`}
         onContinue={onContinue}
         continueLabel={isEsterification ? "Continue to Transesterification" : "Continue to Separation"}
         onReset={onReset}
         error={error}
+        startBlocked={startBlocked}
+        hideContinue={hideContinue}
       />
+      {footer}
     </Card>
   );
 }
 
+type LocalPump = { key: string; pump: PumpName; base: number; targetG: number; deliveredG: number; phase: PumpPhase; faultReason: string | null };
+type LocalDrain = { valve: DrainValve; phase: DrainPhase; remainingSeconds: number; totalSeconds: number };
+type DoseLoad = { completedG: number; manual: boolean };
+
 export default function NewBatch() {
   const [step, setStep] = useState(0);
-  const [oilMassG, setOilMassG] = useState(0);
+  // Reactor load cell: the oil, then everything poured or pumped in (live, or the local demo).
+  const [reactorG, setReactorG] = useState(0);
+  // The oil weight recorded at "Confirm detected quantity"; the calculations use it from then on.
+  const [confirmedOilG, setConfirmedOilG] = useState<number | null>(null);
+  const oilMassG = confirmedOilG ?? reactorG;
   const [targetVolume, setTargetVolume] = useState("500");
   const [ffa, setFfa] = useState("");
+  // The strip shows its darkest color: FFA is at least the strip's maximum (5%).
+  const [ffaAboveStrip, setFfaAboveStrip] = useState(false);
+  // Esterification stages and the FFA re-check after each one
+  const [esterStage, setEsterStage] = useState(1);
+  const [esterRecords, setEsterRecords] = useState<EsterStageRecord[]>([]);
+  const [nextDoseFfa, setNextDoseFfa] = useState<number | null>(null);
+  const [recheckValue, setRecheckValue] = useState("");
+  const [recheckAbove, setRecheckAbove] = useState(false);
+  const [finalFfa, setFinalFfa] = useState<number | null>(null);
+  // Dosing pumps: what each dose ("Esterification 1", "Transesterification") has received
+  const [loads, setLoads] = useState<Record<string, DoseLoad>>({});
+  const pendingPump = useRef<{ key: string; base: number; startedAt: string | null } | null>(null);
+  const [localPump, setLocalPump] = useState<LocalPump | null>(null);
+  const [localDrain, setLocalDrain] = useState<LocalDrain | null>(null);
+  // Reactor weight when each dose's step opened, to show the acetone poured since
+  const [acetoneBase, setAcetoneBase] = useState<Record<string, number>>({});
+  const transferSettings = useMemo(getTransferSettings, []);
+  const [stirrerOn, setStirrerOn] = useState(false);
+  const [stirrerRpm, setStirrerRpm] = useState<number | null>(null);
   const [ratio, setRatio] = useState(7);
   const [catalyst, setCatalyst] = useState<"NaOH" | "KOH">("NaOH");
   const [esterVoltage, setEsterVoltage] = useState("20");
@@ -670,6 +1099,9 @@ export default function NewBatch() {
   /** Shows the local demonstration state on the screen. */
   function showLocalPurification(sim: LocalPurification) {
     setPurificationPhase(sim.phase);
+    const stirring = (sim.phase === "heating" || sim.phase === "hold") && transferSettings.stirringSpeed > 0;
+    setStirrerOn(stirring);
+    setStirrerRpm(stirring ? transferSettings.stirringSpeed : 0);
     setLiveTemperature(sim.temperature);
     setHighestTemperature(sim.highest);
     setHeaterOn(sim.heaterOn);
@@ -704,7 +1136,7 @@ export default function NewBatch() {
   // Backend connected: show its live readings and the state of its stages.
   useEffect(() => {
     if (!backend || !live) return;
-    if (live.sensors.oilMassG !== null) setOilMassG(live.sensors.oilMassG);
+    if (live.sensors.oilMassG !== null) setReactorG(live.sensors.oilMassG);
     const stage = live.stage;
     if (stage.stage && stage.batchId === batchId) {
       if (stage.stage === "Esterification") setEsterState(stage.state);
@@ -736,7 +1168,52 @@ export default function NewBatch() {
     setFlowRateGPerMinute(p.flowRateGPerMinute ?? 0);
     setSafetyStopReason(p.safetyStopReason);
     setSafetyStopOccurred(p.safetyStopOccurred);
+    setStirrerOn(p.stirrerOn);
+    setStirrerRpm(p.stirrerRpm);
   }, [backend, live, batchId]);
+
+  // A pump run on the Pi has ended: add what it delivered to its dose.
+  useEffect(() => {
+    if (!backend || !live) return;
+    const p = live.pump;
+    const pending = pendingPump.current;
+    if (!pending || p.startedAt !== pending.startedAt) return;
+    if (p.phase === "done" || p.phase === "fault" || p.phase === "stopped") {
+      pendingPump.current = null;
+      setLoads((current) => ({
+        ...current,
+        [pending.key]: { completedG: pending.base + p.deliveredG, manual: current[pending.key]?.manual ?? false },
+      }));
+    }
+  }, [backend, live]);
+
+  // Local demonstration of a pump: the dose arrives in about 5 seconds.
+  useEffect(() => {
+    if (backend || !localPump || localPump.phase !== "pumping") return;
+    const timer = window.setTimeout(() => {
+      const stepG = Math.min(localPump.targetG / 5, localPump.targetG - localPump.deliveredG);
+      const delivered = localPump.deliveredG + stepG;
+      setReactorG((grams) => grams + stepG);
+      if (delivered >= localPump.targetG - 0.01) {
+        setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
+        setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG, manual: false } }));
+      } else {
+        setLocalPump({ ...localPump, deliveredG: delivered });
+      }
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [backend, localPump]);
+
+  // Local demonstration of an outlet valve: open for its drain time, one step per second.
+  useEffect(() => {
+    if (backend || !localDrain || localDrain.phase !== "draining") return;
+    const timer = window.setTimeout(() => {
+      const remaining = Math.max(localDrain.remainingSeconds - 1, 0);
+      if (remaining === 0 && localDrain.valve === "reactor_outlet") setReactorG(0);
+      setLocalDrain({ ...localDrain, remainingSeconds: remaining, phase: remaining === 0 ? "done" : "draining" });
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [backend, localDrain]);
 
   const oilVolumeMl =
     PROCESS_CONFIG.oil.densityGPerMl > 0
@@ -753,8 +1230,9 @@ export default function NewBatch() {
       max: "Maximum supported oil volume is 1000 mL.",
     },
   );
-  const ffaError = decimalError(ffa, { min: 0, max: 100 }, { empty: "Enter a valid FFA percentage." });
-  const ffaNumber = Number(ffa);
+  const ffaError = ffaAboveStrip ? "" : decimalError(ffa, { min: 0, max: 100 }, { empty: "Enter a valid FFA percentage." });
+  // Above the strip's range the batch is recorded at the strip's maximum (5%), marked "≥".
+  const ffaNumber = ffaAboveStrip ? chemistrySettings.stripMaxFfa : Number(ffa);
   const requiresEsterification =
     !ffaError && ffaNumber > PROCESS_CONFIG.ffaThreshold;
   const measuredOilError =
@@ -790,6 +1268,28 @@ export default function NewBatch() {
     chemistrySettings,
   );
   const calculatorReady = oilMassG > 0 && !ffaError;
+
+  // ----- esterification stages and the FFA re-check -----
+  const esterDoseNow = esterificationDose(oilMassG, oilVolumeMl, esterStage === 1 ? ffaNumber : nextDoseFfa ?? ffaNumber, esterStage, chemistrySettings);
+  const recheckError = recheckAbove ? "" : decimalError(recheckValue, { min: 0, max: chemistrySettings.stripMaxFfa });
+  const recheckFfa = recheckAbove ? chemistrySettings.stripMaxFfa : Number(recheckValue);
+  const recheckNext = recheckError
+    ? null
+    : {
+        ffa: recheckFfa,
+        ester: esterificationDose(oilMassG, oilVolumeMl, recheckAbove ? chemistrySettings.designFfa : recheckFfa, esterStage + 1, chemistrySettings),
+        trans: transesterificationDose(oilMassG, oilVolumeMl, recheckFfa, ratio, catalyst, chemistrySettings),
+      };
+  // Transesterification neutralizes the last re-check reading (exact), or the starting FFA.
+  const transAcidPct = requiresEsterification ? finalFfa ?? chemistrySettings.ffaTarget : ffaNumber;
+  const transDoseNow = transesterificationDose(oilMassG, oilVolumeMl, transAcidPct, ratio, catalyst, chemistrySettings);
+  const transExact = !requiresEsterification || finalFfa !== null;
+  const esterStagesRun = esterRecords.length || (requiresEsterification ? 1 : 0);
+  const esterMethanolTotal = esterRecords.length ? esterRecords.reduce((sum, record) => sum + record.methanolMl, 0) : requiresEsterification ? calculatorValues.esterificationMethanolMl : 0;
+  const acetoneTotalMl =
+    (requiresEsterification ? esterRecords.find((record) => record.stage === 1)?.acetoneMl ?? calculatorValues.acetoneMl ?? 0 : 0) +
+    (transDoseNow.acetoneMl ?? 0);
+  const esterAcidTotal = esterRecords.length ? esterRecords.reduce((sum, record) => sum + record.sulfuricAcidMl, 0) : requiresEsterification ? calculatorValues.sulfuricAcidMl : 0;
   useEffect(() => {
     if (ffaError) return;
     let cancelled = false;
@@ -816,6 +1316,11 @@ export default function NewBatch() {
       cancelled = true;
     };
   }, [ffaError, ffaNumber]);
+  function unconfirmOil() {
+    setLoadingConfirmed(false);
+    setConfirmedOilG(null);
+  }
+
   const targetReached =
     !targetError &&
     oilVolumeMl !== null &&
@@ -838,13 +1343,16 @@ export default function NewBatch() {
     { label: "Electrodes", value: "Copper tube – stainless steel", secondary: "Connected" },
     { label: "Stirrer", value: "Ready" },
     { label: "Temperature Sensor", value: "Online", secondary: "27 °C · demonstration reading" },
-    { label: "Load Cell", value: "Online", secondary: `${oilMassG.toFixed(1)} g · zeroed · demonstration mode` },
+    { label: "Reactor Load Cell", value: "Online", secondary: `${reactorG.toFixed(1)} g in the reactor · demonstration mode` },
     {
       label: "Oil Input",
-      value: oilMassG > 0 ? `${oilMassG.toFixed(1)} g` : "No oil detected",
-      secondary: "Input channel ready · demonstration mode",
+      value: reactorG > 0 ? `${reactorG.toFixed(1)} g` : "No oil detected",
+      secondary: "Pour the oil through the inlet filter",
       state: "ready",
     },
+    { label: "Dosing Pumps", value: "Ready", secondary: "A: NaOH/KOH + methanol · B: H₂SO₄ + methanol" },
+    { label: "Outlet Valves", value: "All closed", secondary: "Reactor, centrifuge and purification outlets" },
+    { label: "Output Load Cell", value: "Online", secondary: "0.0 g in the biodiesel container" },
   ];
   const tiles = systemStatus?.tiles ?? systemTiles;
   const fault = tiles.find((tile) => tile.state === "fault");
@@ -888,18 +1396,215 @@ export default function NewBatch() {
   const realHardware = backend && !mock;
 
   async function loadDemoReading() {
-    setLoadingConfirmed(false);
+    unconfirmOil();
     setActionError(null);
     if (backend) {
       try {
         const sensors = await loadDemoOil(Number(targetVolume || 0));
-        if (sensors.oilMassG !== null) setOilMassG(sensors.oilMassG);
+        if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
       } catch (error) {
         setActionError(errorText(error));
       }
       return;
     }
-    setOilMassG(Number(targetVolume || 0) * PROCESS_CONFIG.oil.densityGPerMl);
+    setReactorG(Number(targetVolume || 0) * PROCESS_CONFIG.oil.densityGPerMl);
+  }
+
+  // ----- dosing pumps -----
+  const doseKey = currentStage === "Esterification" ? `Esterification ${esterStage}` : currentStage === "Transesterification" ? "Transesterification" : null;
+
+  function pumpRunFor(key: string): PumpView | null {
+    if (backend) {
+      const p = live?.pump;
+      if (!p || p.phase === "idle" || p.batchId !== batchId || p.stage !== key) return null;
+      return { phase: p.phase, deliveredG: p.deliveredG, faultReason: p.faultReason, byTime: p.byTime };
+    }
+    if (!localPump || localPump.key !== key) return null;
+    return { phase: localPump.phase, deliveredG: localPump.deliveredG, faultReason: localPump.faultReason, byTime: false };
+  }
+
+  const pumpRunning = backend ? live?.pump.phase === "pumping" : localPump?.phase === "pumping";
+
+  function doseLoaded(key: string, targetG: number) {
+    const record = loads[key];
+    return Boolean(record && (record.manual || record.completedG >= targetG - 1));
+  }
+
+  /** "Load": the pump adds the dose (or what's left of it) and stops at its weight. */
+  async function loadDose(key: string, pump: PumpName, targetG: number, premixMl: number) {
+    setActionError(null);
+    const base = loads[key]?.completedG ?? 0;
+    const remainingG = targetG - base;
+    if (remainingG <= 0.5) return;
+    const volumeMl = (premixMl * remainingG) / targetG;
+    if (backend) {
+      try {
+        const state = await startPump({
+          pump,
+          targetG: Number(remainingG.toFixed(1)),
+          volumeMl: Number(Math.max(volumeMl, 0.1).toFixed(1)),
+          batchId,
+          stage: key,
+        });
+        pendingPump.current = { key, base, startedAt: state.startedAt };
+      } catch (error) {
+        setActionError(errorText(error));
+      }
+      return;
+    }
+    setLocalPump({ key, pump, base, targetG: remainingG, deliveredG: 0, phase: "pumping", faultReason: null });
+  }
+
+  async function stopPump() {
+    if (backend) {
+      pumpAction("stop").catch((error) => setActionError(errorText(error)));
+      return;
+    }
+    if (localPump?.phase === "pumping") {
+      setLocalPump({ ...localPump, phase: "stopped", faultReason: "stopped by operator" });
+      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.deliveredG, manual: false } }));
+    }
+  }
+
+  function skipPump() {
+    if (backend) {
+      pumpAction("skip").catch((error) => setActionError(errorText(error)));
+      return;
+    }
+    if (localPump?.phase === "pumping") {
+      setReactorG((grams) => grams + localPump.targetG - localPump.deliveredG);
+      setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
+      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG, manual: false } }));
+    }
+  }
+
+  function setManualDose(key: string, manual: boolean) {
+    setLoads((current) => ({ ...current, [key]: { completedG: current[key]?.completedG ?? 0, manual } }));
+  }
+
+  /** Demo: acetone poured through the inlet lands on the reactor load cell. */
+  async function pourDemoAcetone(grams: number) {
+    setActionError(null);
+    if (backend) {
+      try {
+        const sensors = await demoAdd(Number(grams.toFixed(1)));
+        if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
+      } catch (error) {
+        setActionError(errorText(error));
+      }
+      return;
+    }
+    setReactorG((current) => current + grams);
+  }
+
+  // Remember the reactor weight when a dose's step opens: acetone poured since = the rise.
+  useEffect(() => {
+    if (!doseKey || acetoneBase[doseKey] !== undefined) return;
+    setAcetoneBase((current) => ({ ...current, [doseKey]: reactorG }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doseKey]);
+
+  function acetonePouredG(key: string) {
+    const run = pumpRunFor(key);
+    const pumped = (loads[key]?.completedG ?? 0) + (run?.phase === "pumping" ? run.deliveredG : 0);
+    return Math.max(reactorG - (acetoneBase[key] ?? reactorG) - pumped, 0);
+  }
+
+  // ----- outlet valves -----
+  function drainViewFor(valve: DrainValve): DrainView | null {
+    if (backend) {
+      const d = live?.drain;
+      if (!d || d.valve !== valve || d.batchId !== batchId || d.phase === "idle") return null;
+      return d;
+    }
+    if (!localDrain || localDrain.valve !== valve) return null;
+    return { ...localDrain, waitingFor: null, faultReason: localDrain.phase === "stopped" ? "closed by operator" : null };
+  }
+
+  const drainMinutes = (valve: DrainValve) =>
+    valve === "reactor_outlet" ? transferSettings.reactorDrainMinutes : transferSettings.centrifugeDrainMinutes;
+
+  function draining(valve: DrainValve) {
+    const view = drainViewFor(valve);
+    return view !== null && (view.phase === "waiting" || view.phase === "draining");
+  }
+
+  function startLocalDrain(valve: DrainValve) {
+    const seconds = Math.round(drainMinutes(valve) * 60);
+    if (seconds <= 0) return;
+    setLocalDrain({ valve, phase: "draining", remainingSeconds: seconds, totalSeconds: seconds });
+  }
+
+  async function openDrainAgain(valve: DrainValve) {
+    setActionError(null);
+    if (backend) {
+      try {
+        await startDrain(valve, batchId);
+      } catch (error) {
+        setActionError(errorText(error));
+      }
+      return;
+    }
+    startLocalDrain(valve);
+  }
+
+  function closeDrain() {
+    if (backend) {
+      drainAction("stop").catch((error) => setActionError(errorText(error)));
+      return;
+    }
+    if (localDrain) setLocalDrain({ ...localDrain, phase: "stopped" });
+  }
+
+  function skipDrain() {
+    if (backend) {
+      drainAction("skip").catch((error) => setActionError(errorText(error)));
+      return;
+    }
+    if (localDrain) {
+      if (localDrain.valve === "reactor_outlet") setReactorG(0);
+      setLocalDrain({ ...localDrain, remainingSeconds: 0, phase: "done" });
+    }
+  }
+
+  // ----- FFA re-check after an esterification stage -----
+  function recordEsterStage(ffaAfter: number) {
+    const record: EsterStageRecord = {
+      stage: esterStage,
+      ffaBefore: esterStage === 1 ? ffaNumber : esterRecords[esterRecords.length - 1]?.ffaAfter ?? ffaNumber,
+      ffaAfter,
+      doseFfa: esterDoseNow.doseFfa,
+      methanolMl: Number(esterDoseNow.methanolMl.toFixed(2)),
+      sulfuricAcidMl: Number(esterDoseNow.sulfuricAcidMl.toFixed(3)),
+      acetoneMl: Number(esterDoseNow.acetoneMl.toFixed(1)),
+    };
+    setEsterRecords((current) => [...current.filter((item) => item.stage !== esterStage), record]);
+  }
+
+  async function prepareNextEsterStage() {
+    if (!recheckNext) return;
+    setActionError(null);
+    recordEsterStage(recheckNext.ffa);
+    if (backend) {
+      try {
+        await stageAction("reset");
+      } catch (error) {
+        setActionError(errorText(error));
+        return;
+      }
+    }
+    setNextDoseFfa(recheckNext.ester.doseFfa);
+    setEsterStage((current) => current + 1);
+    setRecheckValue("");
+    setRecheckAbove(false);
+    setEsterState("ready");
+  }
+
+  function finishEsterification() {
+    if (!recheckNext) return;
+    recordEsterStage(recheckNext.ffa);
+    setFinalFfa(recheckNext.ffa);
+    next();
   }
 
   /** Stage buttons: the backend runs the stage when it's connected; otherwise the local demo. */
@@ -907,6 +1612,9 @@ export default function NewBatch() {
     setActionError(null);
     if (!backend) {
       setLocal(nextState);
+      // the outlet valves open by themselves after these stages (the Pi does this itself)
+      if (nextState === "complete" && kind === "Transesterification") startLocalDrain("reactor_outlet");
+      if (nextState === "complete" && kind === "Separation") startLocalDrain("centrifuge_outlet");
       return;
     }
     try {
@@ -1067,15 +1775,17 @@ export default function NewBatch() {
   // With the backend, the Raspberry Pi starts it after separation, when the level switch detects biodiesel.
   useEffect(() => {
     if (backend || currentStage !== "Purification" || autoStarted.current || purificationPhase !== "ready") return;
+    if (localDrain && localDrain.valve === "centrifuge_outlet" && localDrain.phase === "draining") return;   // biodiesel still on its way
     autoStarted.current = true;
     startPurificationNow(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, currentStage, purificationPhase]);
+  }, [backend, currentStage, purificationPhase, localDrain]);
 
   const levelSwitch = backend && live ? live.sensors.heaterSubmerged : null;
   const autoStartPending = backend && live !== null && live.purificationAutoStart === batchId;
+  const centrifugeDraining = draining("centrifuge_outlet");
   const showManualStart =
-    purificationPhase === "ready" && !safetyStopReason && (!backend || !autoStartPending || levelSwitch === null);
+    purificationPhase === "ready" && !safetyStopReason && !centrifugeDraining && (!backend || !autoStartPending || levelSwitch === null);
   const shownPlannedFlowSeconds = plannedFlowSeconds ?? plannedFlowSecondsFor(oilVolumeMl, purificationSettings);
   const shownBiodieselMl = expectedBiodieselMl ?? oilVolumeMl;
 
@@ -1083,19 +1793,27 @@ export default function NewBatch() {
     if (!saved) {
       setActionError(null);
       const totalReactionTime =
-        Number(transTime) + (requiresEsterification ? Number(esterTime) : 0);
+        Number(transTime) + (requiresEsterification ? Number(esterTime) * esterStagesRun : 0);
+      const oilVolume = Number((oilVolumeMl ?? 0).toFixed(1));
+      // Offline the website works out the yield itself from the output load cell; the Pi does it on its own.
+      const localOutputMl = !backend && outputWeightG > 0 ? Number((outputWeightG / 0.88).toFixed(1)) : undefined;
       let result: BatchRecord;
       try {
         result = await saveCompletedBatch({
           id: batchId,
           date: new Date().toISOString().slice(0, 10),
-          oilVolume: Number((oilVolumeMl ?? 0).toFixed(1)),
-          yield: 0,
+          oilVolume,
+          yield: localOutputMl && oilVolume ? Number(((localOutputMl / oilVolume) * 100).toFixed(1)) : 0,
+          biodieselOutputMl: localOutputMl,
           duration: totalReactionTime + PROCESS_CONFIG.separation.timeMinutes,
           energy: 0,
           status: "Completed",
           labResult: "Pending",
           ffa: ffaNumber,
+          ffaAboveStrip,
+          oilMassG: Number(oilMassG.toFixed(1)),
+          catalystToWeighG: Number(transDoseNow.catalystToWeighG.toFixed(3)),
+          esterificationStages: esterRecords,
           esterificationRun: requiresEsterification,
           temperature: 27,
           reactionTime: Number(transTime),
@@ -1119,6 +1837,8 @@ export default function NewBatch() {
             automatic: purificationAutomatic,
             warning: purificationWarning,
             safetyStopOccurred,
+            stirringSpeed: transferSettings.stirringSpeed,
+            outputWeightG: outputWeightG || null,
           },
         });
       } catch (error) {
@@ -1223,13 +1943,13 @@ export default function NewBatch() {
           <div className="grid gap-6 xl:grid-cols-2">
             <Card className="p-6 sm:p-8">
               <Heading as="h2" className="text-lg font-semibold">1. Oil Input</Heading>
-              <p className="mt-1 text-sm text-gray-500">The load cell is authoritative for actual oil mass.</p>
+              <p className="mt-1 text-sm text-gray-500">Pour the oil through the inlet filter. The reactor load cell is authoritative for the actual oil mass.</p>
               <div className="mt-6 grid gap-4 sm:grid-cols-2">
-                <ReadOnlyTile label="Live oil mass" value={`${oilMassG.toFixed(1)} g`} secondary={realHardware ? "Load cell · live" : "Load cell · demonstration channel"} state={oilMassG > 0 ? "ready" : "checking"} />
+                <ReadOnlyTile label="Live oil mass" value={`${oilMassG.toFixed(1)} g`} secondary={realHardware ? "Reactor load cell · live" : "Reactor load cell · demonstration channel"} state={oilMassG > 0 ? "ready" : "checking"} />
                 <ReadOnlyTile label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} secondary={`Configured density: ${PROCESS_CONFIG.oil.densityGPerMl} g/mL · assumed`} state={oilMassG > 0 ? "ready" : "checking"} />
               </div>
               <div className="mt-5">
-                <Field label="Target batch volume" inputMode="decimal" value={targetVolume} onChange={(event) => { setTargetVolume(event.target.value); setLoadingConfirmed(false); }} unit="mL" aria-invalid={Boolean(targetError)} />
+                <Field label="Target batch volume" inputMode="decimal" value={targetVolume} onChange={(event) => { setTargetVolume(event.target.value); unconfirmOil(); }} unit="mL" aria-invalid={Boolean(targetError)} />
                 <p className={`mt-2 text-xs ${targetError ? "text-red-400" : "text-gray-600"}`}>{targetError || "Supported prototype capacity: 100–1,000 mL."}</p>
               </div>
               <div className="mt-5 flex flex-wrap items-center gap-3">
@@ -1241,18 +1961,27 @@ export default function NewBatch() {
 
             <Card className="p-6 sm:p-8">
               <Heading as="h2" className="text-lg font-semibold">2. FFA Measurement</Heading>
-              <p className="mt-1 text-sm text-gray-500">Measure the feedstock using the FFA test strips, then enter the observed result.</p>
+              <p className="mt-1 text-sm text-gray-500">Measure the feedstock using the FFA test strips, then enter the observed result. The strip reads up to {chemistrySettings.stripMaxFfa}%.</p>
               <div className="mt-6">
-                <Field label="FFA Percentage" inputMode="decimal" value={ffa} onChange={(event) => setFfa(event.target.value)} unit="%" aria-invalid={Boolean(ffaError)} />
+                <Field label="FFA Percentage" inputMode="decimal" value={ffaAboveStrip ? String(chemistrySettings.stripMaxFfa) : ffa} disabled={ffaAboveStrip} onChange={(event) => setFfa(event.target.value)} unit="%" aria-invalid={Boolean(ffaError)} />
                 {ffaError && <p className="mt-2 text-xs text-red-400">{ffaError}</p>}
+                {!ffaError && !ffaAboveStrip && ffaNumber > chemistrySettings.stripMaxFfa && (
+                  <p className="mt-2 text-xs text-amber-400">The strip reads only up to {chemistrySettings.stripMaxFfa}%. If it shows its darkest color, tick the box below.</p>
+                )}
+                <label className="mt-4 flex items-center gap-2 text-sm text-gray-300">
+                  <input className="gv-checkbox" type="checkbox" checked={ffaAboveStrip} onChange={(event) => setFfaAboveStrip(event.target.checked)} />
+                  The strip shows its darkest color ({chemistrySettings.stripMaxFfa}% or more)
+                </label>
               </div>
               {!ffaError && (
                 <div className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.025] p-4">
                   <div className="gv-label">Pathway decision · threshold {PROCESS_CONFIG.ffaThreshold.toFixed(1)}%</div>
                   <p className="text-sm text-gray-300">
-                    {requiresEsterification
-                      ? "Esterification required before transesterification."
-                      : "Proceed directly to transesterification."}
+                    {ffaAboveStrip
+                      ? `FFA ${chemistrySettings.stripMaxFfa}% or more (recorded as ≥ ${chemistrySettings.stripMaxFfa}%). Esterification with the uniform dose for ${chemistrySettings.designFfa}% FFA, then an FFA re-check.`
+                      : requiresEsterification
+                        ? `Esterification required before transesterification: the uniform dose for ${chemistrySettings.designFfa}% FFA, then an FFA re-check.`
+                        : "Proceed directly to transesterification."}
                   </p>
                 </div>
               )}
@@ -1280,7 +2009,7 @@ export default function NewBatch() {
             <div className="mt-7">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <Heading as="h3" className="text-base font-semibold">Esterification</Heading>
-                {calculatorReady && requiresEsterification && <Status tone="yellow">FFA above 4%</Status>}
+                {calculatorReady && requiresEsterification && <Status tone="yellow">Uniform dose · {calculatorValues.doseFfa}% design FFA</Status>}
               </div>
               {calculatorReady && !requiresEsterification ? (
                 <div className="rounded-xl border border-white/[0.07] bg-white/[0.025] p-5 text-sm text-gray-500">
@@ -1292,12 +2021,12 @@ export default function NewBatch() {
                     <ReadOnlyTile
                       label="Methanol"
                       value={calculatorReady ? `${calculatorValues.esterificationMethanolMl.toFixed(1)} mL` : "—"}
-                      secondary={calculatorReady ? `20:1 methanol to FFA · ${calculatorValues.ffaMassG.toFixed(1)} g FFA × 2.84` : undefined}
+                      secondary={calculatorReady ? `20:1 methanol to FFA · dosed for ${calculatorValues.doseFfa}% FFA: ${calculatorValues.ffaMassG.toFixed(1)} g × 2.84` : undefined}
                     />
                     <ReadOnlyTile
                       label="Sulfuric acid 98%"
                       value={calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—"}
-                      secondary={calculatorReady ? `5% of FFA weight · ${calculatorValues.ffaMassG.toFixed(1)} g FFA × 0.027` : undefined}
+                      secondary={calculatorReady ? `5% of the dose's FFA weight · ${calculatorValues.ffaMassG.toFixed(1)} g × 0.027` : undefined}
                     />
                     <ReadOnlyTile
                       label="Acetone"
@@ -1307,7 +2036,7 @@ export default function NewBatch() {
                   </div>
                   {calculatorReady && requiresEsterification && (
                     <p className="mt-3 text-xs leading-5 text-gray-500">
-                      If FFA is still above 1% after this stage, the next stage's amounts appear on the Esterification step.
+                      Every batch above {PROCESS_CONFIG.ffaThreshold}% FFA gets this dose, because the strip can't measure above {chemistrySettings.stripMaxFfa}%. It covers oil up to {chemistrySettings.designFfa}% FFA. Pump B loads it as one premix ({calculatorValues.esterificationPremixG.toFixed(1)} g). After the stage, an FFA re-check decides: at or below {chemistrySettings.ffaTarget}%, transesterification with the exact catalyst; above it, another stage dosed for the reading.
                     </p>
                   )}
                 </>
@@ -1334,7 +2063,7 @@ export default function NewBatch() {
                     calculatorReady
                       ? requiresEsterification
                         ? `${calculatorValues.catalystBaseG.toFixed(1)} g catalyst + up to ${calculatorValues.neutralizationG.toFixed(1)} g to neutralize acid · final amount after the FFA re-check`
-                        : `${calculatorValues.catalystBaseG.toFixed(1)} g catalyst + ${calculatorValues.neutralizationG.toFixed(1)} g to neutralize FFA · ${calculatorValues.purity}% purity`
+                        : `${calculatorValues.catalystBaseG.toFixed(1)} g catalyst + ${calculatorValues.neutralizationG.toFixed(1)} g to neutralize FFA · ${calculatorValues.purity}% purity · pump A premix ${calculatorValues.transesterificationPremixG.toFixed(1)} g`
                       : undefined
                   }
                 />
@@ -1352,14 +2081,14 @@ export default function NewBatch() {
             <p className="mt-1 text-sm text-gray-500">Temperature is monitored live and is not an operator-configurable parameter.</p>
             <div className={`mt-6 grid gap-6 ${requiresEsterification ? "xl:grid-cols-2" : ""}`}>
               {requiresEsterification && (
-                <div className="rounded-xl border border-white/[0.07] bg-black/10 p-5">
-                  <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">Esterification Settings</Heading><Status tone="yellow">Acid added by hand</Status></div>
+                <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-5">
+                  <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">Esterification Settings</Heading><Status tone="yellow">Pump B · acid + methanol</Status></div>
                   <div className="mt-5 grid gap-5 sm:grid-cols-3">
                     <ParameterField label="Voltage" value={esterVoltage} setValue={setEsterVoltage} unit="V" limits={PROCESS_CONFIG.esterification.voltage} />
                     <ParameterField label="Reaction time" value={esterTime} setValue={setEsterTime} unit="min" limits={PROCESS_CONFIG.esterification.time} />
                     <ParameterField label="Stirring speed" value={esterStirring} setValue={setEsterStirring} unit="RPM" limits={PROCESS_CONFIG.esterification.stirring} />
                   </div>
-                  <p className="mt-4 text-xs text-amber-400">Sulfuric acid (98%): {calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—"}, added by hand. Greenova does not dispense it.</p>
+                  <p className="mt-4 text-xs text-amber-400">Sulfuric acid (98%): {calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—"}, mixed by hand into the methanol in tank B. Pump B loads the premix into the reactor.</p>
                 </div>
               )}
               <div className="rounded-xl border border-green-500/15 bg-green-500/[0.025] p-5">
@@ -1378,14 +2107,14 @@ export default function NewBatch() {
 
       {currentStage === "Oil Loading" && (
         <Card className="p-6 sm:p-8">
-          <SectionHeader eyebrow="Manual stage" title="Oil Loading" description="Manually load the oil while Greenova monitors the demonstration load-cell channel." />
+          <SectionHeader eyebrow="Manual stage" title="Oil Loading" description="Pour the oil through the inlet filter while the reactor load cell weighs it. Confirm to record the oil weight; the calculations use it from then on." />
           <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <Card className="p-5"><Metric label="Target oil volume" value={`${Number(targetVolume).toFixed(1)} mL`} /></Card>
             <Card className="p-5"><Metric label="Live measured mass" value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? "Live load-cell data" : "Demonstration load-cell data"} /></Card>
             <Card className="p-5"><Metric label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} sub="Using configured assumed density" /></Card>
             <Card className="p-5"><Metric label="Loading status" value={loadingConfirmed ? "Quantity confirmed" : loadingStatus} accent={targetReached} /></Card>
           </div>
-          <div className="mt-6 rounded-xl border border-white/[0.07] bg-black/10 p-5">
+          <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <div className="gv-label">Load-cell status</div>
@@ -1396,19 +2125,151 @@ export default function NewBatch() {
           </div>
           <div className="mt-7 flex flex-wrap gap-3">
             {!targetReached && !realHardware && <Button variant="secondary" onClick={loadDemoReading}>Simulate target reading</Button>}
-            <Button disabled={!targetReached} onClick={() => setLoadingConfirmed(true)} variant={loadingConfirmed ? "secondary" : "primary"}>{loadingConfirmed ? "Quantity confirmed" : "Confirm detected quantity"}</Button>
+            <Button disabled={!targetReached || loadingConfirmed} onClick={() => { setLoadingConfirmed(true); setConfirmedOilG(reactorG); }} variant={loadingConfirmed ? "secondary" : "primary"}>{loadingConfirmed ? "Quantity confirmed" : "Confirm detected quantity"}</Button>
             {loadingConfirmed && <Button onClick={next}>Continue to {requiresEsterification ? "Esterification" : "Transesterification"} →</Button>}
           </div>
+          {loadingConfirmed && (
+            <p className="mt-3 text-xs leading-5 text-gray-500">Oil recorded: {oilMassG.toFixed(1)} g. The load cell keeps weighing everything added from now on (acetone and the pumped doses).</p>
+          )}
         </Card>
       )}
 
-      {currentStage === "Esterification" && (
-        <ReactionStage kind="Esterification" state={esterState} setState={(nextState) => controlStage("Esterification", nextState, esterState, setEsterState)} oilMass={oilMassG} oilVolume={oilVolumeMl} catalyst={catalyst} ratio={ratio} quantities={calculatorValues} voltage={Number(esterVoltage)} time={Number(esterTime)} stirring={Number(esterStirring)} batchId={batchId} onContinue={next} liveStage={liveStageFor("Esterification")} connected={backend} liveMock={mock} onReset={() => resetStage(setEsterState)} />
-      )}
+      {currentStage === "Esterification" && doseKey && (() => {
+        const key = doseKey;
+        const run = pumpRunFor(key);
+        const loaded = doseLoaded(key, esterDoseNow.premixG);
+        const reactorDraining = draining("reactor_outlet");
+        return (
+          <ReactionStage
+            kind="Esterification"
+            esterStage={esterStage}
+            state={esterState}
+            setState={(nextState) => controlStage("Esterification", nextState, esterState, setEsterState)}
+            oilMass={oilMassG}
+            oilVolume={oilVolumeMl}
+            catalyst={catalyst}
+            ratio={ratio}
+            esterDose={esterDoseNow}
+            transDose={transDoseNow}
+            transExact={transExact}
+            voltage={Number(esterVoltage)}
+            time={Number(esterTime)}
+            stirring={Number(esterStirring)}
+            batchId={batchId}
+            onContinue={next}
+            liveStage={liveStageFor("Esterification")}
+            connected={backend}
+            liveMock={mock}
+            onReset={() => resetStage(setEsterState)}
+            startBlocked={run?.phase === "pumping" ? "Pump B is still loading." : !loaded ? "Load the dose with pump B first (or tick that you added it by hand)." : null}
+            hideContinue
+            preparation={
+              <DosingPanel
+                pump="acid"
+                premixParts={[`${esterDoseNow.methanolMl.toFixed(1)} mL methanol`, `${esterDoseNow.sulfuricAcidMl.toFixed(2)} mL sulfuric acid (98%)`]}
+                mixingNote="Pour the acid slowly into the methanol while stirring (never the other way round); it gets warm."
+                targetG={esterDoseNow.premixG}
+                premixMl={esterDoseNow.premixMl}
+                run={run}
+                completedG={loads[key]?.completedG ?? 0}
+                manual={loads[key]?.manual ?? false}
+                setManual={(value) => setManualDose(key, value)}
+                onLoad={() => loadDose(key, "acid", esterDoseNow.premixG, esterDoseNow.premixMl)}
+                onStop={stopPump}
+                onSkip={realHardware ? undefined : skipPump}
+                locked={reactorDraining ? "The reactor outlet is open." : pumpRunning && run?.phase !== "pumping" ? "The other pump is running." : null}
+                acetone={esterStage === 1 && esterDoseNow.acetoneG > 0 ? {
+                  ml: esterDoseNow.acetoneMl,
+                  g: esterDoseNow.acetoneG,
+                  addedG: acetonePouredG(key),
+                  onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(esterDoseNow.acetoneG - acetonePouredG(key)),
+                } : null}
+                reactorG={reactorG}
+                live={realHardware}
+              />
+            }
+            footer={esterState === "complete" ? (
+              <RecheckPanel
+                stage={esterStage}
+                value={recheckValue}
+                setValue={setRecheckValue}
+                aboveStrip={recheckAbove}
+                setAboveStrip={setRecheckAbove}
+                settings={chemistrySettings}
+                next={recheckNext}
+                catalyst={catalyst}
+                onAnotherStage={prepareNextEsterStage}
+                onContinue={finishEsterification}
+              />
+            ) : null}
+          />
+        );
+      })()}
 
-      {currentStage === "Transesterification" && (
-        <ReactionStage kind="Transesterification" state={transState} setState={(nextState) => controlStage("Transesterification", nextState, transState, setTransState)} oilMass={oilMassG} oilVolume={oilVolumeMl} catalyst={catalyst} ratio={ratio} quantities={calculatorValues} voltage={Number(transVoltage)} time={Number(transTime)} stirring={Number(transStirring)} batchId={batchId} onContinue={next} liveStage={liveStageFor("Transesterification")} connected={backend} liveMock={mock} onReset={() => resetStage(setTransState)} />
-      )}
+      {currentStage === "Transesterification" && doseKey && (() => {
+        const key = doseKey;
+        const run = pumpRunFor(key);
+        const loaded = doseLoaded(key, transDoseNow.premixG);
+        return (
+          <ReactionStage
+            kind="Transesterification"
+            state={transState}
+            setState={(nextState) => controlStage("Transesterification", nextState, transState, setTransState)}
+            oilMass={oilMassG}
+            oilVolume={oilVolumeMl}
+            catalyst={catalyst}
+            ratio={ratio}
+            esterDose={esterDoseNow}
+            transDose={transDoseNow}
+            transExact={transExact}
+            voltage={Number(transVoltage)}
+            time={Number(transTime)}
+            stirring={Number(transStirring)}
+            batchId={batchId}
+            onContinue={next}
+            liveStage={liveStageFor("Transesterification")}
+            connected={backend}
+            liveMock={mock}
+            onReset={() => resetStage(setTransState)}
+            startBlocked={run?.phase === "pumping" ? "Pump A is still loading." : !loaded ? "Load the dose with pump A first (or tick that you added it by hand)." : null}
+            preparation={
+              <DosingPanel
+                pump="catalyst"
+                premixParts={[`${transDoseNow.catalystToWeighG.toFixed(2)} g ${catalyst}`, `${transDoseNow.methanolMl.toFixed(1)} mL methanol`]}
+                mixingNote={`Stir until the ${catalyst} has fully dissolved; it gets warm.`}
+                targetG={transDoseNow.premixG}
+                premixMl={transDoseNow.premixMl}
+                run={run}
+                completedG={loads[key]?.completedG ?? 0}
+                manual={loads[key]?.manual ?? false}
+                setManual={(value) => setManualDose(key, value)}
+                onLoad={() => loadDose(key, "catalyst", transDoseNow.premixG, transDoseNow.premixMl)}
+                onStop={stopPump}
+                onSkip={realHardware ? undefined : skipPump}
+                locked={draining("reactor_outlet") ? "The reactor outlet is open." : pumpRunning && run?.phase !== "pumping" ? "The other pump is running." : null}
+                acetone={transDoseNow.acetoneG > 0 ? {
+                  ml: transDoseNow.acetoneMl ?? 0,
+                  g: transDoseNow.acetoneG,
+                  addedG: acetonePouredG(key),
+                  onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(transDoseNow.acetoneG - acetonePouredG(key)),
+                } : null}
+                reactorG={reactorG}
+                live={realHardware}
+              />
+            }
+            footer={transState === "complete" ? (
+              <DrainPanel
+                valve="reactor_outlet"
+                view={drainViewFor("reactor_outlet")}
+                minutes={drainMinutes("reactor_outlet")}
+                onAgain={() => openDrainAgain("reactor_outlet")}
+                onStop={closeDrain}
+                onSkip={realHardware ? undefined : skipDrain}
+              />
+            ) : null}
+          />
+        );
+      })()}
 
       {currentStage === "Separation" && (
         <Card className="p-6 sm:p-8">
@@ -1424,9 +2285,12 @@ export default function NewBatch() {
             <Card className="p-5"><Metric label="Batch ID" value={batchId} sub={liveSeparation && liveSeparation.liveRpm != null ? `Centrifuge ${liveSeparation.liveRpm.toLocaleString()} RPM` : undefined} /></Card>
           </div>
           <div className="mt-6"><Progress value={liveSeparation && liveSeparation.timeMinutes ? (liveSeparation.elapsedSeconds / (liveSeparation.timeMinutes * 60)) * 100 : separationState === "complete" ? 100 : separationState === "running" ? 60 : 0} /></div>
-          <p className="mt-4 text-xs leading-5 text-gray-500">{liveSeparation ? (mock ? "Simulated by the Greenova backend (demo mode)." : "Live from the Raspberry Pi. The centrifuge stops by itself when the time is over.") : "Demonstration state only."} The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes, purification starts by itself.</p>
+          <p className="mt-4 text-xs leading-5 text-gray-500">{liveSeparation ? (mock ? "Simulated by the Greenova backend (demo mode)." : "Live from the Raspberry Pi. The centrifuge stops by itself when the time is over.") : "Demonstration state only."} The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes and the centrifuge has stopped, its outlet valve opens by itself and the biodiesel flows to the purification tank; purification then starts by itself.</p>
           {liveSeparation?.faultReason && <p className="mt-2 text-sm text-red-400">Stopped: {liveSeparation.faultReason}</p>}
-          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? "Start centrifuge" : "Record centrifuge start"} onContinue={next} continueLabel="Continue to Purification" onReset={() => resetStage(setSeparationState)} />
+          {separationState === "ready" && drainViewFor("reactor_outlet") && (
+            <DrainPanel valve="reactor_outlet" view={drainViewFor("reactor_outlet")} minutes={drainMinutes("reactor_outlet")} onStop={closeDrain} onSkip={realHardware ? undefined : skipDrain} />
+          )}
+          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? "Start centrifuge" : "Record centrifuge start"} onContinue={next} continueLabel="Continue to Purification" onReset={() => resetStage(setSeparationState)} startBlocked={draining("reactor_outlet") ? "Wait for the reactor outlet to close: the reactor is still draining into the centrifuge." : null} />
         </Card>
       )}
 
@@ -1436,7 +2300,7 @@ export default function NewBatch() {
             <SectionHeader
               eyebrow={`Batch ${batchId}`}
               title="Purification"
-              description={`Runs by itself: heats to ${Number(targetTemperature)} °C, holds ${purificationSettings.holdTimeMinutes} min to remove leftover methanol, passes the biodiesel through the activated-bentonite mesh bed, then drains. Confirm when it's finished.`}
+              description={`Runs by itself: heats to ${Number(targetTemperature)} °C and holds ${purificationSettings.holdTimeMinutes} min with the dry wash stirrer running, to remove leftover methanol. Then the outlet valve lets the biodiesel through the activated-bentonite mesh bed into the biodiesel container, which the output load cell weighs. Confirm when it's finished.`}
             />
             <Status tone={purificationPhase === "complete" ? "green" : purificationPhase === "fault" ? "red" : PURIFYING.includes(purificationPhase) ? "yellow" : "neutral"}>
               {purificationPhase === "flow" ? "MESH BED FLOW" : purificationPhase === "hold" ? "HOLDING" : purificationPhase === "drain" ? "DRAINING" : purificationPhase === "ready" ? "WAITING" : purificationPhase.toUpperCase()}
@@ -1457,7 +2321,18 @@ export default function NewBatch() {
             })}
           </div>
 
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          {(purificationPhase === "ready" || centrifugeDraining) && drainViewFor("centrifuge_outlet") && (
+            <DrainPanel
+              valve="centrifuge_outlet"
+              view={drainViewFor("centrifuge_outlet")}
+              minutes={drainMinutes("centrifuge_outlet")}
+              onAgain={purificationPhase === "ready" ? () => openDrainAgain("centrifuge_outlet") : undefined}
+              onStop={closeDrain}
+              onSkip={realHardware ? undefined : skipDrain}
+            />
+          )}
+
+          <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <Card className="p-5">
               <Metric label="Live temperature" value={liveTemperature === null ? "Unavailable" : `${liveTemperature.toFixed(1)} °C`} sub={`Target ${Number(targetTemperature).toFixed(1)} °C · ${realHardware ? "Live sensor" : "Demonstration"}`} />
               <div className="mt-4"><Progress value={liveTemperature === null ? 0 : ((liveTemperature - startingTemperature) / Math.max(Number(targetTemperature) - startingTemperature, 1)) * 100} /></div>
@@ -1474,8 +2349,16 @@ export default function NewBatch() {
               <Status tone={heaterOn ? "yellow" : "neutral"}>{heaterOn ? "● ON" : "OFF"}</Status>
             </Card>
             <Card className="p-5">
-              <div className="gv-label">Mesh bed valve</div>
+              <div className="gv-label">Dry wash stirrer</div>
+              <Status tone={stirrerOn ? "green" : "neutral"}>{stirrerOn ? "● RUNNING" : "OFF"}</Status>
+              <div className="mt-2 text-xs text-gray-500">
+                {stirrerOn ? `${stirrerRpm == null ? "RPM reading unavailable" : `${stirrerRpm} RPM`} · set ${transferSettings.stirringSpeed} RPM` : `Runs during heating and hold · ${transferSettings.stirringSpeed} RPM`}
+              </div>
+            </Card>
+            <Card className="p-5">
+              <div className="gv-label">Purification outlet valve</div>
               <Status tone={purificationPhase === "flow" || purificationPhase === "drain" ? "green" : "neutral"}>{purificationPhase === "flow" || purificationPhase === "drain" ? "OPEN" : "CLOSED"}</Status>
+              <div className="mt-2 text-xs text-gray-500">To the mesh bed, then the biodiesel container</div>
             </Card>
             <Card className="p-5">
               <Metric
@@ -1495,7 +2378,8 @@ export default function NewBatch() {
                         : purificationPhase === "drain" ? `Draining · output steady ${flowStableSeconds} s`
                           : purificationPhase === "complete" ? `${formatMinutes(Math.round(purificationSettings.holdTimeMinutes * 60) - holdRemainingSeconds)} hold · ${formatMinutes(flowElapsedSeconds)} flow · ${formatTimer(drainElapsedSeconds)} drain`
                             : purificationPhase === "fault" ? "Stopped"
-                              : showManualStart ? "Waiting for Start purification" : "Starts by itself"
+                              : centrifugeDraining ? "Waiting for the centrifuge outlet"
+                                : showManualStart ? "Waiting for Start purification" : "Starts by itself"
                 }
               />
             </Card>
@@ -1542,7 +2426,7 @@ export default function NewBatch() {
             </div>
           )}
 
-          <div className="mt-6 space-y-2 rounded-xl border border-white/[0.07] bg-black/10 p-5 text-xs leading-5 text-gray-500">
+          <div className="mt-6 space-y-2 rounded-xl border border-white/[0.07] bg-gv-inset p-5 text-xs leading-5 text-gray-500">
             <p>{purificationSettings.thermalFuseRating === null ? "Hardware backup: a thermal fuse cuts heater power if the software fails (set its rating in Settings)." : `Hardware backup: a thermal fuse cuts heater power at ${purificationSettings.thermalFuseRating} °C if the software fails.`} The heater also stops above {purificationSettings.maximumTemperature} °C.</p>
             <p className="text-amber-400">Heat in a ventilated area. Leftover methanol evaporates when heated.</p>
           </div>
@@ -1589,22 +2473,29 @@ export default function NewBatch() {
               <Metric label="Batch ID" value={batchId} accent />
               <Metric label="Oil volume" value={oilVolumeMl === null ? "Not available" : `${oilVolumeMl.toFixed(1)} mL`} sub="Converted using configured density" />
               <Metric label="Oil mass" value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? "Load-cell record" : "Demonstration load-cell record"} />
-              <Metric label="FFA percentage" value={`${ffaNumber.toFixed(1)}%`} sub="Operator entered" />
-              <Metric label="Reaction pathway" value={requiresEsterification ? "Esterification → Transesterification" : "Transesterification"} />
-              {requiresEsterification && <Metric label="Esterification duration" value={`${esterTime} min`} />}
+              <Metric label="FFA percentage" value={formatFfa({ ffa: ffaNumber, ffaAboveStrip })} sub={ffaAboveStrip ? "Strip's darkest color · operator entered" : "Test strip · operator entered"} />
+              <Metric label="Reaction pathway" value={requiresEsterification ? `Esterification${esterStagesRun > 1 ? ` (${esterStagesRun} stages)` : ""} → Transesterification` : "Transesterification"} />
+              {requiresEsterification && (
+                <Metric
+                  label="FFA re-checks"
+                  value={esterRecords.length ? [formatFfa({ ffa: ffaNumber, ffaAboveStrip }), ...esterRecords.map((record) => `${(record.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ") : "Not recorded"}
+                  sub={`Stage 1 dosed for ${chemistrySettings.designFfa}% FFA (uniform)`}
+                />
+              )}
+              {requiresEsterification && <Metric label="Esterification duration" value={`${Number(esterTime) * esterStagesRun} min`} sub={esterStagesRun > 1 ? `${esterStagesRun} × ${esterTime} min` : undefined} />}
               <Metric label="Transesterification duration" value={`${transTime} min`} />
               <Metric label="Methanol-to-oil ratio" value={`${ratio}:1`} sub="Molar convention" />
-              <Metric label="Calculated methanol" value={`${(calculatorValues.transesterificationMethanolMl + (requiresEsterification ? calculatorValues.esterificationMethanolMl : 0)).toFixed(1)} mL`} sub={requiresEsterification ? "Esterification + transesterification · calculated" : "Calculated, not recorded as dispensed"} />
-              <Metric label={`Calculated ${catalyst}`} value={`${requiresEsterification ? "Up to " : ""}${calculatorValues.catalystToWeighG.toFixed(1)} g`} sub={`Including neutralization · ${calculatorValues.purity}% purity`} />
-              <Metric label="Calculated acetone" value={calculatorValues.acetoneMl === null ? "Unavailable" : `${calculatorValues.acetoneMl.toFixed(1)} mL`} sub="Per reaction stage · provisional" />
-              {requiresEsterification && <Metric label="Sulfuric acid" value={`${calculatorValues.sulfuricAcidMl.toFixed(2)} mL`} sub="98% · calculated" />}
+              <Metric label="Methanol" value={`${(transDoseNow.methanolMl + esterMethanolTotal).toFixed(1)} mL`} sub={requiresEsterification ? "Esterification + transesterification · loaded by the pumps" : "Loaded by pump A"} />
+              <Metric label={catalyst} value={`${transExact ? "" : "Up to "}${transDoseNow.catalystToWeighG.toFixed(2)} g`} sub={`Including neutralization · ${transDoseNow.purity}% purity${transExact ? " · exact" : ""}`} />
+              <Metric label="Acetone" value={transDoseNow.acetoneMl === null ? "Unavailable" : `${acetoneTotalMl.toFixed(1)} mL`} sub="Per reaction stage · provisional · poured by hand" />
+              {requiresEsterification && <Metric label="Sulfuric acid" value={`${esterAcidTotal.toFixed(2)} mL`} sub="98% · in the pump B premix" />}
               <Metric label="Separation" value={`${PROCESS_CONFIG.separation.timeMinutes} min · ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
               <Metric
                 label="Purification"
                 value={purificationPhase === "complete" ? `${purificationAutomatic ? "Automatic" : "Completed"} · ${Number(targetTemperature)} °C` : "Not recorded"}
                 sub={purificationPhase === "complete" ? `${formatMinutes(Math.round(purificationSettings.holdTimeMinutes * 60) - holdRemainingSeconds)} hold · ${formatMinutes(flowElapsedSeconds)} flow · ${formatMinutes(drainElapsedSeconds)} drain` : undefined}
               />
-              <Metric label="Biodiesel output" value={savedBatch?.biodieselOutputMl ? `${savedBatch.biodieselOutputMl.toFixed(1)} mL · ${savedBatch.yield}% yield` : "Not measured"} sub={savedBatch?.biodieselOutputMl ? "Output load cell" : undefined} />
+              <Metric label="Biodiesel output" value={savedBatch?.biodieselOutputMl ? `${savedBatch.biodieselOutputMl.toFixed(1)} mL · ${savedBatch.yield}% yield` : "Not measured"} sub={savedBatch?.biodieselOutputMl ? `Output load cell${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
               {savedBatch?.createdAt && <Metric label="Average reaction temperature" value={`${savedBatch.temperature} °C`} sub="Measured during transesterification" />}
               {savedBatch?.createdAt && <Metric label="Energy used" value={`${savedBatch.energy} kWh`} sub="Electrodes (plus heater, if configured)" />}
               <Metric label="Completion date" value={new Date().toLocaleString()} />

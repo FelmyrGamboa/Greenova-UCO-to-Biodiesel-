@@ -30,7 +30,13 @@ def init_db() -> None:
 def get_settings() -> Settings:
     with connect() as con:
         row = con.execute("SELECT data FROM settings WHERE id = 1").fetchone()
-    return Settings.model_validate_json(row[0]) if row else Settings()
+    if not row:
+        return Settings()
+    s = Settings.model_validate_json(row[0])
+    if s.ffa_range_boundaries == "0,2,4,6,8,10":
+        # the old default: the strip now reads only up to 5%, so the ranges end at 5%+
+        s.ffa_range_boundaries = Settings().ffa_range_boundaries
+    return s
 
 
 def save_settings(s: Settings) -> None:

@@ -14,7 +14,17 @@ TIME_SCALE = float(os.getenv("GREENOVA_TIME_SCALE", "1")) if MOCK else 1.0
 DB_PATH = Path(os.getenv("GREENOVA_DB", BASE_DIR / "greenova.db"))
 
 # Built website (Vite "dist" folder). If it exists, the backend serves the website too.
-FRONTEND_DIR = Path(os.getenv("GREENOVA_FRONTEND", BASE_DIR / "frontend" / "dist"))
+# Looked for in backend/frontend/dist, then in ../frontend/dist (a repo with frontend/ and backend/).
+def _frontend_dir() -> Path:
+    if os.getenv("GREENOVA_FRONTEND"):
+        return Path(os.environ["GREENOVA_FRONTEND"])
+    for candidate in (BASE_DIR / "frontend" / "dist", BASE_DIR.parent / "frontend" / "dist"):
+        if candidate.is_dir():
+            return candidate
+    return BASE_DIR / "frontend" / "dist"
+
+
+FRONTEND_DIR = _frontend_dir()
 
 # Websites allowed to call the API from another address (for example the Vite dev server).
 CORS_ORIGINS = os.getenv(
@@ -27,9 +37,14 @@ CORS_ORIGINS = os.getenv(
 PINS = {
     "heater_relay": 23,
     "electrode_power_relay": 25,
-    "valve_mesh_bed": 24,
-    "stirrer_pwm": 18,
+    "valve_reactor_outlet": 16,      # main reactor -> centrifuge (opens after transesterification)
+    "valve_centrifuge_outlet": 20,   # centrifuge -> purification tank (opens after separation)
+    "valve_mesh_bed": 24,            # purification outlet -> mesh bed -> output container
+    "pump_catalyst": 5,              # pump A: NaOH/KOH + methanol
+    "pump_acid": 6,                  # pump B: H2SO4 + methanol
+    "stirrer_pwm": 18,               # reactor stirrer
     "centrifuge_pwm": 13,
+    "purification_stirrer_pwm": 12,  # dry wash stirrer in the purification tank
     # Float (level) switch at the heater's height in the purification tank. Closed = biodiesel
     # covers the heater. Set it to a pin number to start purification automatically and to stop
     # the heater if the level drops. None = no switch: the operator confirms on the website.

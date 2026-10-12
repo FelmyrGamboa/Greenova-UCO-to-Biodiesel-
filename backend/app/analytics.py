@@ -27,7 +27,7 @@ def ffa_ranges(s: Settings) -> list[dict]:
     ranges = [{"key": f"{lo:g}-{hi:g}", "label": f"{lo:g}–{hi:g}%", "min": lo, "max": hi}
               for lo, hi in zip(bounds, bounds[1:])]
     last = bounds[-1]
-    ranges.append({"key": f"{last:g}+", "label": f"Above {last:g}%", "min": last, "max": None})
+    ranges.append({"key": f"{last:g}+", "label": f"{last:g}% and above", "min": last, "max": None})
     return ranges
 
 

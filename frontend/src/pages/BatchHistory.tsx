@@ -17,7 +17,7 @@ import {
   YAxis,
 } from "recharts";
 import { Card, Heading, Metric, SelectField, Status } from "../components/ui";
-import type { DemoBatch } from "../lib/greenovaData";
+import { ffaBoundaries, formatFfa, type DemoBatch } from "../lib/greenovaData";
 import { useBatches } from "../lib/api";
 
 const chartColors = {
@@ -25,8 +25,10 @@ const chartColors = {
   red: "#ef4444",
   blue: "#60a5fa",
   amber: "#fbbf24",
-  grid: "rgba(255,255,255,.06)",
-  text: "#6b7280",
+  // theme colors (see src/index.css), so the charts follow light and dark mode
+  grid: "var(--gv-chart-grid)",
+  text: "var(--gv-chart-text)",
+  label: "var(--gv-chart-label)",
 };
 
 type FfaRange = {
@@ -64,12 +66,7 @@ function readAnalyticsSettings(): AnalyticsSettings {
     const parsed = Number(stored[key]);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   };
-  const boundaries = String(stored.ffaRangeBoundaries || "0,2,4,6,8,10")
-    .split(",")
-    .map(Number)
-    .filter((value) => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  const uniqueBoundaries = [...new Set(boundaries.length >= 2 ? boundaries : [0, 2, 4, 6, 8, 10])];
+  const uniqueBoundaries = ffaBoundaries(stored.ffaRangeBoundaries);
   const ranges: FfaRange[] = uniqueBoundaries.slice(0, -1).map((min, index) => ({
     key: `${min}-${uniqueBoundaries[index + 1]}`,
     label: `${min}–${uniqueBoundaries[index + 1]}%`,
@@ -77,7 +74,8 @@ function readAnalyticsSettings(): AnalyticsSettings {
     max: uniqueBoundaries[index + 1],
   }));
   const finalBoundary = uniqueBoundaries[uniqueBoundaries.length - 1];
-  ranges.push({ key: `${finalBoundary}+`, label: `Above ${finalBoundary}%`, min: finalBoundary, max: null });
+  // The FFA strip's darkest color: these batches are recorded at the strip's maximum.
+  ranges.push({ key: `${finalBoundary}+`, label: `${finalBoundary}% and above`, min: finalBoundary, max: null });
   return {
     ranges,
     provenBatchCount: numberValue("provenBatchCount", 3),
@@ -243,7 +241,7 @@ export default function BatchHistory() {
           <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">Batch History</Heading>
           <p className="mt-2 text-sm text-gray-500">Review production records, compare outcomes, and observe relationships in recorded batch data.</p>
         </div>
-        <div className="flex rounded-lg border border-white/[0.08] bg-black/10 p-1">
+        <div className="flex rounded-lg border border-white/[0.08] bg-gv-inset p-1">
           <button onClick={() => setTab("history")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "history" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>History</button>
           <button onClick={() => setTab("analytics")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "analytics" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>Analytics</button>
         </div>
@@ -271,7 +269,7 @@ export default function BatchHistory() {
                     <td className="font-mono !text-green-400">{batch.id}</td>
                     <td>{new Date(batch.date).toLocaleDateString()}</td>
                     <td>{batch.oilVolume.toLocaleString()} mL</td>
-                    <td><div>{batch.ffa.toFixed(1)}%</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">Esterified</div>}</td>
+                    <td><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">Esterified{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${batch.esterificationStages.length} stages` : ""}</div>}</td>
                     <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
                     <td>{batch.duration} min</td>
                     <td>{batch.energy} kWh</td>
@@ -322,13 +320,13 @@ export default function BatchHistory() {
                     <CartesianGrid stroke={chartColors.grid} vertical={false} />
                     <XAxis dataKey="short" stroke={chartColors.text} fontSize={11} tick={(props) => {
                       const batch = data.find((item) => item.short === props.payload.value);
-                      return <text x={props.x} y={props.y + 10} textAnchor="middle" fill={chartColors.text} fontSize={10}><tspan x={props.x}>{props.payload.value}</tspan><tspan x={props.x} dy="13" fill={batch?.labResult === "Passed" ? chartColors.green : chartColors.red}>{batch?.labResult}</tspan></text>;
+                      return <text x={props.x} y={Number(props.y) + 10} textAnchor="middle" fill={chartColors.text} fontSize={10}><tspan x={props.x}>{props.payload.value}</tspan><tspan x={props.x} dy="13" fill={batch?.labResult === "Passed" ? chartColors.green : chartColors.red}>{batch?.labResult}</tspan></text>;
                     }} />
                     <YAxis domain={[0, 100]} stroke={chartColors.text} fontSize={11} />
                     <Tooltip content={<ChartTooltip />} />
                     <Bar dataKey="yield" name="Yield" unit="%" radius={[5, 5, 0, 0]}>
                       {data.map((batch) => <Cell key={batch.id} fill={batch.labResult === "Passed" ? chartColors.green : chartColors.red} />)}
-                      <LabelList dataKey="yield" position="top" fill="#9ca3af" fontSize={10} formatter={(value) => `${Number(value).toFixed(1)}%`} />
+                      <LabelList dataKey="yield" position="top" fill={chartColors.label} fontSize={10} formatter={(value) => `${Number(value).toFixed(1)}%`} />
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
@@ -362,7 +360,7 @@ export default function BatchHistory() {
                 { title: "Energy per liter (kWh/L)", key: "energyPerLiter", color: chartColors.green, unit: " kWh/L" },
                 { title: "Processing time (min)", key: "duration", color: chartColors.blue, unit: " min" },
               ].map((chart) => (
-                <div key={chart.key} className="rounded-xl border border-white/[0.06] bg-black/10 p-4">
+                <div key={chart.key} className="rounded-xl border border-white/[0.06] bg-gv-inset p-4">
                   <div className="text-sm font-semibold text-gray-300">{chart.title}</div>
                   <div className="mt-3 h-52">
                     <ResponsiveContainer width="100%" height="100%">
@@ -399,7 +397,7 @@ export default function BatchHistory() {
                 { title: "Voltage vs. yield", x: "voltage", xName: "Voltage", unit: " V" },
                 { title: "Stirring speed vs. yield", x: "stirringSpeed", xName: "Stirring speed", unit: " RPM" },
               ].map((chart) => (
-                <div key={chart.title} className="rounded-xl border border-white/[0.06] bg-black/10 p-4">
+                <div key={chart.title} className="rounded-xl border border-white/[0.06] bg-gv-inset p-4">
                   <div className="text-sm font-semibold text-gray-300">{chart.title}</div>
                   <div className="mt-3 h-52">
                     <ResponsiveContainer width="100%" height="100%">

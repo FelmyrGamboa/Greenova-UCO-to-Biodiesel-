@@ -3,6 +3,7 @@ import { Button, Card, Field, Heading, SelectField, Status } from "../components
 import { useLiveData } from "../contexts/LiveContext";
 import { useTheme } from "../contexts/ThemeContext";
 import { getBatches, getSystemStatus, isOffline, saveSettings, type SystemStatus } from "../lib/api";
+import { DEFAULT_FFA_BOUNDARIES, ffaBoundaries } from "../lib/greenovaData";
 
 function readSettings() {
   try {
@@ -11,6 +12,8 @@ function readSettings() {
     return {};
   }
 }
+
+const DEFAULT_BATCH_FORMAT = "B-{YEAR}-{SEQ}";
 
 export default function Settings() {
   const initialSettings = readSettings();
@@ -22,8 +25,10 @@ export default function Settings() {
   const [systemName, setSystemName] = useState(String(initialSettings.systemName || "Greenova Production System"));
   const [operator, setOperator] = useState(String(initialSettings.operator || "Operator 01"));
   const [units, setUnits] = useState(String(initialSettings.units || "metric"));
-  // const [format, setFormat] = useState(String(initialSettings.format || "B-{YEAR}-{SEQ}"));
-  const [format, setFormat] = useState(String());
+  // Empty field = the default format (shown as the placeholder), as in your version of this page.
+  const [format, setFormat] = useState(
+    initialSettings.format && initialSettings.format !== DEFAULT_BATCH_FORMAT ? String(initialSettings.format) : "",
+  );
   const [purificationTargetTemperature, setPurificationTargetTemperature] = useState(
     String(initialSettings.purificationTargetTemperature || 70),
   );
@@ -39,7 +44,19 @@ export default function Settings() {
   const [meshBedFlowRate, setMeshBedFlowRate] = useState(String(initialSettings.meshBedFlowRate || 40));
   const [drainTime, setDrainTime] = useState(String(initialSettings.drainTime || 3));
   const [heatingTimeout, setHeatingTimeout] = useState(String(initialSettings.heatingTimeout || 10));
-  const [ffaRangeBoundaries, setFfaRangeBoundaries] = useState(String(initialSettings.ffaRangeBoundaries || "0,2,4,6,8,10"));
+  const [ffaRangeBoundaries, setFfaRangeBoundaries] = useState(ffaBoundaries(initialSettings.ffaRangeBoundaries).join(","));
+  const numberSetting = (key: string, fallback: number) => {
+    const value = Number(initialSettings[key]);
+    return String(initialSettings[key] !== undefined && initialSettings[key] !== null && Number.isFinite(value) ? value : fallback);
+  };
+  const [purificationStirringSpeed, setPurificationStirringSpeed] = useState(numberSetting("purificationStirringSpeed", 300));
+  const [esterificationDesignFfa, setEsterificationDesignFfa] = useState(numberSetting("esterificationDesignFfa", 10));
+  const [stripMaxFfa, setStripMaxFfa] = useState(numberSetting("stripMaxFfa", 5));
+  const [pumpCatalystRate, setPumpCatalystRate] = useState(numberSetting("pumpCatalystRate", 100));
+  const [pumpAcidRate, setPumpAcidRate] = useState(numberSetting("pumpAcidRate", 100));
+  const [reactorDrainTime, setReactorDrainTime] = useState(numberSetting("reactorDrainTime", 3));
+  const [centrifugeDrainTime, setCentrifugeDrainTime] = useState(numberSetting("centrifugeDrainTime", 3));
+  const [centrifugeSpinDownTime, setCentrifugeSpinDownTime] = useState(numberSetting("centrifugeSpinDownTime", 30));
   const [provenBatchCount, setProvenBatchCount] = useState(String(initialSettings.provenBatchCount || 3));
   const [provenYieldTolerance, setProvenYieldTolerance] = useState(String(initialSettings.provenYieldTolerance || 2));
   const [oilPrice, setOilPrice] = useState(String(initialSettings.oilPrice || 45));
@@ -73,7 +90,7 @@ export default function Settings() {
       systemName,
       operator,
       units,
-      format,
+      format: format.trim() || DEFAULT_BATCH_FORMAT,
       purificationTargetTemperature: Number(purificationTargetTemperature),
       purificationMaximumTemperature: Number(purificationMaximumTemperature),
       thermalFuseRating: thermalFuseRating ? Number(thermalFuseRating) : null,
@@ -81,6 +98,14 @@ export default function Settings() {
       meshBedFlowRate: Number(meshBedFlowRate),
       drainTime: Number(drainTime),
       heatingTimeout: Number(heatingTimeout),
+      purificationStirringSpeed: Number(purificationStirringSpeed),
+      esterificationDesignFfa: Number(esterificationDesignFfa),
+      stripMaxFfa: Number(stripMaxFfa),
+      pumpCatalystRate: Number(pumpCatalystRate),
+      pumpAcidRate: Number(pumpAcidRate),
+      reactorDrainTime: Number(reactorDrainTime),
+      centrifugeDrainTime: Number(centrifugeDrainTime),
+      centrifugeSpinDownTime: Number(centrifugeSpinDownTime),
       ffaRangeBoundaries,
       provenBatchCount: Number(provenBatchCount),
       provenYieldTolerance: Number(provenYieldTolerance),
@@ -131,7 +156,7 @@ export default function Settings() {
         <Heading as="h2" className="text-lg font-semibold">Analytics</Heading>
         <p className="mt-1 text-sm text-gray-500">Configure FFA grouping, proof thresholds, and prototype costing.</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="FFA range boundaries" value={ffaRangeBoundaries} onChange={(event) => setFfaRangeBoundaries(event.target.value)} placeholder="0,2,4,6,8,10" unit="%" />
+          <Field label="FFA range boundaries" value={ffaRangeBoundaries} onChange={(event) => setFfaRangeBoundaries(event.target.value)} placeholder={DEFAULT_FFA_BOUNDARIES} unit="%" />
           <Field label="Batches required for Proven" type="number" min="1" value={provenBatchCount} onChange={(event) => setProvenBatchCount(event.target.value)} />
           <Field label="Yield tolerance" type="number" min="0" value={provenYieldTolerance} onChange={(event) => setProvenYieldTolerance(event.target.value)} unit="± pp" />
           <Field label="Oil price" type="number" min="0" value={oilPrice} onChange={(event) => setOilPrice(event.target.value)} unit="₱/L" />
@@ -144,7 +169,7 @@ export default function Settings() {
           <Field label="Electricity price" type="number" min="0" value={electricityPrice} onChange={(event) => setElectricityPrice(event.target.value)} unit="₱/kWh" />
           <Field label="Diesel price" type="number" min="0" value={dieselPrice} onChange={(event) => setDieselPrice(event.target.value)} unit="₱/L" />
         </div>
-        <p className="mt-3 text-xs text-gray-600">Default FFA ranges: 0–2%, 2–4%, 4–6%, 6–8%, 8–10%, and above 10%.</p>
+        <p className="mt-3 text-xs text-gray-600">Default FFA ranges: 0–2%, 2–4%, 4–5%, and 5% and above (the strip's darkest color).</p>
       </Card>
 
       <Card className="p-6">
@@ -154,8 +179,25 @@ export default function Settings() {
           <Field label="Temperature" placeholder="Project-defined" unit="°C" />
           <Field label="Reaction time" placeholder="Project-defined" unit="min" />
           <Field label="Stirring speed" placeholder="Project-defined" unit="RPM" />
-          <Field label="Batch naming format" value={format} placeholder="B-{YEAR}-{SEQ}" onChange={(event) => setFormat(event.target.value)} />
+          <Field label="Batch naming format" value={format} placeholder={DEFAULT_BATCH_FORMAT} onChange={(event) => setFormat(event.target.value)} />
         </div>
+      </Card>
+
+      <Card className="p-6">
+        <Heading as="h2" className="text-lg font-semibold">Esterification and Dosing</Heading>
+        <p className="mt-1 text-sm text-gray-500">The FFA strip reads only up to its darkest color, so every batch above 4% FFA gets one uniform esterification dose. A re-check after each stage decides the next step.</p>
+        <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          <Field label="Design FFA for the dose" type="number" min="4.1" max="30" step="0.5" value={esterificationDesignFfa} onChange={(event) => setEsterificationDesignFfa(event.target.value)} unit="%" />
+          <Field label="Strip maximum (darkest color)" type="number" min="1" step="0.5" value={stripMaxFfa} onChange={(event) => setStripMaxFfa(event.target.value)} unit="%" />
+          <Field label="Pump A rate (NaOH/KOH + methanol)" type="number" min="1" value={pumpCatalystRate} onChange={(event) => setPumpCatalystRate(event.target.value)} unit="mL/min" />
+          <Field label="Pump B rate (H₂SO₄ + methanol)" type="number" min="1" value={pumpAcidRate} onChange={(event) => setPumpAcidRate(event.target.value)} unit="mL/min" />
+          <Field label="Reactor outlet open after transesterification" type="number" min="0" value={reactorDrainTime} onChange={(event) => setReactorDrainTime(event.target.value)} unit="min" />
+          <Field label="Centrifuge outlet open after separation" type="number" min="0" value={centrifugeDrainTime} onChange={(event) => setCentrifugeDrainTime(event.target.value)} unit="min" />
+          <Field label="Centrifuge spin-down wait" type="number" min="0" value={centrifugeSpinDownTime} onChange={(event) => setCentrifugeSpinDownTime(event.target.value)} unit="s" />
+        </div>
+        <p className="mt-3 text-xs leading-5 text-gray-600">
+          Uniform dose per 100 mL of oil at {Number(esterificationDesignFfa) || 10}% design FFA: {((92 * (Number(esterificationDesignFfa) || 10) / 100) * 2.84).toFixed(1)} mL methanol and {((92 * (Number(esterificationDesignFfa) || 10) / 100) * 0.027).toFixed(2)} mL H₂SO₄. The pumps stop when the reactor load cell has gained the dose's weight; their rate only sets the time limit (and the dose time if the load cell has no reading). An outlet time of 0 means you move the liquid by hand. The spin-down wait is used only when the centrifuge has no RPM reading.
+        </p>
       </Card>
 
       <Card className="p-6">
@@ -213,6 +255,14 @@ export default function Settings() {
             unit="min"
           />
           <Field
+            label="Dry wash stirring speed"
+            type="number"
+            min="0"
+            value={purificationStirringSpeed}
+            onChange={(event) => setPurificationStirringSpeed(event.target.value)}
+            unit="RPM"
+          />
+          <Field
             label="Heating time limit"
             type="number"
             min="1"
@@ -222,7 +272,7 @@ export default function Settings() {
           />
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          Target temperature allowed range: 40–70 °C. Flow time = batch volume ÷ flow rate (the biodiesel volume is about the oil volume), e.g. 500 mL ÷ {Number(meshBedFlowRate) || 40} mL/min = {(500 / (Number(meshBedFlowRate) || 40)).toFixed(1)} min. Draining ends when nothing more comes out for 1 minute. The heater stops if the target isn't reached within the heating time limit.
+          Target temperature allowed range: 40–70 °C. Flow time = batch volume ÷ flow rate (the biodiesel volume is about the oil volume), e.g. 500 mL ÷ {Number(meshBedFlowRate) || 40} mL/min = {(500 / (Number(meshBedFlowRate) || 40)).toFixed(1)} min. Draining ends when nothing more comes out for 1 minute. The heater stops if the target isn't reached within the heating time limit. The dry wash stirrer runs during heating and hold, and stops before the outlet valve opens (0 = off).
         </p>
       </Card>
 
@@ -245,9 +295,15 @@ export default function Settings() {
             ["Power relay", "Ready"],
             ["Stirrer relay", "Ready"],
             ["Centrifuge controller", "Ready"],
-            ["Drain control", "Ready"],
+            ["Pump A (NaOH/KOH + methanol)", "Ready"],
+            ["Pump B (H₂SO₄ + methanol)", "Ready"],
+            ["Reactor outlet valve", "Closed"],
+            ["Centrifuge outlet valve", "Closed"],
+            ["Dry wash stirrer", "Ready"],
+            ["Purification outlet valve", "Closed"],
+            ["Output load cell", "0.0 g"],
           ]).map(([device, state]) => (
-            <div key={device} className="flex items-center justify-between rounded-xl border border-white/[0.07] bg-black/10 p-4">
+            <div key={device} className="flex items-center justify-between rounded-xl border border-white/[0.07] bg-gv-inset p-4">
               <span className="text-sm text-gray-400">{device}</span><Status tone={["Fault", "No reading"].includes(state) ? "red" : "green"}>{state}</Status>
             </div>
           ))}

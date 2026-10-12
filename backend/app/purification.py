@@ -4,7 +4,8 @@ It runs by itself, without operator confirmations:
 1. Heating: heater on, valve closed, until the target (default 70 °C). With a heater sized for the
    batch this takes about a minute.
 2. Hold: the target ±1 °C for the hold time (default 25 min), so leftover methanol evaporates.
-3. Mesh bed flow: heater off, then the valve opens for the planned flow time = the batch's
+   The dry wash stirrer runs during heating and hold (purificationStirringSpeed, default 300 RPM).
+3. Mesh bed flow: heater and stirrer off, then the purification outlet valve opens for the planned flow time = the batch's
    biodiesel volume (about its oil volume) ÷ the mesh bed flow rate (default 40 mL/min).
 4. Drain: the valve stays open until the output weight stops changing for a minute (at most the
    drain time, default 3 min), then closes.
@@ -49,6 +50,7 @@ class PurificationRunner:
                 "flowRemainingSeconds": 0, "drainElapsedSeconds": 0, "drainMaximumSeconds": 0,
                 "flowStableSeconds": 0, "outputWeightG": None, "flowRateGPerMinute": None,
                 "heaterOn": False, "valveOpen": False, "heaterOnSeconds": 0, "warning": None,
+                "stirrerOn": False, "stirrerRpm": None, "stirringSpeed": 0,
                 "safetyStopReason": None, "safetyStopOccurred": False, "record": None}
 
     @property
@@ -112,8 +114,15 @@ class PurificationRunner:
             self.state["heaterOnSeconds"] += 1
 
     def _sync(self) -> None:
+        reading = self.hw.read()
         self.state["heaterOn"] = self.hw.heater_on
         self.state["valveOpen"] = self.hw.valves.get("mesh_bed", False)
+        self.state["stirrerOn"] = self.hw.motor_duty.get("purification_stirrer", 0) > 0
+        self.state["stirrerRpm"] = reading.get("purificationStirrerRpm")
+
+    def _stir(self, s: Settings, on: bool) -> None:
+        duty = s.purification_stirring_speed / s.purification_stirrer_max_rpm if on else 0.0
+        self.hw.set_motor("purification_stirrer", duty)
 
     def _check_temperature(self, s: Settings, required: bool = True) -> Optional[float]:
         t = self.hw.read().get("temperature")
@@ -152,9 +161,11 @@ class PurificationRunner:
         cancelled = False
         st = self.state
         try:
-            # 1. Heating: valve closed, heater on until the target is reached
+            # 1. Heating: valve closed, heater and stirrer on until the target is reached
             self.hw.set_valve("mesh_bed", False)
             self.hw.set_heater(True)
+            st["stirringSpeed"] = s.purification_stirring_speed
+            self._stir(s, True)
             self._sync()
             while self._check_temperature(s) < target:
                 if self._take_skip():
@@ -166,6 +177,7 @@ class PurificationRunner:
                     raise SafetyStop(f"target not reached within {s.heating_timeout:g} min")
                 await self._tick()
                 st["heatingTimeSeconds"] += 1
+                self._sync()
 
             # 2. Hold at target ±1 °C so leftover methanol evaporates
             st["phase"] = "hold"
@@ -180,8 +192,9 @@ class PurificationRunner:
                 st["holdRemainingSeconds"] -= 1
             st["holdTimeSeconds"] = st["holdTotalSeconds"] - st["holdRemainingSeconds"]
 
-            # 3. Mesh bed flow: heater off first, then open the valve for the planned time
+            # 3. Mesh bed flow: heater and stirrer off first, then open the valve for the planned time
             self.hw.set_heater(False)
+            self._stir(s, False)
             self._output_base = self.hw.read().get("outputWeightG") or 0.0
             self.hw.set_valve("mesh_bed", True)
             st["phase"] = "flow"
@@ -228,6 +241,7 @@ class PurificationRunner:
             st["safetyStopReason"] = f"unexpected error: {e}"
         finally:
             self.hw.set_heater(False)
+            self.hw.set_motor("purification_stirrer", 0.0)
             self.hw.set_valve("mesh_bed", False)
             self._sync()
         if st["safetyStopReason"]:
@@ -248,6 +262,7 @@ class PurificationRunner:
             "safetyStopReason": st["safetyStopReason"],
             "outputWeightG": st["outputWeightG"],
             "heaterOnSeconds": st["heaterOnSeconds"],
+            "stirringSpeed": st["stirringSpeed"],
         }
         if on_finish:
             on_finish(st["record"])

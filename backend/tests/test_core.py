@@ -9,6 +9,7 @@ from app.hardware import InterlockError, MockHardware
 from app.models import Batch, Settings
 from app.purification import PurificationRunner
 from app.stages import StageError, StageRunner
+from app.transfers import DrainRunner, PumpRunner
 
 S = Settings()
 
@@ -45,12 +46,28 @@ def test_settings_validation(bad):
 
 # ---------- calculations (same numbers as calculateQuantityCards on the website) ----------
 def test_calculator_with_esterification():
+    # The strip reads at most 5%, so every batch above 4% gets the uniform dose for 10% FFA
     q = calculations.quantity_cards(460, 6, 7, "NaOH", S)
-    assert q["esterificationNeeded"] and q["isEstimate"]
-    assert approx(q["esterificationMethanolMl"], 78.38) and approx(q["sulfuricAcidMl"], 0.7452, 0.0001)
-    assert approx(q["acetoneMl"], 50) and approx(q["transesterificationMethanolMl"], 148.01)
+    assert q["esterificationNeeded"] and q["isEstimate"] and q["uniformDose"] and q["doseFfa"] == 10
+    assert approx(q["ffaMassG"], 46) and approx(q["esterificationMethanolMl"], 130.64)
+    assert approx(q["sulfuricAcidMl"], 1.242, 0.0001) and approx(q["sulfuricAcidG"], 2.3)
+    assert approx(q["acetoneMl"], 50) and approx(q["acetoneG"], 39.2) and approx(q["transesterificationMethanolMl"], 148.01)
     assert approx(q["catalystBaseG"], 4.6) and approx(q["neutralizationG"], 0.6532)
     assert approx(q["catalystToWeighG"], 5.36) and q["purity"] == 98
+    # pump B premix: 130.64 mL methanol (103.47 g) + 1.242 mL H2SO4 (2.3 g)
+    assert approx(q["esterificationPremixMl"], 131.88) and approx(q["esterificationPremixG"], 105.77)
+    # pump A premix: 148.01 mL methanol (117.22 g) + 5.36 g NaOH
+    assert approx(q["transesterificationPremixG"], 122.58)
+    same = calculations.quantity_cards(460, 4.5, 7, "NaOH", S)   # any FFA above 4%: the same dose
+    assert same["esterificationMethanolMl"] == q["esterificationMethanolMl"]
+
+
+def test_design_ffa_setting():
+    s = Settings(esterification_design_ffa=8)
+    q = calculations.quantity_cards(460, 5, 7, "NaOH", s)
+    assert q["doseFfa"] == 8 and approx(q["esterificationMethanolMl"], 104.51)
+    with pytest.raises(ValueError):
+        Settings(esterification_design_ffa=3)     # must be above the 4% threshold
 
 
 def test_calculator_without_esterification():
@@ -65,9 +82,11 @@ def test_exactly_4_percent_skips_esterification():
 
 
 def test_after_esterification():
+    # the re-check reading (which the strip can measure) doses stage 2, at 40:1; no new acetone
     nxt = calculations.after_esterification(920, 1.2, 1, 7, "KOH", S)
-    assert nxt["action"] == "anotherStage" and nxt["stage"] == 2
+    assert nxt["action"] == "anotherStage" and nxt["stage"] == 2 and nxt["doseFfa"] == 1.2
     assert approx(nxt["esterificationMethanolMl"], 62.71) and approx(nxt["sulfuricAcidMl"], 0.298)
+    assert nxt["acetoneMl"] == 0 and not nxt["uniformDose"]
     done = calculations.after_esterification(920, 0.5, 2, 7, "KOH", S)
     assert done["action"] == "transesterification"
     assert approx(done["catalystToWeighG"], 11.24) and approx(done["transesterificationMethanolMl"], 296.02)
@@ -86,8 +105,8 @@ def _samples():
 def test_ffa_ranges_match_the_website():
     keys = [r["key"] for r in analytics.ffa_ranges(S)]
     labels = [r["label"] for r in analytics.ffa_ranges(S)]
-    assert keys == ["0-2", "2-4", "4-6", "6-8", "8-10", "10+"]
-    assert labels[1] == "2–4%" and labels[-1] == "Above 10%"
+    assert keys == ["0-2", "2-4", "4-5", "5+"]
+    assert labels[1] == "2–4%" and labels[-1] == "5% and above"
     r24 = analytics.ffa_ranges(S)[1]
     assert analytics.in_range(2.0, r24) and not analytics.in_range(4.0, r24)   # min <= FFA < max
 
@@ -98,7 +117,8 @@ def test_range_rows_on_sample_data():
     assert r["testedBatches"] == 2 and r["labPassRate"] == 100 and r["status"] == "Testing"
     assert r["recommendedBatchId"] == "B-2026-022" and approx(r["averageYield"], 88.75)
     assert r["minimumYield"] == 88.4 and r["maximumYield"] == 89.1
-    assert rows["4-6"]["recommendedParameters"]["esterificationVoltage"] == 20
+    assert rows["4-5"]["recommendedParameters"]["esterificationVoltage"] == 20
+    assert rows["5+"]["testedBatches"] == 0     # B-2026-023 is pending, B-2026-021 failed (not tested)
     assert rows["0-2"]["status"] == "No data" and rows["0-2"]["recommendedParameters"] is None
 
 
@@ -117,7 +137,8 @@ def test_recommended_parameters():
     p = analytics.recommended_parameters(3.0, batches, S)
     assert p["transesterificationTime"] == 65 and p["transesterificationStirring"] == 470
     assert "esterificationVoltage" not in p
-    assert analytics.recommended_parameters(5.0, batches, S)["esterificationTime"] == 120
+    assert analytics.recommended_parameters(4.5, batches, S)["esterificationTime"] == 120
+    assert analytics.recommended_parameters(5.0, batches, S) is None   # "5% and above": nothing tested yet
     assert analytics.recommended_parameters(1.0, batches, S) is None
 
 
@@ -141,6 +162,28 @@ def test_interlocks():
     assert not hw.heater_on and hw.valves["mesh_bed"]
     with pytest.raises(InterlockError):
         hw.set_heater(True)
+
+
+def test_pump_and_valve_interlocks():
+    hw = MockHardware()
+    hw.set_pump("acid", True)
+    with pytest.raises(InterlockError):
+        hw.set_pump("catalyst", True)            # one pump at a time
+    with pytest.raises(InterlockError):
+        hw.set_valve("reactor_outlet", True)     # not while a pump fills the reactor
+    hw.set_pump("acid", False)
+    hw.set_valve("reactor_outlet", True)
+    with pytest.raises(InterlockError):
+        hw.set_pump("catalyst", True)            # not while the reactor drains
+    hw.set_motor("centrifuge", 0.9)
+    with pytest.raises(InterlockError):
+        hw.set_valve("centrifuge_outlet", True)  # not while the centrifuge spins
+    hw.set_motor("centrifuge", 0)
+    hw.set_valve("centrifuge_outlet", True)
+    with pytest.raises(InterlockError):
+        hw.set_motor("centrifuge", 0.9)
+    hw.all_off()
+    assert not any(hw.valves.values()) and not any(hw.pumps.values()) and not any(hw.motor_duty.values())
 
 
 def test_watchdog():
@@ -178,8 +221,10 @@ async def _purify(runner, hw, fault=None, skip=False, biodiesel_ml=500):
 
 
 def _demo_hw(scale=SCALE):
+    """500 mL of oil, and its biodiesel (85% of the oil's weight) already in the purification tank."""
     hw = MockHardware(scale)
     hw.demo_load_oil(500)
+    hw.demo_fill_tank(hw.oil_g * hw.BIODIESEL_FRACTION)
     hw.refresh()
     return hw
 
@@ -207,13 +252,37 @@ def test_purification_full_sequence():
     assert 60 <= rec["drainTimeSeconds"] <= 180                # drained: weight steady for a minute
     assert rec["outputWeightG"] > 380 and st["flowStableSeconds"] >= 60
     assert not violations and not hw.heater_on and not hw.valves["mesh_bed"]
+    assert rec["stirringSpeed"] == 300 and hw.motor_duty["purification_stirrer"] == 0
+
+
+def test_dry_wash_stirrer_runs_during_heating_and_hold():
+    hw = _demo_hw()
+    runner = PurificationRunner(hw, SCALE)
+    seen = {}
+
+    async def scenario():
+        async def sensor_loop():
+            while True:
+                hw.refresh()
+                await asyncio.sleep(1 / SCALE)
+        loop = asyncio.create_task(sensor_loop())
+        runner.start(S, 70, "B-test", biodiesel_ml=500)
+        while runner.running:
+            st = runner.state
+            if st["phase"] in ("heating", "hold", "flow") and st["heatingTimeSeconds"] > 2:
+                seen.setdefault(st["phase"], set()).add((st["stirrerOn"], st["stirrerRpm"] if st["stirrerOn"] else None))
+            await asyncio.sleep(0.002)
+        loop.cancel()
+    asyncio.run(scenario())
+    assert seen["heating"] == {(True, 300)} and seen["hold"] == {(True, 300)}   # 300 RPM default
+    assert seen["flow"] == {(False, None)}    # stopped before the outlet valve opens
 
 
 def test_purification_warns_when_little_comes_out():
     hw = _demo_hw()
     hw.tank_g = 100.0          # a clogged bed lets only 100 g through
     runner = PurificationRunner(hw, SCALE)
-    rec = asyncio.run(_purify(runner, hw))
+    rec = asyncio.run(_purify(runner, hw, skip=True))   # skip the timers: only the result matters
     assert runner.state["phase"] == "complete" and "clogging" in rec["warning"]
 
 
@@ -333,6 +402,126 @@ def test_stage_limits():
 
 async def _start_bad(runner):
     runner.start("Transesterification", S, voltage=35)
+
+
+# ---------- dosing pumps and outlet valves ----------
+async def _with_sensors(hw, coro):
+    async def sensor_loop():
+        while True:
+            hw.refresh()
+            await asyncio.sleep(1 / hw.time_scale)
+    loop = asyncio.create_task(sensor_loop())
+    try:
+        return await coro
+    finally:
+        loop.cancel()
+
+
+async def _until_done(runner):
+    while runner.running:
+        await asyncio.sleep(0.002)
+
+
+def test_pump_stops_at_the_dose_weight():
+    hw = MockHardware(400)
+    hw.demo_load_oil(500)                                       # 460 g of oil in the reactor
+    hw.refresh()
+    pump = PumpRunner(hw, 400)
+    done = []
+
+    async def scenario():
+        pump.start("acid", 105.8, 131.9, 100, 20, "B-test", "Esterification", done.append)
+        assert hw.pumps["acid"]
+        await _until_done(pump)
+    asyncio.run(_with_sensors(hw, scenario()))
+    st = pump.state
+    assert st["phase"] == "done" and done[0]["phase"] == "done" and not st["byTime"]
+    assert 105.3 <= st["deliveredG"] <= 107.5 and not hw.pumps["acid"]
+    assert 565 < hw.reactor_g < 568                              # oil + the dose
+
+
+def test_pump_faults_when_nothing_arrives():
+    hw = MockHardware(400)
+    hw.refresh()
+    hw._write_pump = lambda name, on: None
+    hw.PUMP_G_PER_S = 0                                          # empty tank: the weight never rises
+    pump = PumpRunner(hw, 400)
+
+    async def scenario():
+        pump.start("catalyst", 100, 120, 100, 20)
+        await _until_done(pump)
+    asyncio.run(_with_sensors(hw, scenario()))
+    assert pump.state["phase"] == "fault" and "nothing is arriving" in pump.state["faultReason"]
+    assert pump.state["elapsedSeconds"] == 20 and not hw.pumps["catalyst"]
+
+
+def test_pump_by_time_without_load_cell():
+    hw = MockHardware(400)
+    hw._snapshot = {"oilMassG": None}
+    hw.read = lambda: {"oilMassG": None}                         # no load cell reading
+    pump = PumpRunner(hw, 400)
+
+    async def scenario():
+        pump.start("catalyst", 100, 50, 100, 20)                # 50 mL at 100 mL/min = 30 s
+        await _until_done(pump)
+    asyncio.run(scenario())
+    assert pump.state["byTime"] and pump.state["phase"] == "done" and pump.state["elapsedSeconds"] == 30
+
+
+def test_pump_stop_and_skip():
+    hw = MockHardware(50)
+    hw.demo_load_oil(500)
+    hw.refresh()
+    pump = PumpRunner(hw, 50)
+
+    async def scenario():
+        pump.start("acid", 100, 120, 100, 20)
+        await asyncio.sleep(0.05)
+        await pump.stop()
+        assert pump.state["phase"] == "stopped" and not hw.pumps["acid"]
+        pump.start("acid", 100, 120, 100, 20)
+        pump.skip()                                              # demo: the rest arrives at once
+        await _until_done(pump)
+    asyncio.run(_with_sensors(hw, scenario()))
+    assert pump.state["phase"] == "done" and pump.state["deliveredG"] == 100
+
+
+def test_drains_move_the_batch_along():
+    hw = MockHardware(400)
+    hw.demo_load_oil(500)                                        # 460 g of oil
+    hw.demo_add("reactor", 230)                                  # acetone and premixes
+    hw.refresh()
+    drain = DrainRunner(hw, 400)
+
+    async def scenario():
+        drain.start("reactor_outlet", 180)
+        assert hw.valves["reactor_outlet"]
+        await _until_done(drain)
+        assert drain.state["phase"] == "done" and not hw.valves["reactor_outlet"]
+        assert hw.reactor_g < 1 and 689 < hw.centrifuge_g < 691
+        hw.set_motor("centrifuge", 0.9)
+        hw.refresh()
+        drain.start("centrifuge_outlet", 180, wait_rpm="centrifugeRpm", spin_down_seconds=30)
+        await asyncio.sleep(0.02)
+        assert drain.state["phase"] == "waiting" and not hw.valves["centrifuge_outlet"]
+        hw.set_motor("centrifuge", 0)                            # it stops: the outlet opens
+        await _until_done(drain)
+    asyncio.run(_with_sensors(hw, scenario()))
+    assert drain.state["phase"] == "done" and drain.state["waitedSeconds"] >= 1
+    assert 390 < hw.tank_g < 392 and hw.read()["heaterSubmerged"]    # 85% of the oil: biodiesel
+
+
+def test_drain_waits_for_spin_down_without_rpm_reading():
+    hw = MockHardware(400)
+    hw.refresh()
+    hw._snapshot["centrifugeRpm"] = None
+    drain = DrainRunner(hw, 400)
+
+    async def scenario():
+        drain.start("centrifuge_outlet", 10, wait_rpm="centrifugeRpm", spin_down_seconds=30)
+        await _until_done(drain)
+    asyncio.run(scenario())
+    assert drain.state["waitedSeconds"] == 30 and drain.state["elapsedSeconds"] == 10
 
 
 # ---------- database ----------
