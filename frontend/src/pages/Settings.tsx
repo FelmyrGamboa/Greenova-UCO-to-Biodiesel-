@@ -4,6 +4,7 @@ import { useLiveData } from "../contexts/LiveContext";
 import { useTheme } from "../contexts/ThemeContext";
 import { getBatches, getSystemStatus, isOffline, saveSettings, type SystemStatus } from "../lib/api";
 import { DEFAULT_FFA_BOUNDARIES, ffaBoundaries } from "../lib/greenovaData";
+import { useLanguage, type Language } from "../lib/i18n";
 
 function readSettings() {
   try {
@@ -18,6 +19,7 @@ const DEFAULT_BATCH_FORMAT = "B-{YEAR}-{SEQ}";
 export default function Settings() {
   const initialSettings = readSettings();
   const { theme, setTheme } = useTheme();
+  const { language, setLanguage, t } = useLanguage();
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const { backend } = useLiveData();
@@ -29,32 +31,21 @@ export default function Settings() {
   const [format, setFormat] = useState(
     initialSettings.format && initialSettings.format !== DEFAULT_BATCH_FORMAT ? String(initialSettings.format) : "",
   );
-  const [purificationTargetTemperature, setPurificationTargetTemperature] = useState(
-    String(initialSettings.purificationTargetTemperature || 70),
-  );
-  const [purificationMaximumTemperature, setPurificationMaximumTemperature] = useState(
-    String(initialSettings.purificationMaximumTemperature || 75),
-  );
-  const [thermalFuseRating, setThermalFuseRating] = useState(
-    String(initialSettings.thermalFuseRating || ""),
-  );
-  const [purificationHoldTime, setPurificationHoldTime] = useState(
-    String(initialSettings.purificationHoldTime || 25),
-  );
-  const [meshBedFlowRate, setMeshBedFlowRate] = useState(String(initialSettings.meshBedFlowRate || 40));
-  const [drainTime, setDrainTime] = useState(String(initialSettings.drainTime || 3));
-  const [heatingTimeout, setHeatingTimeout] = useState(String(initialSettings.heatingTimeout || 10));
-  const [ffaRangeBoundaries, setFfaRangeBoundaries] = useState(ffaBoundaries(initialSettings.ffaRangeBoundaries).join(","));
   const numberSetting = (key: string, fallback: number) => {
     const value = Number(initialSettings[key]);
     return String(initialSettings[key] !== undefined && initialSettings[key] !== null && Number.isFinite(value) ? value : fallback);
   };
-  const [purificationStirringSpeed, setPurificationStirringSpeed] = useState(numberSetting("purificationStirringSpeed", 300));
+  // Purification: only these four are settings; the 90 °C hold, 95 °C cutoff and 200 RPM are fixed.
+  const [methanolRemovalTime, setMethanolRemovalTime] = useState(numberSetting("methanolRemovalTime", 10));
+  const [contactTime, setContactTime] = useState(numberSetting("contactTime", 15));
+  const [settlingTime, setSettlingTime] = useState(numberSetting("settlingTime", 10));
+  const [maxDrainTemperature, setMaxDrainTemperature] = useState(numberSetting("maxDrainTemperature", 50));
+  const [ffaRangeBoundaries, setFfaRangeBoundaries] = useState(ffaBoundaries(initialSettings.ffaRangeBoundaries).join(","));
   const [esterificationDesignFfa, setEsterificationDesignFfa] = useState(numberSetting("esterificationDesignFfa", 10));
   const [stripMaxFfa, setStripMaxFfa] = useState(numberSetting("stripMaxFfa", 5));
   const [pumpCatalystRate, setPumpCatalystRate] = useState(numberSetting("pumpCatalystRate", 100));
   const [pumpAcidRate, setPumpAcidRate] = useState(numberSetting("pumpAcidRate", 100));
-  const [reactorDrainTime, setReactorDrainTime] = useState(numberSetting("reactorDrainTime", 3));
+  const [reactorDrainTime, setReactorDrainTime] = useState(numberSetting("reactorDrainTime", 1));
   const [centrifugeDrainTime, setCentrifugeDrainTime] = useState(numberSetting("centrifugeDrainTime", 3));
   const [centrifugeSpinDownTime, setCentrifugeSpinDownTime] = useState(numberSetting("centrifugeSpinDownTime", 30));
   const [provenBatchCount, setProvenBatchCount] = useState(String(initialSettings.provenBatchCount || 3));
@@ -91,14 +82,10 @@ export default function Settings() {
       operator,
       units,
       format: format.trim() || DEFAULT_BATCH_FORMAT,
-      purificationTargetTemperature: Number(purificationTargetTemperature),
-      purificationMaximumTemperature: Number(purificationMaximumTemperature),
-      thermalFuseRating: thermalFuseRating ? Number(thermalFuseRating) : null,
-      purificationHoldTime: Number(purificationHoldTime),
-      meshBedFlowRate: Number(meshBedFlowRate),
-      drainTime: Number(drainTime),
-      heatingTimeout: Number(heatingTimeout),
-      purificationStirringSpeed: Number(purificationStirringSpeed),
+      methanolRemovalTime: Number(methanolRemovalTime),
+      contactTime: Number(contactTime),
+      settlingTime: Number(settlingTime),
+      maxDrainTemperature: Number(maxDrainTemperature),
       esterificationDesignFfa: Number(esterificationDesignFfa),
       stripMaxFfa: Number(stripMaxFfa),
       pumpCatalystRate: Number(pumpCatalystRate),
@@ -123,169 +110,113 @@ export default function Settings() {
       // Saves to the Raspberry Pi and to this browser; offline, only to this browser.
       await saveSettings(changes);
     } catch (error) {
-      setSaveError(isOffline(error) ? "Backend offline." : error instanceof Error ? error.message : String(error));
+      setSaveError(isOffline(error) ? t("Backend offline.") : t(error instanceof Error ? error.message : String(error)));
       return;
     }
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2000);
   }
 
+  const designFfa = Number(esterificationDesignFfa) || 10;
+
   return (
     <div className="mx-auto max-w-5xl space-y-6">
       <div>
-        <div className="section-kicker">System configuration</div>
-        <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">Settings</Heading>
-        <p className="mt-2 text-sm text-gray-500">Manage practical system, process, device, and data defaults.</p>
+        <div className="section-kicker">{t("System configuration")}</div>
+        <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Settings")}</Heading>
+        <p className="mt-2 text-sm text-gray-500">{t("Manage practical system, process, device, and data defaults.")}</p>
       </div>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">General</Heading>
+        <Heading as="h2" className="text-lg font-semibold">{t("General")}</Heading>
         <div className="mt-6 grid gap-5 sm:grid-cols-2">
-          <Field label="System name" value={systemName} onChange={(event) => setSystemName(event.target.value)} />
-          <Field label="Operator / session" value={operator} onChange={(event) => setOperator(event.target.value)} />
-          <SelectField label="Interface theme" value={theme} onChange={(event) => setTheme(event.target.value as "dark" | "light")}>
-            <option value="dark">Dark</option><option value="light">Light</option>
+          <Field label={t("System name")} value={systemName} onChange={(event) => setSystemName(event.target.value)} />
+          <Field label={t("Operator / session")} value={operator} onChange={(event) => setOperator(event.target.value)} />
+          <SelectField label={t("Interface theme")} value={theme} onChange={(event) => setTheme(event.target.value as "dark" | "light")}>
+            <option value="dark">{t("Dark")}</option><option value="light">{t("Light")}</option>
           </SelectField>
-          <SelectField label="Measurement units" value={units} onChange={(event) => setUnits(event.target.value)}>
-            <option value="metric">Metric (mL, °C, g)</option><option value="imperial">Imperial</option>
+          <SelectField label={t("Language")} value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
+            <option value="en">English</option><option value="fil">Filipino (Tagalog)</option>
+          </SelectField>
+          <SelectField label={t("Measurement units")} value={units} onChange={(event) => setUnits(event.target.value)}>
+            <option value="metric">{t("Metric (mL, °C, g)")}</option><option value="imperial">{t("Imperial")}</option>
           </SelectField>
         </div>
+        <p className="mt-3 text-xs text-gray-600">{t("The theme and the language change right away and are remembered in this browser.")}</p>
       </Card>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">Analytics</Heading>
-        <p className="mt-1 text-sm text-gray-500">Configure FFA grouping, proof thresholds, and prototype costing.</p>
+        <Heading as="h2" className="text-lg font-semibold">{t("Analytics")}</Heading>
+        <p className="mt-1 text-sm text-gray-500">{t("Configure FFA grouping, proof thresholds, and prototype costing.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="FFA range boundaries" value={ffaRangeBoundaries} onChange={(event) => setFfaRangeBoundaries(event.target.value)} placeholder={DEFAULT_FFA_BOUNDARIES} unit="%" />
-          <Field label="Batches required for Proven" type="number" min="1" value={provenBatchCount} onChange={(event) => setProvenBatchCount(event.target.value)} />
-          <Field label="Yield tolerance" type="number" min="0" value={provenYieldTolerance} onChange={(event) => setProvenYieldTolerance(event.target.value)} unit="± pp" />
-          <Field label="Oil price" type="number" min="0" value={oilPrice} onChange={(event) => setOilPrice(event.target.value)} unit="₱/L" />
-          <Field label="Methanol price" type="number" min="0" value={methanolPrice} onChange={(event) => setMethanolPrice(event.target.value)} unit="₱/L" />
-          <Field label="KOH price" type="number" min="0" value={kohPrice} onChange={(event) => setKohPrice(event.target.value)} unit="₱/kg" />
-          <Field label="NaOH price" type="number" min="0" value={naohPrice} onChange={(event) => setNaohPrice(event.target.value)} unit="₱/kg" />
-          <Field label="Sulfuric acid price" type="number" min="0" value={sulfuricAcidPrice} onChange={(event) => setSulfuricAcidPrice(event.target.value)} unit="₱/L" />
-          <Field label="Acetone price" type="number" min="0" value={acetonePrice} onChange={(event) => setAcetonePrice(event.target.value)} unit="₱/L" />
-          <Field label="Bentonite price" type="number" min="0" value={bentonitePrice} onChange={(event) => setBentonitePrice(event.target.value)} unit="₱/kg" />
-          <Field label="Electricity price" type="number" min="0" value={electricityPrice} onChange={(event) => setElectricityPrice(event.target.value)} unit="₱/kWh" />
-          <Field label="Diesel price" type="number" min="0" value={dieselPrice} onChange={(event) => setDieselPrice(event.target.value)} unit="₱/L" />
+          <Field label={t("FFA range boundaries")} value={ffaRangeBoundaries} onChange={(event) => setFfaRangeBoundaries(event.target.value)} placeholder={DEFAULT_FFA_BOUNDARIES} unit="%" />
+          <Field label={t("Batches required for Proven")} type="number" min="1" value={provenBatchCount} onChange={(event) => setProvenBatchCount(event.target.value)} />
+          <Field label={t("Yield tolerance")} type="number" min="0" value={provenYieldTolerance} onChange={(event) => setProvenYieldTolerance(event.target.value)} unit="± pp" />
+          <Field label={t("Oil price")} type="number" min="0" value={oilPrice} onChange={(event) => setOilPrice(event.target.value)} unit="₱/L" />
+          <Field label={t("Methanol price")} type="number" min="0" value={methanolPrice} onChange={(event) => setMethanolPrice(event.target.value)} unit="₱/L" />
+          <Field label={t("KOH price")} type="number" min="0" value={kohPrice} onChange={(event) => setKohPrice(event.target.value)} unit="₱/kg" />
+          <Field label={t("NaOH price")} type="number" min="0" value={naohPrice} onChange={(event) => setNaohPrice(event.target.value)} unit="₱/kg" />
+          <Field label={t("Sulfuric acid price")} type="number" min="0" value={sulfuricAcidPrice} onChange={(event) => setSulfuricAcidPrice(event.target.value)} unit="₱/L" />
+          <Field label={t("Acetone price")} type="number" min="0" value={acetonePrice} onChange={(event) => setAcetonePrice(event.target.value)} unit="₱/L" />
+          <Field label={t("Bentonite price")} type="number" min="0" value={bentonitePrice} onChange={(event) => setBentonitePrice(event.target.value)} unit="₱/kg" />
+          <Field label={t("Electricity price")} type="number" min="0" value={electricityPrice} onChange={(event) => setElectricityPrice(event.target.value)} unit="₱/kWh" />
+          <Field label={t("Diesel price")} type="number" min="0" value={dieselPrice} onChange={(event) => setDieselPrice(event.target.value)} unit="₱/L" />
         </div>
-        <p className="mt-3 text-xs text-gray-600">Default FFA ranges: 0–2%, 2–4%, 4–5%, and 5% and above (the strip's darkest color).</p>
+        <p className="mt-3 text-xs text-gray-600">{t("Default FFA ranges: 0–2%, 2–4%, 4–5%, and 5% and above (the strip's darkest color).")}</p>
       </Card>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">Process Defaults</Heading>
-        <p className="mt-1 text-sm text-gray-500">Validated values can be entered once approved by the project team.</p>
+        <Heading as="h2" className="text-lg font-semibold">{t("Process Defaults")}</Heading>
+        <p className="mt-1 text-sm text-gray-500">{t("Validated values can be entered once approved by the project team.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-5">
-          <Field label="Temperature" placeholder="Project-defined" unit="°C" />
-          <Field label="Reaction time" placeholder="Project-defined" unit="min" />
-          <Field label="Stirring speed" placeholder="Project-defined" unit="RPM" />
-          <Field label="Batch naming format" value={format} placeholder={DEFAULT_BATCH_FORMAT} onChange={(event) => setFormat(event.target.value)} />
+          <Field label={t("Temperature")} placeholder={t("Project-defined")} unit="°C" />
+          <Field label={t("Reaction time")} placeholder={t("Project-defined")} unit="min" />
+          <Field label={t("Stirring speed")} placeholder={t("Project-defined")} unit="RPM" />
+          <Field label={t("Batch naming format")} value={format} placeholder={DEFAULT_BATCH_FORMAT} onChange={(event) => setFormat(event.target.value)} />
         </div>
       </Card>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">Esterification and Dosing</Heading>
-        <p className="mt-1 text-sm text-gray-500">The FFA strip reads only up to its darkest color, so every batch above 4% FFA gets one uniform esterification dose. A re-check after each stage decides the next step.</p>
+        <Heading as="h2" className="text-lg font-semibold">{t("Esterification and Dosing")}</Heading>
+        <p className="mt-1 text-sm text-gray-500">{t("The FFA strip reads only up to its darkest color, so every batch above 4% FFA gets one uniform esterification dose. A re-check after each stage decides the next step.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-          <Field label="Design FFA for the dose" type="number" min="4.1" max="30" step="0.5" value={esterificationDesignFfa} onChange={(event) => setEsterificationDesignFfa(event.target.value)} unit="%" />
-          <Field label="Strip maximum (darkest color)" type="number" min="1" step="0.5" value={stripMaxFfa} onChange={(event) => setStripMaxFfa(event.target.value)} unit="%" />
-          <Field label="Pump A rate (NaOH/KOH + methanol)" type="number" min="1" value={pumpCatalystRate} onChange={(event) => setPumpCatalystRate(event.target.value)} unit="mL/min" />
-          <Field label="Pump B rate (H₂SO₄ + methanol)" type="number" min="1" value={pumpAcidRate} onChange={(event) => setPumpAcidRate(event.target.value)} unit="mL/min" />
-          <Field label="Reactor outlet open after transesterification" type="number" min="0" value={reactorDrainTime} onChange={(event) => setReactorDrainTime(event.target.value)} unit="min" />
-          <Field label="Centrifuge outlet open after separation" type="number" min="0" value={centrifugeDrainTime} onChange={(event) => setCentrifugeDrainTime(event.target.value)} unit="min" />
-          <Field label="Centrifuge spin-down wait" type="number" min="0" value={centrifugeSpinDownTime} onChange={(event) => setCentrifugeSpinDownTime(event.target.value)} unit="s" />
+          <Field label={t("Design FFA for the dose")} type="number" min="4.1" max="30" step="0.5" value={esterificationDesignFfa} onChange={(event) => setEsterificationDesignFfa(event.target.value)} unit="%" />
+          <Field label={t("Strip maximum (darkest color)")} type="number" min="1" step="0.5" value={stripMaxFfa} onChange={(event) => setStripMaxFfa(event.target.value)} unit="%" />
+          <Field label={t("Pump A rate (NaOH/KOH + methanol)")} type="number" min="1" value={pumpCatalystRate} onChange={(event) => setPumpCatalystRate(event.target.value)} unit="mL/min" />
+          <Field label={t("Pump B rate (H₂SO₄ + methanol)")} type="number" min="1" value={pumpAcidRate} onChange={(event) => setPumpAcidRate(event.target.value)} unit="mL/min" />
+          <Field label={t("Reactor outlet open after transesterification")} type="number" min="0" value={reactorDrainTime} onChange={(event) => setReactorDrainTime(event.target.value)} unit="min" />
+          <Field label={t("Centrifuge outlet open after separation")} type="number" min="0" value={centrifugeDrainTime} onChange={(event) => setCentrifugeDrainTime(event.target.value)} unit="min" />
+          <Field label={t("Centrifuge spin-down wait")} type="number" min="0" value={centrifugeSpinDownTime} onChange={(event) => setCentrifugeSpinDownTime(event.target.value)} unit="s" />
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          Uniform dose per 100 mL of oil at {Number(esterificationDesignFfa) || 10}% design FFA: {((92 * (Number(esterificationDesignFfa) || 10) / 100) * 2.84).toFixed(1)} mL methanol and {((92 * (Number(esterificationDesignFfa) || 10) / 100) * 0.027).toFixed(2)} mL H₂SO₄. The pumps stop when the reactor load cell has gained the dose's weight; their rate only sets the time limit (and the dose time if the load cell has no reading). An outlet time of 0 means you move the liquid by hand. The spin-down wait is used only when the centrifuge has no RPM reading.
+          {t("Uniform dose per 100 mL of oil at {design}% design FFA: {methanol} mL methanol and {acid} mL H₂SO₄. The pumps stop when the reactor load cell has gained the dose's weight; their rate only sets the time limit (and the dose time if the load cell has no reading). An outlet time of 0 means you move the liquid by hand. The spin-down wait is used only when the centrifuge has no RPM reading.", { design: designFfa, methanol: ((92 * designFfa) / 100 * 2.84).toFixed(1), acid: ((92 * designFfa) / 100 * 0.027).toFixed(2) })}
         </p>
       </Card>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">Purification</Heading>
-        <p className="mt-1 text-sm text-gray-500">Purification runs by itself after separation: heat to the target, hold, mesh bed flow, then drain.</p>
+        <Heading as="h2" className="text-lg font-semibold">{t("Purification")}</Heading>
+        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol. It runs by itself after separation: heating, methanol removal, add Magnesol, contact, settling, cooling if needed, draining.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-          <Field
-            label="Purification target temperature"
-            type="number"
-            min="40"
-            max="70"
-            value={purificationTargetTemperature}
-            onChange={(event) => setPurificationTargetTemperature(event.target.value)}
-            unit="°C"
-          />
-          <Field
-            label="Maximum temperature cutoff"
-            type="number"
-            min="1"
-            value={purificationMaximumTemperature}
-            onChange={(event) => setPurificationMaximumTemperature(event.target.value)}
-            unit="°C"
-          />
-          <Field
-            label="Thermal fuse rating"
-            type="number"
-            min="1"
-            placeholder="Enter rating"
-            value={thermalFuseRating}
-            onChange={(event) => setThermalFuseRating(event.target.value)}
-            unit="°C"
-          />
-          <Field
-            label="Hold at target"
-            type="number"
-            min="1"
-            value={purificationHoldTime}
-            onChange={(event) => setPurificationHoldTime(event.target.value)}
-            unit="min"
-          />
-          <Field
-            label="Mesh bed flow rate"
-            type="number"
-            min="1"
-            value={meshBedFlowRate}
-            onChange={(event) => setMeshBedFlowRate(event.target.value)}
-            unit="mL/min"
-          />
-          <Field
-            label="Drain time (at most)"
-            type="number"
-            min="0"
-            value={drainTime}
-            onChange={(event) => setDrainTime(event.target.value)}
-            unit="min"
-          />
-          <Field
-            label="Dry wash stirring speed"
-            type="number"
-            min="0"
-            value={purificationStirringSpeed}
-            onChange={(event) => setPurificationStirringSpeed(event.target.value)}
-            unit="RPM"
-          />
-          <Field
-            label="Heating time limit"
-            type="number"
-            min="1"
-            value={heatingTimeout}
-            onChange={(event) => setHeatingTimeout(event.target.value)}
-            unit="min"
-          />
+          <Field label={t("Methanol removal time")} type="number" min="5" max="30" value={methanolRemovalTime} onChange={(event) => setMethanolRemovalTime(event.target.value)} unit="min" />
+          <Field label={t("Contact time")} type="number" min="1" max="60" value={contactTime} onChange={(event) => setContactTime(event.target.value)} unit="min" />
+          <Field label={t("Settling time")} type="number" min="0" max="60" value={settlingTime} onChange={(event) => setSettlingTime(event.target.value)} unit="min" />
+          <Field label={t("Max drain temperature")} type="number" min="30" max="85" value={maxDrainTemperature} onChange={(event) => setMaxDrainTemperature(event.target.value)} unit="°C" />
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          Target temperature allowed range: 40–70 °C. Flow time = batch volume ÷ flow rate (the biodiesel volume is about the oil volume), e.g. 500 mL ÷ {Number(meshBedFlowRate) || 40} mL/min = {(500 / (Number(meshBedFlowRate) || 40)).toFixed(1)} min. Draining ends when nothing more comes out for 1 minute. The heater stops if the target isn't reached within the heating time limit. The dry wash stirrer runs during heating and hold, and stops before the outlet valve opens (0 = off).
+          {t("Methanol removal: 5–30 min. Fixed: hold at 90 °C (±2 °C), heater cutoff 95 °C, stirrer 200 RPM, Magnesol = oil volume × 0.0092 g. The outlet valve opens only at or below the max drain temperature (the water filter's limit).")}
         </p>
       </Card>
 
       <Card className="p-6">
         <div className="flex items-center justify-between">
           <div>
-            <Heading as="h2" className="text-lg font-semibold">Device Status</Heading>
-            <p className="mt-1 text-sm text-gray-500">Current Raspberry Pi, sensor, and relay connections.</p>
+            <Heading as="h2" className="text-lg font-semibold">{t("Device Status")}</Heading>
+            <p className="mt-1 text-sm text-gray-500">{t("Current Raspberry Pi, sensor, and relay connections.")}</p>
           </div>
           {systemStatus ? (
-            <Status tone={systemStatus.mode === "live" ? "green" : "yellow"}>{systemStatus.mode === "live" ? "Connected" : "Demonstration backend"}</Status>
+            <Status tone={systemStatus.mode === "live" ? "green" : "yellow"}>{systemStatus.mode === "live" ? t("Connected") : t("Demonstration backend")}</Status>
           ) : (
-            <Status tone="neutral">Backend offline · demo values</Status>
+            <Status tone="neutral">{t("Backend offline · demo values")}</Status>
           )}
         </div>
         <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -304,18 +235,18 @@ export default function Settings() {
             ["Output load cell", "0.0 g"],
           ]).map(([device, state]) => (
             <div key={device} className="flex items-center justify-between rounded-xl border border-white/[0.07] bg-gv-inset p-4">
-              <span className="text-sm text-gray-400">{device}</span><Status tone={["Fault", "No reading"].includes(state) ? "red" : "green"}>{state}</Status>
+              <span className="text-sm text-gray-400">{t(device)}</span><Status tone={["Fault", "No reading"].includes(state) ? "red" : "green"}>{t(state)}</Status>
             </div>
           ))}
         </div>
       </Card>
 
       <Card className="p-6">
-        <Heading as="h2" className="text-lg font-semibold">Data</Heading>
+        <Heading as="h2" className="text-lg font-semibold">{t("Data")}</Heading>
         <div className="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <div className="text-sm font-medium text-gray-300">{backend ? "Raspberry Pi batch storage" : "Local batch storage"}</div>
-            <p className="mt-1 text-xs text-gray-600">{backend ? "Batch records and settings are stored on the Raspberry Pi (a copy of the settings stays in this browser)." : "Batch records and settings are stored in this browser."}</p>
+            <div className="text-sm font-medium text-gray-300">{backend ? t("Raspberry Pi batch storage") : t("Local batch storage")}</div>
+            <p className="mt-1 text-xs text-gray-600">{backend ? t("Batch records and settings are stored on the Raspberry Pi (a copy of the settings stays in this browser).") : t("Batch records and settings are stored in this browser.")}</p>
           </div>
           <Button variant="secondary" onClick={async () => {
             const batches = await getBatches().catch(() => []);
@@ -326,14 +257,14 @@ export default function Settings() {
             anchor.download = "greenova-batches.json";
             anchor.click();
             URL.revokeObjectURL(url);
-          }}>Export Batch Data</Button>
+          }}>{t("Export Batch Data")}</Button>
         </div>
       </Card>
 
       <div className="flex items-center gap-3">
-        <Button onClick={save}>Save Settings</Button>
-        {saved && <span className="text-sm text-green-400">Settings saved{backend ? " to the Raspberry Pi" : ""}.</span>}
-        {saveError && <span className="text-sm text-red-400">Not saved: {saveError}</span>}
+        <Button onClick={save}>{t("Save Settings")}</Button>
+        {saved && <span className="text-sm text-green-400">{backend ? t("Settings saved to the Raspberry Pi.") : t("Settings saved.")}</span>}
+        {saveError && <span className="text-sm text-red-400">{t("Not saved:")} {saveError}</span>}
       </div>
     </div>
   );

@@ -5,6 +5,7 @@ import { useTheme } from "../contexts/ThemeContext";
 import GreenovaLogo from "./GreenovaLogo";
 import PhoneAccess from "./PhoneAccess";
 import { Button, Status } from "./ui";
+import { useT } from "../lib/i18n";
 
 interface SidebarProps {
   open: boolean;
@@ -50,6 +51,7 @@ function readOperator() {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const t = useT();
   const { backend, mock, connecting } = useLiveData();
   const { theme, setTheme } = useTheme();
   const operator = readOperator();
@@ -61,15 +63,15 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           <Link
             to="/"
             onClick={onClose}
-            aria-label="Return to Greenova landing page"
+            aria-label={t("Return to Greenova landing page")}
             className="rounded-sm transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500/50"
           >
             <GreenovaLogo size="md" />
           </Link>
-          <Button variant="ghost" className="nav-close-button lg:hidden" onClick={onClose} aria-label="Close navigation">×</Button>
+          <Button variant="ghost" className="nav-close-button lg:hidden" onClick={onClose} aria-label={t("Close navigation")}>×</Button>
         </div>
         <nav className="flex-1 px-3 py-6">
-          <div className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-600">Workspace</div>
+          <div className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-600">{t("Workspace")}</div>
           <div className="space-y-1">
             {navItems.map((item) => (
               <NavLink
@@ -79,45 +81,45 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
                 className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-3 text-sm font-medium transition-colors ${isActive ? "bg-green-500/10 text-green-400" : "text-gray-400 hover:bg-white/[0.04] hover:text-white"}`}
               >
                 {item.icon}
-                {item.label}
+                {t(item.label)}
               </NavLink>
             ))}
           </div>
         </nav>
         <div className="border-t border-white/[0.07] p-5">
           <PhoneAccess className="mb-3" />
-          <div className="theme-switch mb-4" role="group" aria-label="Theme">
+          <div className="theme-switch mb-4" role="group" aria-label={t("Theme")}>
             <button type="button" aria-pressed={theme === "light"} onClick={() => setTheme("light")}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" className="h-4 w-4" aria-hidden="true">
                 <circle cx="12" cy="12" r="4" />
                 <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
               </svg>
-              Light
+              {t("Light")}
             </button>
             <button type="button" aria-pressed={theme === "dark"} onClick={() => setTheme("dark")}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
                 <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" />
               </svg>
-              Dark
+              {t("Dark")}
             </button>
           </div>
           <div className="mb-4 flex items-center justify-between">
-            <span className="text-xs text-gray-500">System</span>
+            <span className="text-xs text-gray-500">{t("System")}</span>
             {backend && !mock ? (
-              <Status>Connected</Status>
+              <Status>{t("Connected")}</Status>
             ) : backend ? (
-              <Status tone="yellow">Backend · demo</Status>
+              <Status tone="yellow">{t("Backend · demo")}</Status>
             ) : connecting ? (
-              <Status tone="neutral">Connecting…</Status>
+              <Status tone="neutral">{t("Connecting…")}</Status>
             ) : (
-              <Status tone="neutral">Local demo</Status>
+              <Status tone="neutral">{t("Local demo")}</Status>
             )}
           </div>
           <div className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-green-500/10 text-xs font-bold text-green-400">OP</div>
             <div>
               <div className="text-sm font-medium text-gray-200">{operator}</div>
-              <div className="text-xs text-gray-600">Production session</div>
+              <div className="text-xs text-gray-600">{t("Production session")}</div>
             </div>
           </div>
         </div>

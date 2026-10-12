@@ -33,16 +33,23 @@ def _wait_for(client, path, key, values, timeout=6.0):
 def test_health_and_config(client):
     assert client.get("/api/health").json()["status"] == "ok"
     cfg = client.get("/api/config").json()
-    assert cfg["esterification"]["voltage"] == {"min": 18, "max": 30, "default": 20}
+    assert cfg["esterification"]["voltage"] == {"min": 10, "max": 30, "default": 20}
+    assert cfg["transesterification"]["time"] == {"min": 30, "max": 180, "default": 120}
+    assert cfg["esterification"]["current"] == {"min": 0.5, "max": 2, "default": 1}
+    assert cfg["powerSupply"]["currentControl"] is False
     assert cfg["ffaThreshold"] == 4
     assert cfg["esterification"]["designFfa"] == 10 and cfg["esterification"]["stripMaxFfa"] == 5
-    assert cfg["pumps"]["acidRateMlPerMinute"] == 100 and cfg["drains"]["reactorMinutes"] == 3
-    assert cfg["purification"]["stirringSpeedRpm"] == 300
+    assert cfg["pumps"]["acidRateMlPerMinute"] == 100 and cfg["drains"]["reactorMinutes"] == 1
+    pur = cfg["purification"]
+    assert (pur["holdTemperature"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 95, 200)
+    assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settlingMinutes"], pur["maxDrainTemperature"]) == (10, 15, 10, 50)
+    assert pur["magnesolGramsPerMlOil"] == 0.0092
 
 
 def test_settings_partial_update(client):
-    s = client.put("/api/settings", json={"purificationTargetTemperature": 64, "methanolPrice": None}).json()
-    assert s["purificationTargetTemperature"] == 64 and s["methanolPrice"] == 70
+    s = client.put("/api/settings", json={"methanolRemovalTime": 12, "methanolPrice": None}).json()
+    assert s["methanolRemovalTime"] == 12 and s["methanolPrice"] == 70
+    assert client.put("/api/settings", json={"methanolRemovalTime": 40}).status_code == 400   # 5-30 min
     assert client.put("/api/settings", json={"ffaRangeBoundaries": "5"}).status_code == 400
 
 
@@ -50,6 +57,7 @@ def test_calculate(client):
     q = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6, "catalyst": "NaOH"}).json()
     assert round(q["esterificationMethanolMl"], 1) == 130.6 and round(q["catalystToWeighG"], 2) == 5.36
     assert q["uniformDose"] is True and q["doseFfa"] == 10
+    assert q["magnesolG"] == 4.6                                        # 500 mL × 0.0092
     assert client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6, "methanolRatio": 12}).status_code == 400
 
 
@@ -73,6 +81,9 @@ def test_stage_controls(client):
     assert client.post("/api/process/stage/complete").json()["state"] == "complete"
     bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "voltage": 35})
     assert bad.status_code == 409
+    client.post("/api/process/stage/reset")
+    bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "current": 2.5})
+    assert bad.status_code == 409 and "Current must be between 0.5 and 2" in bad.json()["detail"]
 
 
 def test_purification_rules(client):
@@ -143,7 +154,7 @@ def test_whole_batch_moves_through_the_machine(client):
     client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 276})
     client.post("/api/process/stage/complete")
     d = client.get("/api/process/drain").json()
-    assert d["valve"] == "reactor_outlet" and d["phase"] == "draining" and d["totalSeconds"] == 180
+    assert d["valve"] == "reactor_outlet" and d["phase"] == "draining" and d["totalSeconds"] == 60   # 1 min
     assert client.get("/api/live").json()["sensors"]["reactorValveOpen"] is True
     client.post("/api/process/stage/reset")
     busy = client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b})
@@ -164,9 +175,10 @@ def test_whole_batch_moves_through_the_machine(client):
     _wait_for(client, "/api/process/drain", "phase", ["done"])
     p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=3)
     assert p["batchId"] == b and p["automatic"] is True and p["heaterOn"] is True
-    assert p["stirrerOn"] is True and p["stirringSpeed"] == 300
-    # flow time from the batch's oil: 276 g ÷ 0.92 g/mL = 300 mL, at 40 mL/min = 7.5 min
-    assert p["expectedBiodieselMl"] == 300 and p["plannedFlowSeconds"] == 450
+    assert p["stirrerOn"] is True and p["stirringSpeed"] == 200 and p["targetTemperature"] == 90
+    # from the batch's oil: 276 g ÷ 0.92 g/mL = 300 mL; Magnesol = 300 × 0.0092 = 2.76 -> 2.8 g
+    assert p["magnesolG"] == 2.8 and p["oilWeightG"] == 276
+    assert p["methanolTotalSeconds"] == 600 and p["contactTotalSeconds"] == 900
     client.post("/api/process/purification/abort")
 
     saved = client.post("/api/batches", json={"id": b, "oilVolume": 300, "ffa": 5, "ffaAboveStrip": True,
@@ -214,6 +226,10 @@ def test_system_status_lists_the_new_parts(client):
     st = client.get("/api/system/status").json()
     labels = [t["label"] for t in st["tiles"]]
     assert {"Dosing Pumps", "Outlet Valves", "Output Load Cell", "Reactor Load Cell"} <= set(labels)
+    tiles = {t["label"]: t for t in st["tiles"]}
+    for name in ("Reactor Stirrer", "Centrifuge Motor", "Purification Stirrer", "Heater"):
+        assert tiles[name]["value"] == "Ready" and tiles[name]["state"] == "ready"
+    assert tiles["Electrodes"]["value"] == "Graphite – graphite"
     devices = {d["label"]: d["status"] for d in st["devices"]}
     assert devices["Reactor outlet valve"] == "Closed" and devices["Dry wash stirrer"] == "Ready"
     assert devices["Pump B (H₂SO₄ + methanol)"] == "Ready"
@@ -230,3 +246,44 @@ def test_network_addresses(client):
     addresses = client.get("/api/network").json()["addresses"]
     assert isinstance(addresses, list)
     assert all(not a.startswith("127.") and a.count(".") == 3 for a in addresses)
+
+
+def test_magnesol_step_waits_for_the_operator(client):
+    client.post("/api/demo/load-oil", json={"volumeMl": 500})
+    client.post("/api/demo/add", json={"place": "purificationTank", "grams": 391})
+    time.sleep(1.2)
+    r = client.post("/api/process/purification/start", json={"batchId": "B-MAG-1", "oilVolumeMl": 500})
+    assert r.status_code == 200 and r.json()["magnesolG"] == 4.6
+    assert client.post("/api/process/purification/magnesol-added").status_code == 409   # not asked yet
+    client.post("/api/process/purification/skip")                                        # heating
+    _wait_for(client, "/api/process/purification", "phase", ["methanol"])
+    client.post("/api/process/purification/skip")                                        # methanol removal
+    p = _wait_for(client, "/api/process/purification", "phase", ["magnesol"])
+    assert p["heaterOn"] is False and p["stirrerOn"] is True
+    time.sleep(1.5)
+    assert client.get("/api/process/purification").json()["phase"] == "magnesol"         # still waiting
+    p = client.post("/api/process/purification/magnesol-added").json()
+    p = _wait_for(client, "/api/process/purification", "phase", ["contact"])
+    assert p["magnesolAdded"] is True
+    client.post("/api/process/purification/abort")
+
+
+def test_overcurrent_stops_electrodes_with_a_warning(client):
+    r = client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": "B-AMP-1", "current": 1})
+    assert r.json()["current"] == 1 and r.json()["currentLimitSet"] is False
+    app.state.hw.supply_current_limit = 1.5            # the supply was set too high
+    st = _wait_for(client, "/api/process/stage", "state", ["fault"], timeout=6)
+    assert "above the 1 A setting" in st["faultReason"]
+    live = client.get("/api/live").json()
+    assert live["sensors"]["electrodePowerOn"] is False and live["alarm"].startswith("Electrodes stopped: current")
+    client.post("/api/process/stage/reset")
+
+
+def test_heater_needs_the_stirrer(client):
+    client.post("/api/demo/add", json={"place": "purificationTank", "grams": 391})
+    time.sleep(1.2)
+    r = client.post("/api/control/heater", json={"on": True})
+    assert r.status_code == 409 and "stirrer" in r.json()["detail"]
+    client.post("/api/control/motor", json={"name": "purification_stirrer", "duty": 0.33})
+    assert client.post("/api/control/heater", json={"on": True}).json()["heaterOn"] is True
+    client.post("/api/control/all-off")

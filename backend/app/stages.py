@@ -4,7 +4,10 @@ Matches the website's stage controls (NewBatch.tsx): state is "ready", "running"
 "complete" or "fault", with Start, Pause, Resume, Record completion and Emergency stop.
 
 - Reactions: electrode power relay ON and the stirrer running. They stop by themselves when the
-  reaction time is over, and fault if the temperature passes reactionMaximumTemperature.
+  reaction time is over, and fault if the temperature passes reactionMaximumTemperature, or if
+  the measured current stays above the current setting (default 1 A) for 2 seconds.
+  When the Pi can set the power supply's current limit (config.POWER_SUPPLY_CURRENT_CONTROL), it
+  sets it to the current setting at the start; otherwise the operator sets it on the supply.
 - Separation: the centrifuge runs for separationTime at separationSpeed.
 - Pause switches everything off and stops the timer; Resume switches it back on.
 Stirrer and centrifuge speeds are set open-loop (PWM = RPM ÷ max RPM in Settings) until you
@@ -17,6 +20,7 @@ from .hardware import Hardware
 from .models import Settings
 
 REACTIONS = ("Esterification", "Transesterification")
+OVERCURRENT_SECONDS = 2   # readings in a row above the setting before the electrodes stop
 
 
 class StageError(Exception):
@@ -31,12 +35,13 @@ class StageRunner:
         self._settings: Optional[Settings] = None
         self._on_event: Optional[Callable[[str, dict], None]] = None
         self._temperatures: list[float] = []
+        self._over_current = 0
         self.state = self._ready_state()
 
     @staticmethod
     def _ready_state() -> dict:
         return {"stage": None, "state": "ready", "batchId": None, "voltage": None, "timeMinutes": None,
-                "stirringRpm": None, "speedRpm": None, "elapsedSeconds": 0, "remainingSeconds": 0,
+                "stirringRpm": None, "speedRpm": None, "current": None, "currentLimitSet": False, "elapsedSeconds": 0, "remainingSeconds": 0,
                 "liveVoltage": None, "liveCurrent": None, "liveTemperature": None, "liveRpm": None,
                 "averageTemperature": None, "energyKwh": 0.0, "faultReason": None}
 
@@ -48,7 +53,8 @@ class StageRunner:
     def start(self, stage: str, s: Settings, batch_id: Optional[str] = None,
               voltage: Optional[float] = None, time_min: Optional[float] = None,
               stirring: Optional[float] = None,
-              on_event: Optional[Callable[[str, dict], None]] = None) -> None:
+              on_event: Optional[Callable[[str, dict], None]] = None,
+              current: Optional[float] = None) -> None:
         if self.active:
             raise StageError(f"{self.state['stage']} is still {self.state['state']}.")
         if self.state["state"] == "fault":
@@ -58,20 +64,25 @@ class StageRunner:
             voltage = limits.voltage.default if voltage is None else voltage
             time_min = limits.time.default if time_min is None else time_min
             stirring = limits.stirring.default if stirring is None else stirring
+            current = limits.current.default if current is None else current
             for name, value, limit in (("Voltage", voltage, limits.voltage), ("Reaction time", time_min, limits.time),
-                                       ("Stirring speed", stirring, limits.stirring)):
+                                       ("Stirring speed", stirring, limits.stirring), ("Current", current, limits.current)):
                 if not limit.min <= value <= limit.max:
                     raise StageError(f"{name} must be between {limit.min:g} and {limit.max:g}.")
             if hasattr(self.hw, "supply_voltage"):
                 self.hw.supply_voltage = voltage      # demo: the simulated supply follows the setting
+                self.hw.supply_current_limit = current  # demo: as if the operator set it on the supply
+            self.hw.set_current_limit(current)       # only when the Pi controls the supply
         else:
-            voltage, stirring, time_min = None, None, s.separation_time
+            voltage, stirring, time_min, current = None, None, s.separation_time, None
         self._settings, self._on_event = s, on_event
         self._temperatures = []
         self.state = {**self._ready_state(), "stage": stage, "state": "running", "batchId": batch_id,
                       "voltage": voltage, "timeMinutes": time_min, "stirringRpm": stirring,
                       "speedRpm": s.separation_speed if stage == "Separation" else None,
+                      "current": current, "currentLimitSet": current is not None and self.hw.current_limit_control,
                       "remainingSeconds": round(time_min * 60)}
+        self._over_current = 0
         self._outputs(True)
         self._event("started")
         self._task = asyncio.create_task(self._run())
@@ -156,6 +167,11 @@ class StageRunner:
                         break
                     if t > s.reaction_maximum_temperature:
                         self._finish("fault", f"temperature exceeded {s.reaction_maximum_temperature:g} °C")
+                        break
+                    i = st["liveCurrent"]
+                    self._over_current = self._over_current + 1 if i is not None and i > st["current"] else 0
+                    if self._over_current >= OVERCURRENT_SECONDS:
+                        self._finish("fault", f"current {i:.2f} A went above the {st['current']:g} A setting")
                         break
                     self._temperatures.append(t)
                     st["averageTemperature"] = round(sum(self._temperatures) / len(self._temperatures), 1)

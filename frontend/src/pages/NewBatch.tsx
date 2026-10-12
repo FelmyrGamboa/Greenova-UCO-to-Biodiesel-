@@ -13,7 +13,6 @@ import {
 import { useLiveData } from "../contexts/LiveContext";
 import {
   demoAdd,
-  drainAction,
   getNextBatchId,
   getRecommendedParametersForFfa,
   getSystemStatus,
@@ -23,7 +22,6 @@ import {
   purificationAction,
   saveCompletedBatch,
   stageAction,
-  startDrain,
   startPump,
   startPurification,
   startStage,
@@ -32,16 +30,17 @@ import {
   type DrainValve,
   type PumpName,
   type PumpPhase,
+  type PurificationPhase,
   type StageName,
   type StageStatus,
   type SystemStatus,
 } from "../lib/api";
 import { formatFfa } from "../lib/greenovaData";
+import { useT, type TFunction } from "../lib/i18n";
 
 type DeviceState = "ready" | "checking" | "fault";
 type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-type PurificationPhase = "ready" | "heating" | "hold" | "flow" | "drain" | "complete" | "fault";
-const PURIFYING: PurificationPhase[] = ["heating", "hold", "flow", "drain"];
+const PURIFYING: PurificationPhase[] = ["heating", "methanol", "magnesol", "contact", "settling", "cooling", "drain"];
 type ChemistrySettings = {
   oilMolarMass: number;
   kohPurity: number;
@@ -61,6 +60,8 @@ type EsterStageRecord = {
   sulfuricAcidMl: number;
   acetoneMl: number;
 };
+
+const CURRENT_LIMITS = { min: 0.5, max: 2, default: 1 };
 
 export const PROCESS_CONFIG = {
   oil: {
@@ -86,19 +87,33 @@ export const PROCESS_CONFIG = {
     provisional: true,
   },
   esterification: {
-    voltage: { min: 18, max: 30, default: 20 },
-    time: { min: 30, max: 120, default: 120 },
+    voltage: { min: 10, max: 30, default: 20 },
+    time: { min: 30, max: 180, default: 120 },
     stirring: { min: 400, max: 700, default: 500 },
+    current: CURRENT_LIMITS,
     sulfuricAcidDosage: null,
   },
   transesterification: {
-    voltage: { min: 18, max: 30, default: 30 },
+    voltage: { min: 10, max: 30, default: 30 },
     time: { min: 30, max: 180, default: 120 },
     stirring: { min: 400, max: 700, default: 500 },
+    current: CURRENT_LIMITS,
   },
   separation: {
     timeMinutes: 10,
     speedRpm: 2600,
+  },
+  // Purification (dry wash with Magnesol): fixed values, same as the backend's purification.py
+  purification: {
+    holdTemperature: 90,
+    holdBand: 2,
+    maximumTemperature: 95,
+    heatingTimeoutMinutes: 15,
+    stirringSpeedRpm: 200,
+    drainStableGrams: 2,
+    drainStableSeconds: 30,
+    drainMaximumMinutes: 20,
+    lowOutputFraction: 0.7,
   },
 } as const;
 
@@ -110,6 +125,7 @@ const SAFETY_GROUPS = [
       ["Sulfuric acid (H₂SO₄)", "Corrosive. Use appropriate chemical-resistant PPE and the approved dilution and handling procedure."],
       ["NaOH or KOH", "Corrosive alkaline catalysts. Handle according to the laboratory procedure."],
       ["Acetone", "Highly flammable. Keep away from ignition sources and use suitable ventilation."],
+      ["Magnesol", "Magnesol is a fine powder: wear a dust mask and avoid breathing the dust."],
       ["Chemical mixing", "Follow the validated order of addition. Do not mix incompatible chemicals or add chemicals without the approved procedure."],
       ["Containers", "Use compatible, closed, clearly labeled containers."],
     ],
@@ -120,6 +136,7 @@ const SAFETY_GROUPS = [
       ["Isolation", "Turn off and isolate the power supply before touching electrodes or reactor connections."],
       ["Electronics", "Keep electronics protected from spills, liquid, and chemical vapors."],
       ["Monitoring", "Monitor voltage, current, and temperature during the reaction."],
+      ["Hot purification tank", "The purification tank gets hot (90 °C): don't touch it, keep the area ventilated, no flames nearby."],
       ["Attendance", "Never leave an operating batch unattended."],
       ["Interlocks", "Stop the process if an interlock or configured safety limit is triggered."],
     ],
@@ -136,180 +153,77 @@ const SAFETY_GROUPS = [
 ];
 
 function decimalError(
+  t: TFunction,
   value: string,
   limits: { min: number; max: number },
   messages?: { empty?: string; min?: string; max?: string },
 ) {
   if (!value.trim() || !/^(?:\d+\.?\d*|\.\d+)$/.test(value)) {
-    return messages?.empty ?? "Enter a valid numeric value.";
+    return messages?.empty ?? t("Enter a valid numeric value.");
   }
   const number = Number(value);
-  if (number < limits.min) return messages?.min ?? `Minimum value is ${limits.min}.`;
-  if (number > limits.max) return messages?.max ?? `Maximum value is ${limits.max}.`;
+  if (number < limits.min) return messages?.min ?? t("Minimum value is {value}.", { value: limits.min });
+  if (number > limits.max) return messages?.max ?? t("Maximum value is {value}.", { value: limits.max });
   return "";
 }
 
-function errorText(error: unknown) {
-  if (isOffline(error)) return "Backend offline. Check that the Greenova backend is running.";
-  return error instanceof Error ? error.message : String(error);
+function errorText(t: TFunction, error: unknown) {
+  if (isOffline(error)) return t("Backend offline. Check that the Greenova backend is running.");
+  return t(error instanceof Error ? error.message : String(error));
+}
+
+function readSettings(): Record<string, unknown> {
+  try {
+    return JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function settingNumber(settings: Record<string, unknown>, key: string, fallback: number, minimum = 0) {
+  const value = settings[key];
+  const parsed = Number(value);
+  return value !== undefined && value !== null && value !== "" && Number.isFinite(parsed) && parsed >= minimum ? parsed : fallback;
 }
 
 function getChemistrySettings(): ChemistrySettings {
-  const defaults = { oilMolarMass: 880, kohPurity: 90, naohPurity: 98, designFfa: 10, stripMaxFfa: 5, ffaTarget: 1 };
-  try {
-    const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
-    const positiveNumber = (value: unknown, fallback: number) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-    };
-    return {
-      oilMolarMass: positiveNumber(settings.oilMolarMass, defaults.oilMolarMass),
-      kohPurity: positiveNumber(settings.kohPurity, defaults.kohPurity),
-      naohPurity: positiveNumber(settings.naohPurity, defaults.naohPurity),
-      designFfa: positiveNumber(settings.esterificationDesignFfa, defaults.designFfa),
-      stripMaxFfa: positiveNumber(settings.stripMaxFfa, defaults.stripMaxFfa),
-      ffaTarget: positiveNumber(settings.ffaTarget, defaults.ffaTarget),
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-/** Pumps and outlet valves (Settings → Esterification and Dosing). */
-function getTransferSettings() {
-  const defaults = { reactorDrainMinutes: 3, centrifugeDrainMinutes: 3, stirringSpeed: 300 };
-  try {
-    const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
-    const nonNegative = (value: unknown, fallback: number) => {
-      const parsed = Number(value);
-      return value !== undefined && value !== null && value !== "" && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-    };
-    return {
-      reactorDrainMinutes: nonNegative(settings.reactorDrainTime, defaults.reactorDrainMinutes),
-      centrifugeDrainMinutes: nonNegative(settings.centrifugeDrainTime, defaults.centrifugeDrainMinutes),
-      stirringSpeed: nonNegative(settings.purificationStirringSpeed, defaults.stirringSpeed),
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-function getPurificationSettings() {
-  const defaults = {
-    targetTemperature: 70,
-    maximumTemperature: 75,
-    thermalFuseRating: null as number | null,
-    holdTimeMinutes: 25,
-    flowRateMlPerMinute: 40,
-    drainTimeMinutes: 3,
-    heatingTimeoutMinutes: 10,
+  const settings = readSettings();
+  const positive = (key: string, fallback: number) => settingNumber(settings, key, fallback, Number.MIN_VALUE);
+  return {
+    oilMolarMass: positive("oilMolarMass", 880),
+    kohPurity: positive("kohPurity", 90),
+    naohPurity: positive("naohPurity", 98),
+    designFfa: positive("esterificationDesignFfa", 10),
+    stripMaxFfa: positive("stripMaxFfa", 5),
+    ffaTarget: positive("ffaTarget", 1),
   };
-  try {
-    const settings = JSON.parse(localStorage.getItem("greenova_settings") || "{}") as Record<string, unknown>;
-    const positiveNumber = (value: unknown, fallback: number) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-    };
-    const fuse = Number(settings.thermalFuseRating);
-    return {
-      targetTemperature: Math.min(70, Math.max(40, positiveNumber(settings.purificationTargetTemperature, defaults.targetTemperature))),
-      maximumTemperature: positiveNumber(settings.purificationMaximumTemperature, defaults.maximumTemperature),
-      thermalFuseRating: Number.isFinite(fuse) && fuse > 0 ? fuse : defaults.thermalFuseRating,
-      holdTimeMinutes: positiveNumber(settings.purificationHoldTime, defaults.holdTimeMinutes),
-      flowRateMlPerMinute: positiveNumber(settings.meshBedFlowRate, defaults.flowRateMlPerMinute),
-      drainTimeMinutes: positiveNumber(settings.drainTime, defaults.drainTimeMinutes),
-      heatingTimeoutMinutes: positiveNumber(settings.heatingTimeout, defaults.heatingTimeoutMinutes),
-    };
-  } catch {
-    return defaults;
-  }
+}
+
+/** Outlet valves (Settings → Esterification and Dosing). */
+function getTransferSettings() {
+  const settings = readSettings();
+  return {
+    reactorDrainMinutes: settingNumber(settings, "reactorDrainTime", 1),
+    centrifugeDrainMinutes: settingNumber(settings, "centrifugeDrainTime", 3),
+  };
+}
+
+/** Purification: the four editable values (Settings → Purification). */
+function getPurificationSettings() {
+  const settings = readSettings();
+  return {
+    methanolRemovalMinutes: settingNumber(settings, "methanolRemovalTime", 10, 1),
+    contactMinutes: settingNumber(settings, "contactTime", 15, 1),
+    settlingMinutes: settingNumber(settings, "settlingTime", 10),
+    maxDrainTemperature: settingNumber(settings, "maxDrainTemperature", 50, 1),
+  };
 }
 
 type PurificationSettings = ReturnType<typeof getPurificationSettings>;
 
-/** Mesh bed flow time: the biodiesel volume (about the oil volume) ÷ the flow rate, at least 2 min.
- * Same rule as the backend. */
-function plannedFlowSecondsFor(volumeMl: number | null, settings: PurificationSettings) {
-  const volume = volumeMl && volumeMl > 0 ? volumeMl : PROCESS_CONFIG.oil.maximumVolumeMl;
-  return Math.round(Math.max(volume / settings.flowRateMlPerMinute, 2) * 60);
-}
-
 function formatMinutes(seconds: number) {
   const minutes = seconds / 60;
   return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} min`;
-}
-
-/** Local demonstration of the automatic purification (no backend): same phases and rules. */
-type LocalPurification = {
-  phase: PurificationPhase;
-  temperature: number;
-  highest: number;
-  heaterOn: boolean;
-  heatingSeconds: number;
-  holdRemaining: number;
-  plannedFlow: number;
-  flowElapsed: number;
-  drainElapsed: number;
-  stableSeconds: number;
-  outputG: number;
-  tankG: number;
-  rateGPerMinute: number;
-  expectedG: number;
-  warning: string | null;
-  stopReason: string | null;
-};
-
-function stepLocalPurification(sim: LocalPurification, settings: PurificationSettings, target: number) {
-  const fault = (reason: string) => {
-    sim.phase = "fault";
-    sim.heaterOn = false;
-    sim.stopReason = reason;
-  };
-  const passMeshBed = () => {
-    const moved = Math.min(sim.tankG, 0.59); // about 40 mL/min of biodiesel
-    sim.tankG -= moved;
-    sim.outputG = Number((sim.outputG + moved).toFixed(1));
-    sim.rateGPerMinute = Number((moved * 60).toFixed(1));
-    sim.stableSeconds = moved < 0.5 ? sim.stableSeconds + 1 : 0;
-  };
-  sim.temperature = Number((sim.temperature + (sim.heaterOn ? 0.75 : -0.1)).toFixed(1));
-  sim.highest = Math.max(sim.highest, sim.temperature);
-  if (sim.temperature > settings.maximumTemperature) return fault(`temperature exceeded ${settings.maximumTemperature} °C`);
-  if (sim.phase === "heating") {
-    sim.heatingSeconds += 1;
-    if (sim.temperature >= target) {
-      sim.phase = "hold";
-    } else if (sim.heatingSeconds >= settings.heatingTimeoutMinutes * 60) {
-      fault(`target not reached within ${settings.heatingTimeoutMinutes} min`);
-    }
-  } else if (sim.phase === "hold") {
-    if (sim.temperature <= target - 1) sim.heaterOn = true;
-    if (sim.temperature >= target + 1) sim.heaterOn = false;
-    sim.holdRemaining = Math.max(sim.holdRemaining - 1, 0);
-    if (sim.holdRemaining === 0) {
-      sim.heaterOn = false;
-      sim.phase = "flow";
-    }
-  } else if (sim.phase === "flow") {
-    passMeshBed();
-    sim.flowElapsed += 1;
-    if (sim.flowElapsed >= sim.plannedFlow) {
-      sim.phase = "drain";
-      sim.stableSeconds = 0;
-    }
-  } else if (sim.phase === "drain") {
-    passMeshBed();
-    sim.drainElapsed += 1;
-    if (sim.stableSeconds >= 60 || sim.drainElapsed >= settings.drainTimeMinutes * 60) finishLocalPurification(sim);
-  }
-}
-
-function finishLocalPurification(sim: LocalPurification) {
-  sim.phase = "complete";
-  sim.rateGPerMinute = 0;
-  if (sim.expectedG > 0 && sim.outputG < 0.5 * sim.expectedG) {
-    sim.warning = `Only ${sim.outputG.toFixed(0)} g came out of about ${sim.expectedG.toFixed(0)} g expected. Check the mesh bed for clogging.`;
-  }
 }
 
 function formatTimer(totalSeconds: number) {
@@ -320,6 +234,11 @@ function formatTimer(totalSeconds: number) {
 
 const METHANOL_DENSITY = 0.792;
 const ACETONE_DENSITY = 0.784;
+
+/** Magnesol for the dry wash: oil mL × 0.92 × 1% = oil mL × 0.0092 g, rounded to 0.1 g. */
+function magnesolGrams(oilVolumeMl: number | null) {
+  return oilVolumeMl ? Math.round(oilVolumeMl * 0.0092 * 10 + 1e-9) / 10 : 0;
+}
 
 /** One esterification stage (same rules as the backend's calculations.py). Stage 1 is the uniform
  * dose for the design FFA (default 10%), because the strip can't read above 5%. Later stages are
@@ -413,7 +332,89 @@ function calculateQuantityCards(
     catalystToWeighG: trans.catalystToWeighG,
     purity: trans.purity,
     transesterificationPremixG: trans.premixG,
+    magnesolG: magnesolGrams(oilVolumeMl),
   };
+}
+
+/** Local demonstration of the purification (no backend): same steps and rules as the Pi. */
+type LocalPurification = {
+  phase: PurificationPhase;
+  temperature: number;
+  highest: number;
+  heaterOn: boolean;
+  stirrerOn: boolean;
+  heatingSeconds: number;
+  methanolRemaining: number;
+  magnesolAdded: boolean;
+  contactRemaining: number;
+  settlingRemaining: number;
+  coolingSeconds: number;
+  drainElapsed: number;
+  stableSeconds: number;
+  anchorG: number | null;
+  outputG: number;
+  tankG: number;
+  oilG: number;
+  warning: string | null;
+  stopReason: string | null;
+};
+
+function stepLocalPurification(sim: LocalPurification, settings: PurificationSettings) {
+  const p = PROCESS_CONFIG.purification;
+  const fault = (reason: string) => {
+    sim.phase = "fault";
+    sim.heaterOn = false;
+    sim.stirrerOn = false;
+    sim.stopReason = reason;
+  };
+  // the heater warms about 0.75 °C/s; without it the tank cools toward 27 °C
+  sim.temperature = Number((sim.heaterOn ? sim.temperature + 0.75 : sim.temperature - (sim.temperature - 27) * 0.002).toFixed(2));
+  sim.highest = Math.max(sim.highest, sim.temperature);
+  if (sim.temperature > p.maximumTemperature) return fault(`temperature exceeded ${p.maximumTemperature} °C`);
+  if (sim.phase === "heating") {
+    sim.heatingSeconds += 1;
+    if (sim.temperature >= p.holdTemperature) sim.phase = "methanol";
+    else if (sim.heatingSeconds >= p.heatingTimeoutMinutes * 60) fault(`${p.holdTemperature} °C not reached within ${p.heatingTimeoutMinutes} min`);
+  } else if (sim.phase === "methanol") {
+    if (sim.temperature <= p.holdTemperature - p.holdBand) sim.heaterOn = true;
+    if (sim.temperature >= p.holdTemperature + p.holdBand) sim.heaterOn = false;
+    sim.methanolRemaining = Math.max(sim.methanolRemaining - 1, 0);
+    if (sim.methanolRemaining === 0) {
+      sim.heaterOn = false;
+      sim.phase = "magnesol";
+    }
+  } else if (sim.phase === "magnesol") {
+    if (sim.magnesolAdded) sim.phase = "contact";
+  } else if (sim.phase === "contact") {
+    sim.contactRemaining = Math.max(sim.contactRemaining - 1, 0);
+    if (sim.contactRemaining === 0) {
+      sim.stirrerOn = false;
+      sim.phase = "settling";
+    }
+  } else if (sim.phase === "settling") {
+    sim.settlingRemaining = Math.max(sim.settlingRemaining - 1, 0);
+    if (sim.settlingRemaining === 0) sim.phase = sim.temperature > settings.maxDrainTemperature ? "cooling" : "drain";
+  } else if (sim.phase === "cooling") {
+    sim.coolingSeconds += 1;
+    if (sim.temperature <= settings.maxDrainTemperature) sim.phase = "drain";
+  } else if (sim.phase === "drain") {
+    const moved = Math.min(sim.tankG, 3); // about 3 g/s through the outlet and filter
+    sim.tankG -= moved;
+    sim.outputG = Number((sim.outputG + moved).toFixed(1));
+    sim.drainElapsed += 1;
+    if (sim.anchorG !== null && Math.abs(sim.outputG - sim.anchorG) <= p.drainStableGrams) sim.stableSeconds += 1;
+    else {
+      sim.anchorG = sim.outputG;
+      sim.stableSeconds = 0;
+    }
+    const started = sim.outputG > p.drainStableGrams;
+    if ((started && sim.stableSeconds >= p.drainStableSeconds) || sim.drainElapsed >= p.drainMaximumMinutes * 60) {
+      sim.phase = "complete";
+      if (sim.oilG > 0 && sim.outputG < p.lowOutputFraction * sim.oilG) {
+        sim.warning = `Low output – check the filter. ${sim.outputG.toFixed(0)} g collected from ${sim.oilG.toFixed(0)} g of oil.`;
+      }
+    }
+  }
 }
 
 function SectionHeader({
@@ -457,24 +458,27 @@ function ReadOnlyTile({
   secondary?: string;
   state?: DeviceState;
 }) {
+  const t = useT();
+  const stateLabel = state === "ready" ? t("ready") : state === "checking" ? t("checking") : t("fault");
   return (
     <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="gv-label !mb-0">{label}</div>
+        <div className="gv-label !mb-0">{t(label)}</div>
         <div className="flex items-center gap-2">
           <StateDot state={state} />
           <span className="text-[9px] font-bold uppercase tracking-wider text-gray-500">
-            {state}
+            {stateLabel}
           </span>
         </div>
       </div>
-      <div className="mt-3 font-display text-base font-semibold text-white">{value}</div>
-      {secondary && <div className="mt-1 text-xs leading-5 text-gray-500">{secondary}</div>}
+      <div className="mt-3 font-display text-base font-semibold text-white">{t(value)}</div>
+      {secondary && <div className="mt-1 text-xs leading-5 text-gray-500">{t(secondary)}</div>}
     </div>
   );
 }
 
 function Stepper({ steps, step }: { steps: string[]; step: number }) {
+  const t = useT();
   return (
     <Card className="overflow-x-auto p-4 sm:p-5">
       <div className="flex min-w-[900px] items-start">
@@ -506,7 +510,7 @@ function Stepper({ steps, step }: { steps: string[]; step: number }) {
                   active ? "text-white" : complete ? "text-green-400" : "text-gray-600"
                 }`}
               >
-                {label}
+                {t(label)}
               </div>
             </div>
           );
@@ -529,11 +533,12 @@ function ParameterField({
   unit: string;
   limits: { min: number; max: number };
 }) {
-  const error = decimalError(value, limits);
+  const t = useT();
+  const error = decimalError(t, value, limits);
   return (
     <div>
       <Field
-        label={label}
+        label={t(label)}
         inputMode="decimal"
         value={value}
         onChange={(event) => setValue(event.target.value)}
@@ -541,7 +546,7 @@ function ParameterField({
         aria-invalid={Boolean(error)}
       />
       <p className={`mt-2 text-xs ${error ? "text-red-400" : "text-gray-600"}`}>
-        {error || `Allowed range: ${limits.min}–${limits.max} ${unit}`}
+        {error || t("Allowed range: {min}–{max} {unit}", { min: limits.min, max: limits.max, unit })}
       </p>
     </div>
   );
@@ -557,6 +562,7 @@ function StageControls({
   error,
   startBlocked,
   hideContinue = false,
+  hideStart = false,
 }: {
   state: StageState;
   setState: (state: StageState) => void;
@@ -565,12 +571,14 @@ function StageControls({
   continueLabel: string;
   onReset?: () => void;
   error?: string | null;
-  /** Why the stage can't start yet (e.g. the dose isn't loaded), or nothing. */
+  /** Why the stage can't start yet, or nothing. */
   startBlocked?: string | null;
   hideContinue?: boolean;
+  /** The stage starts by itself (once the dose is in): no Start button. */
+  hideStart?: boolean;
 }) {
-  if (state === "complete" && hideContinue) {
-    // the next step is in the panel below (the FFA re-check)
+  const t = useT();
+  if ((state === "complete" && hideContinue) || (state === "ready" && hideStart)) {
     return error ? <p className="mt-3 text-xs text-red-400">{error}</p> : null;
   }
   return (
@@ -580,140 +588,116 @@ function StageControls({
       {state === "ready" && startBlocked && <span className="text-xs text-amber-400">{startBlocked}</span>}
       {state === "running" && (
         <>
-          <Button variant="secondary" onClick={() => setState("paused")}>Pause</Button>
-          <Button variant="secondary" onClick={() => setState("complete")}>Record completion</Button>
+          <Button variant="secondary" onClick={() => setState("paused")}>{t("Pause")}</Button>
+          <Button variant="secondary" onClick={() => setState("complete")}>{t("Record completion")}</Button>
         </>
       )}
       {state === "paused" && (
         <>
-          <Button onClick={() => setState("running")}>Resume</Button>
-          <Button variant="secondary" onClick={() => setState("complete")}>Record completion</Button>
+          <Button onClick={() => setState("running")}>{t("Resume")}</Button>
+          <Button variant="secondary" onClick={() => setState("complete")}>{t("Record completion")}</Button>
         </>
       )}
-      {state === "complete" && !hideContinue && <Button onClick={onContinue}>{continueLabel} →</Button>}
+      {state === "complete" && <Button onClick={onContinue}>{continueLabel} →</Button>}
       {(state === "running" || state === "paused") && (
-        <Button variant="danger" onClick={() => setState("fault")}>Emergency stop</Button>
+        <Button variant="danger" onClick={() => setState("fault")}>{t("Emergency stop")}</Button>
       )}
-      {state === "fault" && <Status tone="red">Fault — controller reset required</Status>}
-      {state === "fault" && onReset && <Button variant="secondary" onClick={onReset}>Reset controller</Button>}
+      {state === "fault" && <Status tone="red">{t("Fault — controller reset required")}</Status>}
+      {state === "fault" && onReset && <Button variant="secondary" onClick={onReset}>{t("Reset controller")}</Button>}
     </div>
     {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
     </>
   );
 }
 
-const PUMP_INFO: Record<PumpName, { label: string; short: string; tank: string }> = {
-  catalyst: { label: "Pump A · NaOH/KOH + methanol", short: "pump A", tank: "A" },
-  acid: { label: "Pump B · H₂SO₄ + methanol", short: "pump B", tank: "B" },
+const PUMP_INFO: Record<PumpName, { label: string; tank: string }> = {
+  catalyst: { label: "Pump A · NaOH/KOH + methanol", tank: "A" },
+  acid: { label: "Pump B · H₂SO₄ + methanol", tank: "B" },
 };
 
 type PumpView = { phase: PumpPhase; deliveredG: number; faultReason: string | null; byTime: boolean };
 
-/** Before a reaction stage: acetone poured by hand (weighed by the reactor load cell), then the
- * premixed dose loaded by pump A or B. The pump stops when the reactor has gained the dose weight. */
-function DosingPanel({
+/** Before a reaction stage: the pump loads the dose by itself (by the reactor load cell), the
+ * operator pours the acetone, and the stage starts by itself once both are in. */
+function LoadingPanel({
   pump,
   premixParts,
-  mixingNote,
   targetG,
-  premixMl,
   run,
-  completedG,
-  manual,
-  setManual,
-  onLoad,
-  onStop,
+  deliveredG,
+  onRetry,
   onSkip,
-  locked,
   acetone,
-  reactorG,
-  live,
+  current,
+  currentByHand,
+  status,
 }: {
   pump: PumpName;
   premixParts: string[];
-  mixingNote: string;
   targetG: number;
-  premixMl: number;
   /** The pump run for this dose, when one is running or just ended. */
   run: PumpView | null;
-  completedG: number;
-  manual: boolean;
-  setManual: (value: boolean) => void;
-  onLoad: () => void;
-  onStop: () => void;
+  /** Grams this dose has received so far (all runs). */
+  deliveredG: number;
+  onRetry: () => void;
   onSkip?: () => void;
-  /** Why loading isn't possible now (e.g. the reactor is draining), or nothing. */
-  locked?: string | null;
   acetone?: { ml: number; g: number; addedG: number; onDemoAdd?: () => void } | null;
-  reactorG: number;
-  live: boolean;
+  current: number;
+  /** No current control on the Pi: the operator sets the power supply's current. */
+  currentByHand: boolean;
+  /** loading: the stage starts by itself once loaded; loaded: start it with the button. */
+  status: "loading" | "starting" | "loaded";
 }) {
+  const t = useT();
   const info = PUMP_INFO[pump];
   const pumping = run?.phase === "pumping";
-  const deliveredG = completedG + (pumping ? run.deliveredG : 0);
   const loaded = deliveredG >= targetG - 1;
-  const remainingG = Math.max(targetG - deliveredG, 0);
-  const ended = run && (run.phase === "fault" || run.phase === "stopped") ? run : null;
-  const number = acetone ? 2 : 1;
+  const problem = !loaded && !pumping && run !== null && (run.phase === "fault" || run.phase === "stopped");
   return (
     <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid={`dosing-${pump}`}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="gv-label">Load the reactor</div>
-          <p className="text-sm text-gray-300">Reactor load cell: <span className="font-mono text-white">{reactorG.toFixed(1)} g</span> <span className="text-xs text-gray-600">· {live ? "live" : "demonstration"}</span></p>
-        </div>
-        <Status tone={loaded || manual ? "green" : pumping ? "blue" : ended?.phase === "fault" ? "red" : "yellow"}>
-          {loaded ? "Dose loaded" : manual ? "Added by hand" : pumping ? "Pumping" : ended?.phase === "fault" ? "Pump fault" : "Waiting"}
+        <div className="gv-label">{t("Loading the reactor")}</div>
+        <Status tone={problem ? "red" : status === "loading" ? "blue" : "green"}>
+          {problem ? t("Pump problem") : status === "starting" ? t("Starting…") : status === "loaded" ? t("Dose loaded") : t("Starts by itself when loaded")}
         </Status>
       </div>
-      <div className={`mt-5 grid gap-4 ${acetone ? "lg:grid-cols-2" : ""}`}>
-        {acetone && (
-          <div className="rounded-xl border border-white/[0.07] p-4">
-            <div className="text-sm font-semibold text-white">1. Acetone · poured by hand</div>
-            <p className="mt-1 text-xs leading-5 text-gray-500">Pour {acetone.ml.toFixed(1)} mL ({acetone.g.toFixed(1)} g) of acetone through the inlet filter. The reactor load cell weighs it.</p>
-            <div className="mt-3 flex items-baseline justify-between gap-3 text-sm">
-              <span className="text-gray-400">Poured so far</span>
-              <span className="font-mono text-white">{acetone.addedG.toFixed(1)} / {acetone.g.toFixed(1)} g</span>
-            </div>
-            <div className="mt-2"><Progress value={acetone.g > 0 ? (acetone.addedG / acetone.g) * 100 : 100} /></div>
-            {acetone.onDemoAdd && acetone.addedG < acetone.g * 0.95 && (
-              <Button variant="secondary" className="mt-3" onClick={acetone.onDemoAdd}>Pour acetone (demo)</Button>
-            )}
-          </div>
-        )}
-        <div className="rounded-xl border border-white/[0.07] p-4">
-          <div className="text-sm font-semibold text-white">{number}. {info.label}</div>
-          <p className="mt-1 text-xs leading-5 text-gray-500">
-            Mix in tank {info.tank}: <span className="text-gray-300">{premixParts.join(" + ")}</span>. {mixingNote} Make about 10% extra in the same proportions so the line stays full; the pump stops at the dose weight.
-          </p>
-          <div className="mt-3 flex items-baseline justify-between gap-3 text-sm">
-            <span className="text-gray-400">Delivered</span>
+      <div className="mt-3 space-y-4">
+        <div>
+          <div className="flex items-baseline justify-between gap-3 text-sm">
+            <span className="text-gray-300">{t(info.label)} <span className="text-xs text-gray-500">({premixParts.join(" + ")})</span></span>
             <span className="font-mono text-white">{deliveredG.toFixed(1)} / {targetG.toFixed(1)} g</span>
           </div>
           <div className="mt-2"><Progress value={targetG > 0 ? (deliveredG / targetG) * 100 : 0} /></div>
-          <p className="mt-2 text-xs text-gray-600">Dose {targetG.toFixed(1)} g · about {premixMl.toFixed(1)} mL{pumping && run.byTime ? " · no load cell reading: dosing by time" : ""}</p>
-          {ended && !loaded && (
-            <p className={`mt-2 text-xs ${ended.phase === "fault" ? "text-red-400" : "text-amber-400"}`}>
-              Pump stopped at {deliveredG.toFixed(1)} g: {ended.faultReason}
-            </p>
+          {problem && (
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <span className="text-sm font-semibold text-red-400">{t("Pump problem – check the line")}</span>
+              <Button variant="secondary" onClick={onRetry}>{t("Retry")}</Button>
+            </div>
           )}
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {!pumping && !loaded && !manual && (
-              <Button disabled={Boolean(locked)} onClick={onLoad}>
-                {completedG > 0 ? `Load the remaining ${remainingG.toFixed(1)} g` : `Load with ${info.short}`}
-              </Button>
-            )}
-            {pumping && <Button variant="danger" onClick={onStop}>Stop pump</Button>}
-            {pumping && onSkip && <Button variant="secondary" onClick={onSkip}>Skip (demo)</Button>}
-            {locked && !pumping && !loaded && <span className="text-xs text-amber-400">{locked}</span>}
-          </div>
-          {!loaded && !pumping && (
-            <label className="mt-3 flex items-center gap-2 text-xs text-gray-400">
-              <input className="gv-checkbox" type="checkbox" checked={manual} onChange={(event) => setManual(event.target.checked)} />
-              I added this dose by hand instead (pump not used)
-            </label>
-          )}
+          {pumping && onSkip && <Button variant="secondary" className="mt-3" onClick={onSkip}>{t("Skip (demo)")}</Button>}
         </div>
+        {acetone && (
+          // The pump doses by the reactor's weight gain, so nothing may be poured in while it runs.
+          loaded ? (
+            <div>
+              <div className="flex items-baseline justify-between gap-3 text-sm">
+                <span className="text-gray-300">{t("Pour {ml} mL acetone through the inlet", { ml: acetone.ml.toFixed(1) })}</span>
+                <span className="font-mono text-white">{acetone.addedG.toFixed(1)} / {acetone.g.toFixed(1)} g</span>
+              </div>
+              <div className="mt-2"><Progress value={acetone.g > 0 ? (acetone.addedG / acetone.g) * 100 : 100} /></div>
+              {acetone.onDemoAdd && acetone.addedG < acetone.g * 0.95 && (
+                <Button variant="secondary" className="mt-3" onClick={acetone.onDemoAdd}>{t("Pour acetone (demo)")}</Button>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">{t("Then pour {ml} mL acetone through the inlet. Wait until the pump has finished: it doses by the reactor's weight.", { ml: acetone.ml.toFixed(1) })}</p>
+          )
+        )}
+        {currentByHand && (
+          <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] px-3 py-2 text-sm font-semibold text-amber-400">
+            {t("Set the power supply current to {amps} A", { amps: current })}
+          </p>
+        )}
       </div>
     </div>
   );
@@ -722,61 +706,24 @@ function DosingPanel({
 type DrainView = { phase: DrainPhase; remainingSeconds: number; totalSeconds: number; waitingFor: string | null; faultReason: string | null };
 
 const DRAIN_INFO: Record<DrainValve, { label: string; to: string }> = {
-  reactor_outlet: { label: "Reactor outlet valve", to: "to the centrifuge" },
-  centrifuge_outlet: { label: "Centrifuge outlet valve", to: "to the purification tank" },
+  reactor_outlet: { label: "Reactor outlet valve", to: "draining to the centrifuge" },
+  centrifuge_outlet: { label: "Centrifuge outlet valve", to: "draining to the purification tank" },
 };
 
-/** An outlet valve that opens by itself after a stage, stays open for its drain time, then closes. */
-function DrainPanel({
-  valve,
-  view,
-  minutes,
-  onAgain,
-  onStop,
-  onSkip,
-}: {
-  valve: DrainValve;
-  view: DrainView | null;
-  minutes: number;
-  onAgain?: () => void;
-  onStop?: () => void;
-  onSkip?: () => void;
-}) {
+/** An outlet valve that opens by itself: only an Open / Closed indicator. */
+function ValveIndicator({ valve, view }: { valve: DrainValve; view: DrainView | null }) {
+  const t = useT();
   const info = DRAIN_INFO[valve];
   const phase = view?.phase ?? "idle";
-  const active = phase === "waiting" || phase === "draining";
-  const tone = phase === "done" ? "green" : phase === "fault" ? "red" : active ? "blue" : "neutral";
-  const text =
-    minutes <= 0 && phase === "idle"
-      ? `Opens by hand: the outlet time in Settings is 0. Move the liquid ${info.to} yourself.`
-      : phase === "waiting"
-        ? `Waiting for ${view?.waitingFor ?? "the centrifuge to stop"} before opening.`
-        : phase === "draining"
-          ? `Open: draining ${info.to} · ${formatTimer(view?.remainingSeconds ?? 0)} left.`
-          : phase === "done"
-            ? `Closed after ${formatMinutes(view?.totalSeconds ?? minutes * 60)}: the liquid went ${info.to}.`
-            : phase === "stopped" || phase === "fault"
-              ? `Closed early: ${view?.faultReason ?? "stopped"}.`
-              : `Opens by itself for ${minutes} min.`;
+  const open = phase === "draining";
   return (
-    <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid={`drain-${valve}`}>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <div className="gv-label">{info.label}</div>
-          <p className="text-sm text-gray-300">{text}</p>
-        </div>
-        <Status tone={tone}>{phase === "waiting" ? "WAITING" : phase === "draining" ? "OPEN" : phase === "done" ? "CLOSED" : phase === "idle" ? "CLOSED" : "STOPPED"}</Status>
+    <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.07] bg-gv-inset px-5 py-4" data-testid={`valve-${valve}`}>
+      <div className="text-sm text-gray-300">
+        <span className="font-semibold text-white">{t(info.label)}</span>
+        {open && <span> · {t(info.to)} · {formatTimer(view?.remainingSeconds ?? 0)}</span>}
+        {phase === "waiting" && <span> · {t("waiting for the centrifuge to stop")}</span>}
       </div>
-      {phase === "draining" && view && view.totalSeconds > 0 && (
-        <div className="mt-4"><Progress value={((view.totalSeconds - view.remainingSeconds) / view.totalSeconds) * 100} /></div>
-      )}
-      {(active || ((phase === "done" || phase === "stopped" || phase === "fault") && onAgain)) && (
-        <div className="mt-4 flex flex-wrap gap-2">
-          {active && onStop && <Button variant="secondary" onClick={onStop}>Close now</Button>}
-          {active && onSkip && <Button variant="secondary" onClick={onSkip}>Skip (demo)</Button>}
-          {!active && onAgain && <Button variant="secondary" onClick={onAgain}>Open again ({minutes} min)</Button>}
-        </div>
-      )}
+      <Status tone={open ? "green" : "neutral"}>{open ? t("OPEN") : t("CLOSED")}</Status>
     </div>
   );
 }
@@ -805,42 +752,59 @@ function RecheckPanel({
   onAnotherStage: () => void;
   onContinue: () => void;
 }) {
-  const error = aboveStrip ? "" : decimalError(value, { min: 0, max: settings.stripMaxFfa }, {
-    empty: "Enter the re-check FFA.",
-    max: `The strip reads up to ${settings.stripMaxFfa}%. Tick the darkest color instead.`,
+  const t = useT();
+  const error = aboveStrip ? "" : decimalError(t, value, { min: 0, max: settings.stripMaxFfa }, {
+    empty: t("Enter the re-check FFA."),
+    max: t("The strip reads up to {max}%. Tick the darkest color instead.", { max: settings.stripMaxFfa }),
   });
   const done = next !== null && next.ffa <= settings.ffaTarget;
   return (
     <div className="mt-6 rounded-xl border border-green-500/20 bg-green-500/[0.03] p-5" data-testid="ffa-recheck">
-      <div className="gv-label">FFA re-check after stage {stage}</div>
-      <p className="text-sm text-gray-300">Test a sample from the oil layer with a new strip. At or below {settings.ffaTarget}%, go on to transesterification; above it, run another esterification stage.</p>
+      <div className="gv-label">{t("FFA re-check after stage {stage}", { stage })}</div>
+      <p className="text-sm text-gray-300">{t("Test a sample from the oil layer with a new strip. At or below {target}%, go on to transesterification; above it, run another esterification stage.", { target: settings.ffaTarget })}</p>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <div>
-          <Field label="FFA after esterification" inputMode="decimal" value={aboveStrip ? String(settings.stripMaxFfa) : value} disabled={aboveStrip} onChange={(event) => setValue(event.target.value)} unit="%" aria-invalid={Boolean(error) && value !== ""} />
+          <Field label={t("FFA after esterification")} inputMode="decimal" value={aboveStrip ? String(settings.stripMaxFfa) : value} disabled={aboveStrip} onChange={(event) => setValue(event.target.value)} unit="%" aria-invalid={Boolean(error) && value !== ""} />
           {error && value !== "" && <p className="mt-2 text-xs text-red-400">{error}</p>}
         </div>
         <label className="flex items-center gap-2 self-end pb-3 text-sm text-gray-300">
           <input className="gv-checkbox" type="checkbox" checked={aboveStrip} onChange={(event) => setAboveStrip(event.target.checked)} />
-          Still the darkest color ({settings.stripMaxFfa}% or more)
+          {t("Still the darkest color ({max}% or more)", { max: settings.stripMaxFfa })}
         </label>
       </div>
       {next && !error && (
         done ? (
           <div className="mt-4 rounded-xl border border-green-500/20 bg-green-500/[0.05] p-4 text-sm text-green-400">
-            FFA {next.ffa.toFixed(1)}% is at or below {settings.ffaTarget}%. Transesterification uses the exact amount: <b>{next.trans.catalystToWeighG.toFixed(2)} g {catalyst}</b> ({next.trans.catalystBaseG.toFixed(2)} g catalyst + {next.trans.neutralizationG.toFixed(2)} g to neutralize {next.ffa.toFixed(1)}% FFA).
+            {t("FFA {ffa}% is at or below {target}%. Transesterification uses the exact amount: {grams} g {catalyst}.", { ffa: next.ffa.toFixed(1), target: settings.ffaTarget, grams: next.trans.catalystToWeighG.toFixed(2), catalyst })}
           </div>
         ) : (
           <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm text-amber-400">
-            FFA is still {aboveStrip ? `${settings.stripMaxFfa}% or more` : `${next.ffa.toFixed(1)}%`}, above {settings.ffaTarget}%. Stage {stage + 1}: {next.ester.methanolMl.toFixed(1)} mL methanol (40:1) + {next.ester.sulfuricAcidMl.toFixed(2)} mL H₂SO₄, dosed for {next.ester.doseFfa.toFixed(1)}% FFA. No more acetone.
-            {aboveStrip && <span className="mt-1 block text-xs">The oil may have more than {settings.designFfa}% FFA. Stage {stage + 1} is dosed for {settings.designFfa}% again.</span>}
-            {stage >= 3 && <span className="mt-1 block text-xs">Several stages haven't brought the FFA down. Consider checking the strip, the reaction time, or using a different feedstock.</span>}
+            {t("FFA is still above {target}%. Stage {stage}: {methanol} mL methanol (40:1) + {acid} mL H₂SO₄, dosed for {dose}% FFA. No more acetone.", { target: settings.ffaTarget, stage: stage + 1, methanol: next.ester.methanolMl.toFixed(1), acid: next.ester.sulfuricAcidMl.toFixed(2), dose: next.ester.doseFfa.toFixed(1) })}
+            {aboveStrip && <span className="mt-1 block text-xs">{t("The oil may have more than {design}% FFA. Stage {stage} is dosed for {design}% again.", { design: settings.designFfa, stage: stage + 1 })}</span>}
+            {stage >= 3 && <span className="mt-1 block text-xs">{t("Several stages haven't brought the FFA down. Consider checking the strip, the reaction time, or using a different feedstock.")}</span>}
           </div>
         )
       )}
       <div className="mt-4 flex flex-wrap gap-3">
-        {done && <Button onClick={onContinue}>Continue to Transesterification →</Button>}
-        {next && !error && !done && <Button onClick={onAnotherStage}>Prepare esterification stage {stage + 1} →</Button>}
+        {done && <Button onClick={onContinue}>{t("Continue to Transesterification")} →</Button>}
+        {next && !error && !done && <Button onClick={onAnotherStage}>{t("Prepare esterification stage {stage}", { stage: stage + 1 })} →</Button>}
       </div>
+    </div>
+  );
+}
+
+/** Live readings of a running stage: only these, nothing else. */
+function LiveReadings({ children, source, progress, fault }: { children: ReactNode; source: string; progress?: number; fault?: string | null }) {
+  const t = useT();
+  return (
+    <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid="live-readings">
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <div className="gv-label !mb-0">{t("Live monitoring")}</div>
+        <span className="text-xs text-gray-500">{t(source)}</span>
+      </div>
+      <div className="grid gap-5 sm:grid-cols-3 lg:grid-cols-5">{children}</div>
+      {progress !== undefined && <div className="mt-5"><Progress value={progress} /></div>}
+      {fault && <p className="mt-4 text-sm text-red-400">{t("Stopped:")} {t(fault)}</p>}
     </div>
   );
 }
@@ -858,19 +822,20 @@ function ReactionStage({
   transExact,
   esterStage = 1,
   voltage,
+  current,
   time,
   stirring,
   batchId,
   onContinue,
   liveStage,
-  connected,
-  liveMock,
+  sourceLabel,
   onReset,
   error,
   preparation,
   footer,
   startBlocked,
   hideContinue,
+  hideStart,
 }: {
   kind: "Esterification" | "Transesterification";
   state: StageState;
@@ -885,13 +850,13 @@ function ReactionStage({
   transExact: boolean;
   esterStage?: number;
   voltage: number;
+  current: number;
   time: number;
   stirring: number;
   batchId: string;
   onContinue: () => void;
   liveStage: StageStatus | null;
-  connected: boolean;
-  liveMock: boolean;
+  sourceLabel: string;
   onReset?: () => void;
   error?: string | null;
   /** Loading the reactor (shown before the stage starts). */
@@ -900,27 +865,30 @@ function ReactionStage({
   footer?: ReactNode;
   startBlocked?: string | null;
   hideContinue?: boolean;
+  hideStart?: boolean;
 }) {
+  const t = useT();
   const isEsterification = kind === "Esterification";
   const totalSeconds = time * 60;
   const elapsedSeconds = liveStage
     ? liveStage.elapsedSeconds
     : (state === "ready" ? 0 : state === "complete" ? time : Math.min(42, time)) * 60;
   const remainingSeconds = liveStage ? liveStage.remainingSeconds : Math.max(totalSeconds - elapsedSeconds, 0);
-  const showTime = (seconds: number) => (liveStage ? formatTimer(seconds) : `${Math.round(seconds / 60)} min`);
-  const title = isEsterification && esterStage > 1 ? `Esterification · stage ${esterStage}` : kind;
+  const title = isEsterification && esterStage > 1 ? t("Esterification · stage {stage}", { stage: esterStage }) : t(kind);
+  const running = state === "running" || state === "paused" || state === "fault";
+  const stateLabel = { ready: "READY", running: "RUNNING", paused: "PAUSED", complete: "COMPLETE", fault: "FAULT" }[state];
   return (
     <Card className="p-6 sm:p-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <SectionHeader
-          eyebrow={`Batch ${batchId}`}
+          eyebrow={t("Batch {id}", { id: batchId })}
           title={title}
           description={
             isEsterification
               ? esterStage > 1
-                ? "FFA was still above 1% after the last stage: another acid stage, dosed for the re-check reading."
-                : "Acid pretreatment of high-FFA feedstock before transesterification. The dose is the same for every oil above 4% FFA."
-              : "Base-catalyzed conversion of the prepared oil into biodiesel."
+                ? t("FFA was still above 1% after the last stage: another acid stage, dosed for the re-check reading.")
+                : t("Acid pretreatment of high-FFA feedstock before transesterification. The dose is the same for every oil above 4% FFA.")
+              : t("Base-catalyzed conversion of the prepared oil into biodiesel.")
           }
         />
         <Status
@@ -934,75 +902,64 @@ function ReactionStage({
                   : "blue"
           }
         >
-          {state.toUpperCase()}
+          {t(stateLabel)}
         </Status>
       </div>
 
-      <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="p-5"><Metric label="Oil in this batch" value={`${oilMass.toFixed(1)} g`} sub={oilVolume === null ? "Volume unavailable" : `${oilVolume.toFixed(1)} mL · recorded at oil loading`} /></Card>
-        <Card className="p-5">
-          <Metric
-            label="Methanol"
-            value={`${(isEsterification ? esterDose.methanolMl : transDose.methanolMl).toFixed(1)} mL`}
-            sub={isEsterification ? `${esterStage === 1 ? "20:1" : "40:1"} methanol to FFA · dose for ${esterDose.doseFfa.toFixed(1)}% FFA` : `${ratio}:1 molar ratio · calculated`}
-          />
-        </Card>
-        {isEsterification ? (
-          <Card className="p-5"><Metric label="Sulfuric acid (H₂SO₄)" value={`${esterDose.sulfuricAcidMl.toFixed(2)} mL`} sub="98% · 5% of the dose's FFA weight · mixed into the methanol" /></Card>
-        ) : (
-          <Card className="p-5"><Metric label={`${catalyst} to weigh`} value={`${transExact ? "" : "Up to "}${transDose.catalystToWeighG.toFixed(2)} g`} sub={`${transDose.catalystBaseG.toFixed(1)} g catalyst + ${transDose.neutralizationG.toFixed(2)} g to neutralize · ${transDose.purity}% purity${transExact ? " · exact" : ""}`} /></Card>
-        )}
-        <Card className="p-5">
-          <Metric
-            label="Acetone"
-            value={isEsterification && esterStage > 1 ? "None" : transDose.acetoneMl === null ? "Unavailable" : `${(isEsterification ? esterDose.acetoneMl : transDose.acetoneMl).toFixed(1)} mL`}
-            sub={isEsterification && esterStage > 1 ? "Still in the reactor from stage 1" : "Provisional 10% · poured by hand through the inlet"}
-          />
-        </Card>
-      </div>
-
-      <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="p-5"><Metric label="Voltage setting" value={`${voltage} V`} /></Card>
-        <Card className="p-5"><Metric label="Reaction time" value={`${time} min`} /></Card>
-        <Card className="p-5"><Metric label="Stirring speed" value={`${stirring} RPM`} /></Card>
-        <Card className="p-5"><Metric label="Batch ID" value={batchId} /></Card>
-      </div>
-
-      {state === "ready" && preparation}
-
-      <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5">
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <div>
-            <div className="gv-label">Live monitoring</div>
-            <p className={`text-xs ${connected && !liveMock ? "text-green-400" : "text-amber-400"}`}>
-              {connected ? (liveMock ? "Simulated by the Greenova backend (demo mode)" : "Live readings from the Raspberry Pi") : "Demonstration data — no hardware controller connected"}
-            </p>
+      {state === "ready" && (
+        <>
+          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Card className="p-5"><Metric label={t("Oil in this batch")} value={`${oilMass.toFixed(1)} g`} sub={oilVolume === null ? t("Volume unavailable") : t("{ml} mL · recorded at oil loading", { ml: oilVolume.toFixed(1) })} /></Card>
+            <Card className="p-5">
+              <Metric
+                label={t("Methanol")}
+                value={`${(isEsterification ? esterDose.methanolMl : transDose.methanolMl).toFixed(1)} mL`}
+                sub={isEsterification ? t("{ratio} methanol to FFA · dose for {dose}% FFA", { ratio: esterStage === 1 ? "20:1" : "40:1", dose: esterDose.doseFfa.toFixed(1) }) : t("{ratio}:1 molar ratio · calculated", { ratio })}
+              />
+            </Card>
+            {isEsterification ? (
+              <Card className="p-5"><Metric label={t("Sulfuric acid (H₂SO₄)")} value={`${esterDose.sulfuricAcidMl.toFixed(2)} mL`} sub={t("98% · 5% of the dose's FFA weight · mixed into the methanol")} /></Card>
+            ) : (
+              <Card className="p-5"><Metric label={t("{catalyst} to weigh", { catalyst })} value={`${transExact ? "" : t("Up to") + " "}${transDose.catalystToWeighG.toFixed(2)} g`} sub={t("{base} g catalyst + {neutral} g to neutralize · {purity}% purity", { base: transDose.catalystBaseG.toFixed(1), neutral: transDose.neutralizationG.toFixed(2), purity: transDose.purity }) + (transExact ? ` · ${t("exact")}` : "")} /></Card>
+            )}
+            <Card className="p-5">
+              <Metric
+                label={t("Acetone")}
+                value={isEsterification && esterStage > 1 ? t("None") : transDose.acetoneMl === null ? t("Unavailable") : `${(isEsterification ? esterDose.acetoneMl : transDose.acetoneMl).toFixed(1)} mL`}
+                sub={isEsterification && esterStage > 1 ? t("Still in the reactor from stage 1") : t("Provisional 10% · poured by hand through the inlet")}
+              />
+            </Card>
           </div>
-          <Status tone={state === "complete" ? "green" : state === "fault" ? "red" : "neutral"}>
-            {state}
-          </Status>
-        </div>
-        <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-6">
-          <Metric label="Elapsed" value={showTime(elapsedSeconds)} />
-          <Metric label="Remaining" value={showTime(remainingSeconds)} />
-          <Metric label="Actual voltage" value={liveStage ? (liveStage.liveVoltage == null ? "—" : `${liveStage.liveVoltage.toFixed(1)} V`) : state === "running" ? `${voltage} V` : "0 V"} />
-          <Metric label="Current" value={liveStage ? (liveStage.liveCurrent == null ? "—" : `${liveStage.liveCurrent.toFixed(2)} A`) : state === "running" ? "1.8 A" : "0 A"} sub={liveStage ? undefined : "Demo"} />
-          <Metric label="Temperature" value={liveStage ? (liveStage.liveTemperature == null ? "—" : `${liveStage.liveTemperature.toFixed(1)} °C`) : "27 °C"} sub={liveStage ? (liveStage.averageTemperature == null ? undefined : `Average ${liveStage.averageTemperature.toFixed(1)} °C`) : "Demo"} />
-          <Metric label="Stirring" value={liveStage ? (liveStage.liveRpm == null ? "—" : `${liveStage.liveRpm} RPM`) : state === "running" ? `${stirring} RPM` : "0 RPM"} />
-        </div>
-        <div className="mt-5"><Progress value={(elapsedSeconds / totalSeconds) * 100} /></div>
-        {liveStage?.faultReason && <p className="mt-4 text-sm text-red-400">Stopped: {liveStage.faultReason}</p>}
-      </div>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Card className="p-5"><Metric label={t("Voltage setting")} value={`${voltage} V`} /></Card>
+            <Card className="p-5"><Metric label={t("Current setting")} value={`${current} A`} /></Card>
+            <Card className="p-5"><Metric label={t("Reaction time")} value={`${time} min`} /></Card>
+            <Card className="p-5"><Metric label={t("Stirring speed")} value={`${stirring} RPM`} /></Card>
+          </div>
+          {preparation}
+        </>
+      )}
+
+      {running && (
+        <LiveReadings source={sourceLabel} progress={(elapsedSeconds / totalSeconds) * 100} fault={liveStage?.faultReason}>
+          <Metric label={t("Time remaining")} value={liveStage ? formatTimer(remainingSeconds) : `${Math.round(remainingSeconds / 60)} min`} />
+          <Metric label={t("Voltage")} value={liveStage ? (liveStage.liveVoltage == null ? "—" : `${liveStage.liveVoltage.toFixed(1)} V`) : state === "running" ? `${voltage} V` : "0 V"} />
+          <Metric label={t("Current")} value={liveStage ? (liveStage.liveCurrent == null ? "—" : `${liveStage.liveCurrent.toFixed(2)} A`) : state === "running" ? `${(current * 0.9).toFixed(2)} A` : "0 A"} sub={t("limit {amps} A", { amps: current })} />
+          <Metric label={t("Stirrer")} value={liveStage ? (liveStage.liveRpm == null ? "—" : `${liveStage.liveRpm} RPM`) : state === "running" ? `${stirring} RPM` : "0 RPM"} />
+          <Metric label={t("Temperature")} value={liveStage ? (liveStage.liveTemperature == null ? "—" : `${liveStage.liveTemperature.toFixed(1)} °C`) : "27 °C"} />
+        </LiveReadings>
+      )}
       <StageControls
         state={state}
         setState={setState}
-        startLabel={isEsterification && esterStage > 1 ? `Start esterification stage ${esterStage}` : `Start ${kind}`}
+        startLabel={isEsterification && esterStage > 1 ? t("Start esterification stage {stage}", { stage: esterStage }) : t("Start {stage}", { stage: t(kind) })}
         onContinue={onContinue}
-        continueLabel={isEsterification ? "Continue to Transesterification" : "Continue to Separation"}
+        continueLabel={isEsterification ? t("Continue to Transesterification") : t("Continue to Separation")}
         onReset={onReset}
         error={error}
         startBlocked={startBlocked}
         hideContinue={hideContinue}
+        hideStart={hideStart}
       />
       {footer}
     </Card>
@@ -1011,13 +968,57 @@ function ReactionStage({
 
 type LocalPump = { key: string; pump: PumpName; base: number; targetG: number; deliveredG: number; phase: PumpPhase; faultReason: string | null };
 type LocalDrain = { valve: DrainValve; phase: DrainPhase; remainingSeconds: number; totalSeconds: number };
-type DoseLoad = { completedG: number; manual: boolean };
+type DoseLoad = { completedG: number };
+
+/** What the Purification screen shows, from the Pi or from the local demonstration. */
+type PurificationView = {
+  phase: PurificationPhase;
+  temperature: number | null;
+  highest: number | null;
+  heaterOn: boolean;
+  stirrerOn: boolean;
+  stirrerRpm: number | null;
+  valveOpen: boolean;
+  stepRemaining: number | null;
+  outputG: number;
+  oilG: number | null;
+  magnesolG: number | null;
+  warning: string | null;
+  stopReason: string | null;
+  stopOccurred: boolean;
+  automatic: boolean;
+  heatingSeconds: number;
+  methanolSeconds: number;
+  contactSeconds: number;
+  settlingSeconds: number;
+  coolingSeconds: number;
+  drainSeconds: number;
+};
+
+const READY_PURIFICATION: PurificationView = {
+  phase: "ready", temperature: null, highest: null, heaterOn: false, stirrerOn: false, stirrerRpm: null,
+  valveOpen: false, stepRemaining: null, outputG: 0, oilG: null, magnesolG: null, warning: null, stopReason: null,
+  stopOccurred: false, automatic: true, heatingSeconds: 0, methanolSeconds: 0, contactSeconds: 0,
+  settlingSeconds: 0, coolingSeconds: 0, drainSeconds: 0,
+};
+
+const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
+  ["heating", "Heating"],
+  ["methanol", "Methanol removal"],
+  ["magnesol", "Add Magnesol"],
+  ["contact", "Contact"],
+  ["settling", "Settling"],
+  ["cooling", "Cooling"],
+  ["drain", "Draining"],
+  ["complete", "Done"],
+];
 
 export default function NewBatch() {
+  const t = useT();
   const [step, setStep] = useState(0);
   // Reactor load cell: the oil, then everything poured or pumped in (live, or the local demo).
   const [reactorG, setReactorG] = useState(0);
-  // The oil weight recorded at "Confirm detected quantity"; the calculations use it from then on.
+  // The oil weight recorded when the oil loading is confirmed; the calculations use it from then on.
   const [confirmedOilG, setConfirmedOilG] = useState<number | null>(null);
   const oilMassG = confirmedOilG ?? reactorG;
   const [targetVolume, setTargetVolume] = useState("500");
@@ -1033,58 +1034,41 @@ export default function NewBatch() {
   const [finalFfa, setFinalFfa] = useState<number | null>(null);
   // Dosing pumps: what each dose ("Esterification 1", "Transesterification") has received
   const [loads, setLoads] = useState<Record<string, DoseLoad>>({});
-  const pendingPump = useRef<{ key: string; base: number; startedAt: string | null } | null>(null);
+  // Pump runs on the Pi already added to their dose (by start time), so none is counted twice
+  const accountedRuns = useRef(new Set<string>());
+  const autoPumped = useRef(new Set<string>());
+  const autoStageStarted = useRef(new Set<string>());
   const [localPump, setLocalPump] = useState<LocalPump | null>(null);
   const [localDrain, setLocalDrain] = useState<LocalDrain | null>(null);
   // Reactor weight when each dose's step opened, to show the acetone poured since
   const [acetoneBase, setAcetoneBase] = useState<Record<string, number>>({});
   const transferSettings = useMemo(getTransferSettings, []);
-  const [stirrerOn, setStirrerOn] = useState(false);
-  const [stirrerRpm, setStirrerRpm] = useState<number | null>(null);
+  const purificationSettings = useMemo(getPurificationSettings, []);
   const [ratio, setRatio] = useState(7);
   const [catalyst, setCatalyst] = useState<"NaOH" | "KOH">("NaOH");
   const [esterVoltage, setEsterVoltage] = useState("20");
   const [esterTime, setEsterTime] = useState("120");
   const [esterStirring, setEsterStirring] = useState("500");
+  const [esterCurrent, setEsterCurrent] = useState(String(CURRENT_LIMITS.default));
   const [transVoltage, setTransVoltage] = useState("30");
   const [transTime, setTransTime] = useState("120");
   const [transStirring, setTransStirring] = useState("500");
-  const [loadingConfirmed, setLoadingConfirmed] = useState(false);
+  const [transCurrent, setTransCurrent] = useState(String(CURRENT_LIMITS.default));
   const [esterState, setEsterState] = useState<StageState>("ready");
   const [transState, setTransState] = useState<StageState>("ready");
+  const [transCompletedAt, setTransCompletedAt] = useState<number | null>(null);
   const [separationState, setSeparationState] = useState<StageState>("ready");
-  const purificationSettings = useMemo(getPurificationSettings, []);
-  const [purificationPhase, setPurificationPhase] = useState<PurificationPhase>("ready");
-  const [targetTemperature, setTargetTemperature] = useState(String(purificationSettings.targetTemperature));
-  const [liveTemperature, setLiveTemperature] = useState<number | null>(27);
-  const [startingTemperature, setStartingTemperature] = useState(27);
-  const [highestTemperature, setHighestTemperature] = useState(27);
-  const [heatingTimeSeconds, setHeatingTimeSeconds] = useState(0);
-  const [holdRemainingSeconds, setHoldRemainingSeconds] = useState(
-    Math.round(purificationSettings.holdTimeMinutes * 60),
-  );
-  const [heaterOn, setHeaterOn] = useState(false);
-  const [plannedFlowSeconds, setPlannedFlowSeconds] = useState<number | null>(null);
-  const [expectedBiodieselMl, setExpectedBiodieselMl] = useState<number | null>(null);
-  const [drainElapsedSeconds, setDrainElapsedSeconds] = useState(0);
-  const [purificationWarning, setPurificationWarning] = useState<string | null>(null);
-  const [purificationAutomatic, setPurificationAutomatic] = useState(true);
+  const [purification, setPurification] = useState<PurificationView>(READY_PURIFICATION);
   const localPurification = useRef<LocalPurification | null>(null);
   const autoStarted = useRef(false);
-  const [flowElapsedSeconds, setFlowElapsedSeconds] = useState(0);
-  const [flowStableSeconds, setFlowStableSeconds] = useState(0);
-  const [outputWeightG, setOutputWeightG] = useState(0);
-  const [flowRateGPerMinute, setFlowRateGPerMinute] = useState(0);
   const [heaterConfirmed, setHeaterConfirmed] = useState(false); // only used without a level switch
-  const [purificationStarted, setPurificationStarted] = useState(false);
-  const [safetyStopReason, setSafetyStopReason] = useState<string | null>(null);
-  const [safetyStopOccurred, setSafetyStopOccurred] = useState(false);
   const [saved, setSaved] = useState(false);
   const { live, backend, mock } = useLiveData();
   const [actionError, setActionError] = useState<string | null>(null);
   const [savedBatch, setSavedBatch] = useState<BatchRecord | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [batchId, setBatchId] = useState(() => `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`);
+  const [processConfigCurrentControl, setProcessConfigCurrentControl] = useState(false);
 
   // Batch ID from the backend's naming format (local ID when offline).
   useEffect(() => {
@@ -1096,42 +1080,69 @@ export default function NewBatch() {
   }, []);
   const chemistrySettings = useMemo(getChemistrySettings, []);
 
+  // Can the Pi set the power supply's current limit? (otherwise the operator sets it by hand)
+  useEffect(() => {
+    if (!backend) {
+      setProcessConfigCurrentControl(false);
+      return;
+    }
+    let cancelled = false;
+    fetch("/api/config")
+      .then((response) => response.json())
+      .then((config: { powerSupply?: { currentControl?: boolean } }) => {
+        if (!cancelled) setProcessConfigCurrentControl(Boolean(config.powerSupply?.currentControl));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [backend]);
+
   /** Shows the local demonstration state on the screen. */
   function showLocalPurification(sim: LocalPurification) {
-    setPurificationPhase(sim.phase);
-    const stirring = (sim.phase === "heating" || sim.phase === "hold") && transferSettings.stirringSpeed > 0;
-    setStirrerOn(stirring);
-    setStirrerRpm(stirring ? transferSettings.stirringSpeed : 0);
-    setLiveTemperature(sim.temperature);
-    setHighestTemperature(sim.highest);
-    setHeaterOn(sim.heaterOn);
-    setHeatingTimeSeconds(sim.heatingSeconds);
-    setHoldRemainingSeconds(sim.holdRemaining);
-    setPlannedFlowSeconds(sim.plannedFlow);
-    setFlowElapsedSeconds(sim.flowElapsed);
-    setDrainElapsedSeconds(sim.drainElapsed);
-    setFlowStableSeconds(sim.stableSeconds);
-    setOutputWeightG(sim.outputG);
-    setFlowRateGPerMinute(sim.rateGPerMinute);
-    setPurificationWarning(sim.warning);
-    if (sim.stopReason) {
-      setSafetyStopReason(sim.stopReason);
-      setSafetyStopOccurred(true);
-    }
+    const total = (minutes: number) => Math.round(minutes * 60);
+    setPurification({
+      phase: sim.phase,
+      temperature: sim.temperature,
+      highest: sim.highest,
+      heaterOn: sim.heaterOn,
+      stirrerOn: sim.stirrerOn,
+      stirrerRpm: sim.stirrerOn ? PROCESS_CONFIG.purification.stirringSpeedRpm - 2 : 0,
+      valveOpen: sim.phase === "drain",
+      stepRemaining:
+        sim.phase === "methanol" ? sim.methanolRemaining
+          : sim.phase === "contact" ? sim.contactRemaining
+            : sim.phase === "settling" ? sim.settlingRemaining
+              : sim.phase === "drain" ? PROCESS_CONFIG.purification.drainMaximumMinutes * 60 - sim.drainElapsed
+                : null,
+      outputG: sim.outputG,
+      oilG: sim.oilG,
+      magnesolG: magnesolGrams(oilVolumeMl),
+      warning: sim.warning,
+      stopReason: sim.stopReason,
+      stopOccurred: Boolean(sim.stopReason),
+      automatic: true,
+      heatingSeconds: sim.heatingSeconds,
+      methanolSeconds: total(purificationSettings.methanolRemovalMinutes) - sim.methanolRemaining,
+      contactSeconds: total(purificationSettings.contactMinutes) - sim.contactRemaining,
+      settlingSeconds: total(purificationSettings.settlingMinutes) - sim.settlingRemaining,
+      coolingSeconds: sim.coolingSeconds,
+      drainSeconds: sim.drainElapsed,
+    });
   }
 
-  // No backend: run the automatic purification as a local demonstration, one step per second.
+  // No backend: run the purification as a local demonstration, one step per second.
   useEffect(() => {
-    if (backend || !PURIFYING.includes(purificationPhase)) return;
+    if (backend || !PURIFYING.includes(purification.phase)) return;
     const timer = window.setInterval(() => {
       const sim = localPurification.current;
       if (!sim) return;
-      stepLocalPurification(sim, purificationSettings, Number(targetTemperature));
+      stepLocalPurification(sim, purificationSettings);
       showLocalPurification({ ...sim });
     }, 1000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, purificationPhase, purificationSettings, targetTemperature]);
+  }, [backend, purification.phase, purificationSettings]);
 
   // Backend connected: show its live readings and the state of its stages.
   useEffect(() => {
@@ -1145,47 +1156,45 @@ export default function NewBatch() {
     }
     const p = live.purification;
     if (p.phase === "ready" || p.batchId !== batchId) {
-      setLiveTemperature(live.sensors.temperature);
+      setPurification((current) => (current.phase === "ready" ? { ...current, temperature: live.sensors.temperature } : current));
       return;
     }
-    setPurificationPhase(p.phase);
-    setPurificationStarted(true);
-    setLiveTemperature(p.liveTemperature ?? live.sensors.temperature);
-    if (p.startingTemperature !== null) setStartingTemperature(p.startingTemperature);
-    if (p.highestTemperature !== null) setHighestTemperature(p.highestTemperature);
-    setHeatingTimeSeconds(p.heatingTimeSeconds);
-    setHoldRemainingSeconds(p.holdRemainingSeconds);
-    setHeaterOn(p.heaterOn);
-    if (p.targetTemperature !== null) setTargetTemperature(String(p.targetTemperature));
-    setPlannedFlowSeconds(p.plannedFlowSeconds);
-    setExpectedBiodieselMl(p.expectedBiodieselMl);
-    setDrainElapsedSeconds(p.drainElapsedSeconds);
-    setPurificationWarning(p.warning);
-    setPurificationAutomatic(p.automatic);
-    setFlowElapsedSeconds(p.flowElapsedSeconds);
-    setFlowStableSeconds(p.flowStableSeconds);
-    setOutputWeightG(p.outputWeightG ?? 0);
-    setFlowRateGPerMinute(p.flowRateGPerMinute ?? 0);
-    setSafetyStopReason(p.safetyStopReason);
-    setSafetyStopOccurred(p.safetyStopOccurred);
-    setStirrerOn(p.stirrerOn);
-    setStirrerRpm(p.stirrerRpm);
+    setPurification({
+      phase: p.phase,
+      temperature: p.liveTemperature ?? live.sensors.temperature,
+      highest: p.highestTemperature,
+      heaterOn: p.heaterOn,
+      stirrerOn: p.stirrerOn,
+      stirrerRpm: p.stirrerRpm,
+      valveOpen: p.valveOpen,
+      stepRemaining: p.stepRemainingSeconds,
+      outputG: p.outputWeightG ?? 0,
+      oilG: p.oilWeightG,
+      magnesolG: p.magnesolG,
+      warning: p.warning,
+      stopReason: p.safetyStopReason,
+      stopOccurred: p.safetyStopOccurred,
+      automatic: p.automatic,
+      heatingSeconds: p.heatingTimeSeconds,
+      methanolSeconds: p.methanolTotalSeconds - p.methanolRemainingSeconds,
+      contactSeconds: p.contactTotalSeconds - p.contactRemainingSeconds,
+      settlingSeconds: p.settlingTotalSeconds - p.settlingRemainingSeconds,
+      coolingSeconds: p.coolingSeconds,
+      drainSeconds: p.drainElapsedSeconds,
+    });
   }, [backend, live, batchId]);
 
-  // A pump run on the Pi has ended: add what it delivered to its dose.
+  // A pump run on the Pi has ended: add what it delivered to its dose (once).
   useEffect(() => {
     if (!backend || !live) return;
     const p = live.pump;
-    const pending = pendingPump.current;
-    if (!pending || p.startedAt !== pending.startedAt) return;
+    if (!p.startedAt || !p.stage || p.batchId !== batchId || accountedRuns.current.has(p.startedAt)) return;
     if (p.phase === "done" || p.phase === "fault" || p.phase === "stopped") {
-      pendingPump.current = null;
-      setLoads((current) => ({
-        ...current,
-        [pending.key]: { completedG: pending.base + p.deliveredG, manual: current[pending.key]?.manual ?? false },
-      }));
+      accountedRuns.current.add(p.startedAt);
+      const key = p.stage;
+      setLoads((current) => ({ ...current, [key]: { completedG: (current[key]?.completedG ?? 0) + p.deliveredG } }));
     }
-  }, [backend, live]);
+  }, [backend, live, batchId]);
 
   // Local demonstration of a pump: the dose arrives in about 5 seconds.
   useEffect(() => {
@@ -1196,7 +1205,7 @@ export default function NewBatch() {
       setReactorG((grams) => grams + stepG);
       if (delivered >= localPump.targetG - 0.01) {
         setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
-        setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG, manual: false } }));
+        setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG } }));
       } else {
         setLocalPump({ ...localPump, deliveredG: delivered });
       }
@@ -1220,38 +1229,41 @@ export default function NewBatch() {
       ? oilMassG / PROCESS_CONFIG.oil.densityGPerMl
       : null;
   const targetError = decimalError(
+    t,
     targetVolume,
     {
       min: PROCESS_CONFIG.oil.minimumVolumeMl,
       max: PROCESS_CONFIG.oil.maximumVolumeMl,
     },
     {
-      min: "Minimum oil volume is 100 mL.",
-      max: "Maximum supported oil volume is 1000 mL.",
+      min: t("Minimum oil volume is 100 mL."),
+      max: t("Maximum supported oil volume is 1000 mL."),
     },
   );
-  const ffaError = ffaAboveStrip ? "" : decimalError(ffa, { min: 0, max: 100 }, { empty: "Enter a valid FFA percentage." });
+  const ffaError = ffaAboveStrip ? "" : decimalError(t, ffa, { min: 0, max: 100 }, { empty: t("Enter a valid FFA percentage.") });
   // Above the strip's range the batch is recorded at the strip's maximum (5%), marked "≥".
   const ffaNumber = ffaAboveStrip ? chemistrySettings.stripMaxFfa : Number(ffa);
   const requiresEsterification =
     !ffaError && ffaNumber > PROCESS_CONFIG.ffaThreshold;
   const measuredOilError =
     oilMassG <= 0 || oilVolumeMl === null
-      ? "Load-cell reading is unavailable."
+      ? t("Load-cell reading is unavailable.")
       : oilVolumeMl < PROCESS_CONFIG.oil.minimumVolumeMl
-        ? "Minimum oil volume is 100 mL."
+        ? t("Minimum oil volume is 100 mL.")
         : oilVolumeMl > PROCESS_CONFIG.oil.maximumVolumeMl
-          ? "Maximum supported oil volume is 1000 mL."
+          ? t("Maximum supported oil volume is 1000 mL.")
           : "";
   const esterErrors = [
-    decimalError(esterVoltage, PROCESS_CONFIG.esterification.voltage),
-    decimalError(esterTime, PROCESS_CONFIG.esterification.time),
-    decimalError(esterStirring, PROCESS_CONFIG.esterification.stirring),
+    decimalError(t, esterVoltage, PROCESS_CONFIG.esterification.voltage),
+    decimalError(t, esterTime, PROCESS_CONFIG.esterification.time),
+    decimalError(t, esterStirring, PROCESS_CONFIG.esterification.stirring),
+    decimalError(t, esterCurrent, PROCESS_CONFIG.esterification.current),
   ];
   const transErrors = [
-    decimalError(transVoltage, PROCESS_CONFIG.transesterification.voltage),
-    decimalError(transTime, PROCESS_CONFIG.transesterification.time),
-    decimalError(transStirring, PROCESS_CONFIG.transesterification.stirring),
+    decimalError(t, transVoltage, PROCESS_CONFIG.transesterification.voltage),
+    decimalError(t, transTime, PROCESS_CONFIG.transesterification.time),
+    decimalError(t, transStirring, PROCESS_CONFIG.transesterification.stirring),
+    decimalError(t, transCurrent, PROCESS_CONFIG.transesterification.current),
   ];
   const parametersValid =
     !targetError &&
@@ -1271,7 +1283,7 @@ export default function NewBatch() {
 
   // ----- esterification stages and the FFA re-check -----
   const esterDoseNow = esterificationDose(oilMassG, oilVolumeMl, esterStage === 1 ? ffaNumber : nextDoseFfa ?? ffaNumber, esterStage, chemistrySettings);
-  const recheckError = recheckAbove ? "" : decimalError(recheckValue, { min: 0, max: chemistrySettings.stripMaxFfa });
+  const recheckError = recheckAbove ? "" : decimalError(t, recheckValue, { min: 0, max: chemistrySettings.stripMaxFfa });
   const recheckFfa = recheckAbove ? chemistrySettings.stripMaxFfa : Number(recheckValue);
   const recheckNext = recheckError
     ? null
@@ -1290,6 +1302,7 @@ export default function NewBatch() {
     (requiresEsterification ? esterRecords.find((record) => record.stage === 1)?.acetoneMl ?? calculatorValues.acetoneMl ?? 0 : 0) +
     (transDoseNow.acetoneMl ?? 0);
   const esterAcidTotal = esterRecords.length ? esterRecords.reduce((sum, record) => sum + record.sulfuricAcidMl, 0) : requiresEsterification ? calculatorValues.sulfuricAcidMl : 0;
+  const magnesolG = purification.magnesolG ?? calculatorValues.magnesolG;
   useEffect(() => {
     if (ffaError) return;
     let cancelled = false;
@@ -1316,10 +1329,6 @@ export default function NewBatch() {
       cancelled = true;
     };
   }, [ffaError, ffaNumber]);
-  function unconfirmOil() {
-    setLoadingConfirmed(false);
-    setConfirmedOilG(null);
-  }
 
   const targetReached =
     !targetError &&
@@ -1327,12 +1336,12 @@ export default function NewBatch() {
     Math.abs(oilVolumeMl - Number(targetVolume)) <= Math.max(Number(targetVolume) * 0.02, 5);
   const loadingStatus =
     oilMassG <= 0
-      ? "Waiting for oil"
+      ? t("Waiting for oil")
       : measuredOilError
-        ? "Invalid quantity"
+        ? t("Invalid quantity")
         : targetReached
-          ? "Target quantity reached"
-          : "Oil detected";
+          ? t("Target quantity reached")
+          : t("Oil detected");
   const systemTiles: Array<{
     label: string;
     value: string;
@@ -1340,9 +1349,12 @@ export default function NewBatch() {
     state?: DeviceState;
   }> = [
     { label: "Power Supply", value: "Ready", secondary: "Output off · 0–30 V DC" },
-    { label: "Electrodes", value: "Copper tube – stainless steel", secondary: "Connected" },
-    { label: "Stirrer", value: "Ready" },
-    { label: "Temperature Sensor", value: "Online", secondary: "27 °C · demonstration reading" },
+    { label: "Electrodes", value: "Graphite – graphite", secondary: "Connected" },
+    { label: "Reactor Stirrer", value: "Ready", secondary: "Stopped · RPM sensor online" },
+    { label: "Centrifuge Motor", value: "Ready", secondary: "Stopped · RPM sensor online" },
+    { label: "Purification Stirrer", value: "Ready", secondary: "Stopped · RPM sensor online" },
+    { label: "Heater", value: "Ready", secondary: "Off · stops above 95 °C" },
+    { label: "Temperature Sensor", value: "Online", secondary: "27.0 °C · demonstration reading" },
     { label: "Reactor Load Cell", value: "Online", secondary: `${reactorG.toFixed(1)} g in the reactor · demonstration mode` },
     {
       label: "Oil Input",
@@ -1394,24 +1406,30 @@ export default function NewBatch() {
     backend && live && live.stage.stage === kind && live.stage.batchId === batchId ? live.stage : null;
   const liveSeparation = liveStageFor("Separation");
   const realHardware = backend && !mock;
+  const sourceLabel = backend ? (mock ? "Simulated by the Greenova backend (demo mode)" : "Live readings from the Raspberry Pi") : "Demonstration data — no hardware controller connected";
 
   async function loadDemoReading() {
-    unconfirmOil();
+    setConfirmedOilG(null);
     setActionError(null);
     if (backend) {
       try {
         const sensors = await loadDemoOil(Number(targetVolume || 0));
         if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
       }
       return;
     }
     setReactorG(Number(targetVolume || 0) * PROCESS_CONFIG.oil.densityGPerMl);
   }
 
-  // ----- dosing pumps -----
+  // ----- dosing pumps: each stage's dose loads by itself -----
   const doseKey = currentStage === "Esterification" ? `Esterification ${esterStage}` : currentStage === "Transesterification" ? "Transesterification" : null;
+  const reactionDose = currentStage === "Esterification"
+    ? { pump: "acid" as PumpName, targetG: esterDoseNow.premixG, premixMl: esterDoseNow.premixMl, acetoneMl: esterDoseNow.acetoneMl, acetoneG: esterDoseNow.acetoneG, state: esterState }
+    : currentStage === "Transesterification"
+      ? { pump: "catalyst" as PumpName, targetG: transDoseNow.premixG, premixMl: transDoseNow.premixMl, acetoneMl: transDoseNow.acetoneMl ?? 0, acetoneG: transDoseNow.acetoneG, state: transState }
+      : null;
 
   function pumpRunFor(key: string): PumpView | null {
     if (backend) {
@@ -1426,11 +1444,10 @@ export default function NewBatch() {
   const pumpRunning = backend ? live?.pump.phase === "pumping" : localPump?.phase === "pumping";
 
   function doseLoaded(key: string, targetG: number) {
-    const record = loads[key];
-    return Boolean(record && (record.manual || record.completedG >= targetG - 1));
+    return (loads[key]?.completedG ?? 0) >= targetG - 1;
   }
 
-  /** "Load": the pump adds the dose (or what's left of it) and stops at its weight. */
+  /** The pump adds the dose (or what's left of it) and stops at its weight. */
   async function loadDose(key: string, pump: PumpName, targetG: number, premixMl: number) {
     setActionError(null);
     const base = loads[key]?.completedG ?? 0;
@@ -1439,58 +1456,43 @@ export default function NewBatch() {
     const volumeMl = (premixMl * remainingG) / targetG;
     if (backend) {
       try {
-        const state = await startPump({
+        await startPump({
           pump,
           targetG: Number(remainingG.toFixed(1)),
           volumeMl: Number(Math.max(volumeMl, 0.1).toFixed(1)),
           batchId,
           stage: key,
         });
-        pendingPump.current = { key, base, startedAt: state.startedAt };
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
       }
       return;
     }
     setLocalPump({ key, pump, base, targetG: remainingG, deliveredG: 0, phase: "pumping", faultReason: null });
   }
 
-  async function stopPump() {
-    if (backend) {
-      pumpAction("stop").catch((error) => setActionError(errorText(error)));
-      return;
-    }
-    if (localPump?.phase === "pumping") {
-      setLocalPump({ ...localPump, phase: "stopped", faultReason: "stopped by operator" });
-      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.deliveredG, manual: false } }));
-    }
-  }
-
   function skipPump() {
     if (backend) {
-      pumpAction("skip").catch((error) => setActionError(errorText(error)));
+      pumpAction("skip").catch((error) => setActionError(errorText(t, error)));
       return;
     }
     if (localPump?.phase === "pumping") {
       setReactorG((grams) => grams + localPump.targetG - localPump.deliveredG);
       setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
-      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG, manual: false } }));
+      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG } }));
     }
-  }
-
-  function setManualDose(key: string, manual: boolean) {
-    setLoads((current) => ({ ...current, [key]: { completedG: current[key]?.completedG ?? 0, manual } }));
   }
 
   /** Demo: acetone poured through the inlet lands on the reactor load cell. */
   async function pourDemoAcetone(grams: number) {
     setActionError(null);
+    if (grams < 0.5) return;
     if (backend) {
       try {
         const sensors = await demoAdd(Number(grams.toFixed(1)));
         if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
       }
       return;
     }
@@ -1504,11 +1506,27 @@ export default function NewBatch() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doseKey]);
 
-  function acetonePouredG(key: string) {
-    const run = pumpRunFor(key);
-    const pumped = (loads[key]?.completedG ?? 0) + (run?.phase === "pumping" ? run.deliveredG : 0);
-    return Math.max(reactorG - (acetoneBase[key] ?? reactorG) - pumped, 0);
+  /** Grams the pump has put in for this dose, including a run that just ended and isn't added up yet. */
+  function pumpedG(key: string) {
+    const completed = loads[key]?.completedG ?? 0;
+    if (backend) {
+      const p = live?.pump;
+      const running = p && p.startedAt && p.stage === key && p.batchId === batchId && !accountedRuns.current.has(p.startedAt);
+      return running ? completed + p.deliveredG : completed;
+    }
+    if (localPump && localPump.key === key) return Math.max(completed, localPump.base + localPump.deliveredG);
+    return completed;
   }
+
+  function acetonePouredG(key: string) {
+    return Math.max(reactorG - (acetoneBase[key] ?? reactorG) - pumpedG(key), 0);
+  }
+
+  // Without a reactor load cell reading the acetone can't be seen: then the stage doesn't wait for it.
+  const loadCellReading = !backend || (live?.sensors.oilMassG ?? null) !== null;
+  const acetoneNeeded = reactionDose !== null && reactionDose.acetoneG > 0 && !(currentStage === "Esterification" && esterStage > 1);
+  const acetoneOk = !doseKey || !acetoneNeeded || !loadCellReading || acetonePouredG(doseKey) >= (reactionDose?.acetoneG ?? 0) * 0.95;
+  const doseIn = doseKey !== null && reactionDose !== null && doseLoaded(doseKey, reactionDose.targetG);
 
   // ----- outlet valves -----
   function drainViewFor(valve: DrainValve): DrainView | null {
@@ -1518,7 +1536,7 @@ export default function NewBatch() {
       return d;
     }
     if (!localDrain || localDrain.valve !== valve) return null;
-    return { ...localDrain, waitingFor: null, faultReason: localDrain.phase === "stopped" ? "closed by operator" : null };
+    return { ...localDrain, waitingFor: null, faultReason: null };
   }
 
   const drainMinutes = (valve: DrainValve) =>
@@ -1535,37 +1553,32 @@ export default function NewBatch() {
     setLocalDrain({ valve, phase: "draining", remainingSeconds: seconds, totalSeconds: seconds });
   }
 
-  async function openDrainAgain(valve: DrainValve) {
-    setActionError(null);
-    if (backend) {
-      try {
-        await startDrain(valve, batchId);
-      } catch (error) {
-        setActionError(errorText(error));
-      }
-      return;
-    }
-    startLocalDrain(valve);
-  }
+  const reactorDraining = draining("reactor_outlet");
+  // "Continue to Separation" appears once the reactor outlet has closed again.
+  const reactorView = drainViewFor("reactor_outlet");
+  const reactorDrained =
+    drainMinutes("reactor_outlet") <= 0 ||
+    (reactorView !== null && ["done", "stopped", "fault"].includes(reactorView.phase)) ||
+    (reactorView === null && transCompletedAt !== null && Date.now() - transCompletedAt > 5000);
 
-  function closeDrain() {
-    if (backend) {
-      drainAction("stop").catch((error) => setActionError(errorText(error)));
-      return;
-    }
-    if (localDrain) setLocalDrain({ ...localDrain, phase: "stopped" });
-  }
+  // The dose loads by itself when its stage opens (once per dose; Retry after a pump problem).
+  useEffect(() => {
+    if (!doseKey || !reactionDose || reactionDose.state !== "ready") return;
+    if (autoPumped.current.has(doseKey) || doseLoaded(doseKey, reactionDose.targetG) || pumpRunning || reactorDraining) return;
+    autoPumped.current.add(doseKey);
+    loadDose(doseKey, reactionDose.pump, reactionDose.targetG, reactionDose.premixMl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doseKey, reactionDose?.state, pumpRunning, reactorDraining]);
 
-  function skipDrain() {
-    if (backend) {
-      drainAction("skip").catch((error) => setActionError(errorText(error)));
-      return;
-    }
-    if (localDrain) {
-      if (localDrain.valve === "reactor_outlet") setReactorG(0);
-      setLocalDrain({ ...localDrain, remainingSeconds: 0, phase: "done" });
-    }
-  }
+  // ... and the stage starts by itself once the dose (and the acetone) is in.
+  useEffect(() => {
+    if (!doseKey || !reactionDose || reactionDose.state !== "ready" || !doseIn || !acetoneOk || pumpRunning) return;
+    if (autoStageStarted.current.has(doseKey)) return;
+    autoStageStarted.current.add(doseKey);
+    if (currentStage === "Esterification") controlStage("Esterification", "running", "ready", setEsterState);
+    else controlStage("Transesterification", "running", "ready", setTransState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doseKey, reactionDose?.state, doseIn, acetoneOk, pumpRunning]);
 
   // ----- FFA re-check after an esterification stage -----
   function recordEsterStage(ffaAfter: number) {
@@ -1589,7 +1602,7 @@ export default function NewBatch() {
       try {
         await stageAction("reset");
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
         return;
       }
     }
@@ -1610,6 +1623,7 @@ export default function NewBatch() {
   /** Stage buttons: the backend runs the stage when it's connected; otherwise the local demo. */
   async function controlStage(kind: StageName, nextState: StageState, current: StageState, setLocal: (state: StageState) => void) {
     setActionError(null);
+    if (nextState === "complete" && kind === "Transesterification") setTransCompletedAt(Date.now());
     if (!backend) {
       setLocal(nextState);
       // the outlet valves open by themselves after these stages (the Pi does this itself)
@@ -1629,6 +1643,7 @@ export default function NewBatch() {
                 voltage: Number(kind === "Esterification" ? esterVoltage : transVoltage),
                 time: Number(kind === "Esterification" ? esterTime : transTime),
                 stirring: Number(kind === "Esterification" ? esterStirring : transStirring),
+                current: Number(kind === "Esterification" ? esterCurrent : transCurrent),
                 oilMassG,
               },
         );
@@ -1645,7 +1660,7 @@ export default function NewBatch() {
       }
       setLocal(result.state);
     } catch (error) {
-      setActionError(errorText(error));
+      setActionError(errorText(t, error));
     }
   }
 
@@ -1658,72 +1673,86 @@ export default function NewBatch() {
     try {
       setLocal((await stageAction("reset")).state);
     } catch (error) {
-      setActionError(errorText(error));
+      setActionError(errorText(t, error));
     }
   }
 
+  // ----- purification -----
   /** Starts purification now. Normally it starts by itself: the backend starts it after separation
    * when the level switch detects biodiesel, and the local demonstration starts it on this screen. */
-  async function startPurificationNow(automatic: boolean) {
+  async function startPurificationNow() {
     setActionError(null);
-    setPurificationWarning(null);
     if (backend) {
       try {
-        const state = await startPurification({
-          heaterSubmerged: heaterConfirmed,
-          batchId,
-          oilVolumeMl: oilVolumeMl ?? undefined,
-        });
-        setPurificationStarted(true);
-        setPurificationPhase(state.phase);
+        await startPurification({ heaterSubmerged: heaterConfirmed, batchId, oilVolumeMl: oilVolumeMl ?? undefined });
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
       }
       return;
     }
-    const temperature = liveTemperature ?? 27;
-    const planned = plannedFlowSecondsFor(oilVolumeMl, purificationSettings);
+    const temperature = purification.temperature ?? 27;
     const sim: LocalPurification = {
       phase: "heating",
       temperature,
       highest: temperature,
       heaterOn: true,
+      stirrerOn: true,
       heatingSeconds: 0,
-      holdRemaining: Math.round(purificationSettings.holdTimeMinutes * 60),
-      plannedFlow: planned,
-      flowElapsed: 0,
+      methanolRemaining: Math.round(purificationSettings.methanolRemovalMinutes * 60),
+      magnesolAdded: false,
+      contactRemaining: Math.round(purificationSettings.contactMinutes * 60),
+      settlingRemaining: Math.round(purificationSettings.settlingMinutes * 60),
+      coolingSeconds: 0,
       drainElapsed: 0,
       stableSeconds: 0,
+      anchorG: null,
       outputG: 0,
       tankG: oilMassG * 0.85,
-      rateGPerMinute: 0,
-      expectedG: (oilVolumeMl ?? 0) * 0.88,
+      oilG: oilMassG,
       warning: null,
       stopReason: null,
     };
     localPurification.current = sim;
-    setExpectedBiodieselMl(oilVolumeMl);
-    setPurificationAutomatic(automatic);
-    setStartingTemperature(temperature);
-    setPurificationStarted(true);
     showLocalPurification({ ...sim });
   }
 
-  /** "Skip timer (demo)": finishes the current phase now. */
+  async function confirmMagnesol() {
+    setActionError(null);
+    if (backend) {
+      try {
+        await purificationAction("magnesol-added");
+      } catch (error) {
+        setActionError(errorText(t, error));
+      }
+      return;
+    }
+    const sim = localPurification.current;
+    if (sim && sim.phase === "magnesol") {
+      sim.magnesolAdded = true;
+      sim.phase = "contact";
+      showLocalPurification({ ...sim });
+    }
+  }
+
+  /** "Skip timer (demo)": finishes the current step now (not the Magnesol: that's the operator's). */
   function skipPurificationPhase() {
     if (backend) {
-      purificationAction("skip").catch((error) => setActionError(errorText(error)));
+      purificationAction("skip").catch((error) => setActionError(errorText(t, error)));
       return;
     }
     const sim = localPurification.current;
     if (!sim) return;
-    if (sim.phase === "heating") sim.temperature = Number(targetTemperature);
-    else if (sim.phase === "hold") sim.holdRemaining = 1;
-    else if (sim.phase === "flow") {
+    if (sim.phase === "heating") sim.temperature = PROCESS_CONFIG.purification.holdTemperature;
+    else if (sim.phase === "methanol") sim.methanolRemaining = 1;
+    else if (sim.phase === "contact") sim.contactRemaining = 1;
+    else if (sim.phase === "settling") sim.settlingRemaining = 1;
+    else if (sim.phase === "cooling") sim.temperature = purificationSettings.maxDrainTemperature;
+    else if (sim.phase === "drain") {
       sim.outputG = Number((sim.outputG + sim.tankG).toFixed(1));
       sim.tankG = 0;
-      sim.flowElapsed = Math.max(sim.plannedFlow - 1, 0);
-    } else if (sim.phase === "drain") sim.stableSeconds = 60;
+      sim.anchorG = sim.outputG;
+      sim.stableSeconds = PROCESS_CONFIG.purification.drainStableSeconds;
+    }
     showLocalPurification({ ...sim });
   }
 
@@ -1733,7 +1762,7 @@ export default function NewBatch() {
       try {
         await purificationAction("abort");
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
       }
       return;
     }
@@ -1741,6 +1770,7 @@ export default function NewBatch() {
     if (sim) {
       sim.phase = "fault";
       sim.heaterOn = false;
+      sim.stirrerOn = false;
       sim.stopReason = "stopped by operator";
       showLocalPurification({ ...sim });
     }
@@ -1752,14 +1782,12 @@ export default function NewBatch() {
       try {
         await purificationAction("acknowledge");
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
         return;
       }
     }
     localPurification.current = null;
-    setSafetyStopReason(null);
-    setPurificationPhase("ready");
-    setPurificationStarted(false);
+    setPurification((current) => ({ ...READY_PURIFICATION, temperature: current.temperature, stopOccurred: true }));
     setHeaterConfirmed(false);
   }
 
@@ -1771,23 +1799,21 @@ export default function NewBatch() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStage, separationState]);
 
-  // Local demonstration: purification starts by itself on the Purification screen (once per batch).
-  // With the backend, the Raspberry Pi starts it after separation, when the level switch detects biodiesel.
+  // Local demonstration: purification starts by itself on the Purification screen (once per batch),
+  // after the centrifuge outlet has closed. With the backend, the Raspberry Pi starts it itself.
   useEffect(() => {
-    if (backend || currentStage !== "Purification" || autoStarted.current || purificationPhase !== "ready") return;
-    if (localDrain && localDrain.valve === "centrifuge_outlet" && localDrain.phase === "draining") return;   // biodiesel still on its way
+    if (backend || currentStage !== "Purification" || autoStarted.current || purification.phase !== "ready") return;
+    if (localDrain && localDrain.valve === "centrifuge_outlet" && localDrain.phase === "draining") return;
     autoStarted.current = true;
-    startPurificationNow(true);
+    startPurificationNow();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, currentStage, purificationPhase, localDrain]);
+  }, [backend, currentStage, purification.phase, localDrain]);
 
   const levelSwitch = backend && live ? live.sensors.heaterSubmerged : null;
   const autoStartPending = backend && live !== null && live.purificationAutoStart === batchId;
   const centrifugeDraining = draining("centrifuge_outlet");
   const showManualStart =
-    purificationPhase === "ready" && !safetyStopReason && !centrifugeDraining && (!backend || !autoStartPending || levelSwitch === null);
-  const shownPlannedFlowSeconds = plannedFlowSeconds ?? plannedFlowSecondsFor(oilVolumeMl, purificationSettings);
-  const shownBiodieselMl = expectedBiodieselMl ?? oilVolumeMl;
+    purification.phase === "ready" && !purification.stopReason && !centrifugeDraining && (!backend || !autoStartPending || levelSwitch === null);
 
   async function completeBatch() {
     if (!saved) {
@@ -1796,7 +1822,7 @@ export default function NewBatch() {
         Number(transTime) + (requiresEsterification ? Number(esterTime) * esterStagesRun : 0);
       const oilVolume = Number((oilVolumeMl ?? 0).toFixed(1));
       // Offline the website works out the yield itself from the output load cell; the Pi does it on its own.
-      const localOutputMl = !backend && outputWeightG > 0 ? Number((outputWeightG / 0.88).toFixed(1)) : undefined;
+      const localOutputMl = !backend && purification.outputG > 0 ? Number((purification.outputG / 0.88).toFixed(1)) : undefined;
       let result: BatchRecord;
       try {
         result = await saveCompletedBatch({
@@ -1819,30 +1845,34 @@ export default function NewBatch() {
           reactionTime: Number(transTime),
           stirringSpeed: Number(transStirring),
           voltage: Number(transVoltage),
+          current: Number(transCurrent),
           methanolRatio: ratio,
           esterificationVoltage: requiresEsterification ? Number(esterVoltage) : undefined,
           esterificationTime: requiresEsterification ? Number(esterTime) : undefined,
           esterificationStirring: requiresEsterification ? Number(esterStirring) : undefined,
+          esterificationCurrent: requiresEsterification ? Number(esterCurrent) : undefined,
           catalystType: catalyst,
           purification: {
-            targetTemperature: Number(targetTemperature),
-            highestTemperature,
-            heatingTimeSeconds,
-            holdTimeSeconds:
-              Math.round(purificationSettings.holdTimeMinutes * 60) - holdRemainingSeconds,
-            flowTimeSeconds: flowElapsedSeconds,
-            drainTimeSeconds: drainElapsedSeconds,
-            expectedBiodieselMl: shownBiodieselMl,
-            plannedFlowSeconds: shownPlannedFlowSeconds,
-            automatic: purificationAutomatic,
-            warning: purificationWarning,
-            safetyStopOccurred,
-            stirringSpeed: transferSettings.stirringSpeed,
-            outputWeightG: outputWeightG || null,
+            targetTemperature: PROCESS_CONFIG.purification.holdTemperature,
+            highestTemperature: purification.highest ?? 0,
+            heatingTimeSeconds: purification.heatingSeconds,
+            holdTimeSeconds: purification.methanolSeconds,
+            drainTimeSeconds: purification.drainSeconds,
+            contactTimeSeconds: purification.contactSeconds,
+            settlingTimeSeconds: purification.settlingSeconds,
+            coolingTimeSeconds: purification.coolingSeconds,
+            magnesolG,
+            magnesolAdded: true,
+            automatic: purification.automatic,
+            warning: purification.warning,
+            safetyStopOccurred: purification.stopOccurred,
+            stirringSpeed: PROCESS_CONFIG.purification.stirringSpeedRpm,
+            outputWeightG: purification.outputG || null,
+            oilWeightG: purification.oilG ?? Number(oilMassG.toFixed(1)),
           },
         });
       } catch (error) {
-        setActionError(errorText(error));
+        setActionError(errorText(t, error));
         return;
       }
       setSavedBatch(result);
@@ -1851,16 +1881,21 @@ export default function NewBatch() {
     next();
   }
 
+  const p = PROCESS_CONFIG.purification;
+  const purifying = PURIFYING.includes(purification.phase);
+  const purificationStepIndex = PURIFICATION_STEPS.findIndex(([phase]) => phase === purification.phase);
+  const stepLabel = purificationStepIndex >= 0 ? PURIFICATION_STEPS[purificationStepIndex][1] : null;
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <div className="section-kicker">Batch {batchId}</div>
-          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">Process</Heading>
-          <p className="mt-2 text-sm text-gray-500">Guided electrochemical biodiesel production workflow.</p>
+          <div className="section-kicker">{t("Batch {id}", { id: batchId })}</div>
+          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Process")}</Heading>
+          <p className="mt-2 text-sm text-gray-500">{t("Guided electrochemical biodiesel production workflow.")}</p>
         </div>
         <Status tone={currentStage === "Process Complete" ? "green" : "blue"}>
-          {currentStage === "Process Complete" ? "Completed" : currentStage}
+          {currentStage === "Process Complete" ? t("Completed") : t(currentStage)}
         </Status>
       </div>
       <Stepper steps={steps} step={step} />
@@ -1868,24 +1903,24 @@ export default function NewBatch() {
       {actionError && (
         <div role="alert" className="flex items-start justify-between gap-4 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-4 text-sm text-red-300">
           <span>{actionError}</span>
-          <button type="button" className="text-xs text-gray-400 hover:text-white" onClick={() => setActionError(null)}>Dismiss</button>
+          <button type="button" className="text-xs text-gray-400 hover:text-white" onClick={() => setActionError(null)}>{t("Dismiss")}</button>
         </div>
       )}
 
       {currentStage === "Before You Start" && (
         <div className="space-y-6">
           <SectionHeader
-            eyebrow="Process introduction"
-            title="Before You Start"
-            description="Greenova checks the system automatically. Review the safety guidance before preparing your batch."
+            eyebrow={t("Process introduction")}
+            title={t("Before You Start")}
+            description={t("Greenova checks the system automatically. Review the safety guidance before preparing your batch.")}
           />
           <Card className="p-6 sm:p-8">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
-                <Heading as="h2" className="text-lg font-semibold">System Status</Heading>
-                <p className="mt-1 text-sm text-gray-500">Read-only prototype channels update automatically.</p>
+                <Heading as="h2" className="text-lg font-semibold">{t("System Status")}</Heading>
+                <p className="mt-1 text-sm text-gray-500">{t("Read-only prototype channels update automatically.")}</p>
               </div>
-              <Status tone={realHardware ? "green" : "yellow"}>{backend ? (mock ? "Demonstration backend" : "Live hardware") : "Demonstration mode"}</Status>
+              <Status tone={realHardware ? "green" : "yellow"}>{backend ? (mock ? t("Demonstration backend") : t("Live hardware")) : t("Demonstration mode")}</Status>
             </div>
             <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {tiles.map((tile) => <ReadOnlyTile key={tile.label} {...tile} />)}
@@ -1895,29 +1930,29 @@ export default function NewBatch() {
                 <StateDot state={systemReady ? "ready" : fault ? "fault" : "checking"} />
                 <div>
                   <div className={`font-display font-semibold ${systemReady ? "text-green-400" : fault ? "text-red-400" : "text-amber-400"}`}>
-                    {systemReady ? "System Ready" : fault ? "System Fault / Not Ready" : "Checking system"}
+                    {systemReady ? t("System Ready") : fault ? t("System Fault / Not Ready") : t("Checking system")}
                   </div>
-                  <p className="mt-1 text-sm text-gray-400">Automatic safety monitoring must remain active throughout the process.</p>
-                  <p className="mt-2 text-xs leading-5 text-gray-600">A Ready display does not energize the reactor. The controller must verify all required interlocks before power is enabled.</p>
+                  <p className="mt-1 text-sm text-gray-400">{t("Automatic safety monitoring must remain active throughout the process.")}</p>
+                  <p className="mt-2 text-xs leading-5 text-gray-600">{t("A Ready display does not energize the reactor. The controller must verify all required interlocks before power is enabled.")}</p>
                 </div>
               </div>
             </div>
           </Card>
 
           <Card className="border-amber-400/15 p-6 sm:p-8">
-            <Heading as="h2" className="text-lg font-semibold">Safety Guidance</Heading>
-            <p className="mt-1 text-sm text-gray-500">Review the approved laboratory procedures before starting.</p>
+            <Heading as="h2" className="text-lg font-semibold">{t("Safety Guidance")}</Heading>
+            <p className="mt-1 text-sm text-gray-500">{t("Review the approved laboratory procedures before starting.")}</p>
             <div className="mt-6 grid gap-7 lg:grid-cols-3">
               {SAFETY_GROUPS.map((group) => (
                 <div key={group.title}>
-                  <div className="border-b border-amber-400/15 pb-3 text-xs font-semibold uppercase tracking-[0.12em] text-amber-400">{group.title}</div>
+                  <div className="border-b border-amber-400/15 pb-3 text-xs font-semibold uppercase tracking-[0.12em] text-amber-400">{t(group.title)}</div>
                   <div className="mt-4 space-y-4">
                     {group.items.map(([title, description]) => (
                       <div key={title} className="flex gap-3">
                         <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-amber-400/25 text-[10px] font-bold text-amber-400">i</div>
                         <div>
-                          <div className="text-sm font-medium text-gray-300">{title}</div>
-                          <p className="mt-1 text-xs leading-5 text-gray-500">{description}</p>
+                          <div className="text-sm font-medium text-gray-300">{t(title)}</div>
+                          <p className="mt-1 text-xs leading-5 text-gray-500">{t(description)}</p>
                         </div>
                       </div>
                     ))}
@@ -1927,8 +1962,8 @@ export default function NewBatch() {
             </div>
           </Card>
           <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <Link to="/dashboard" className="btn-ghost justify-center">Back to Dashboard</Link>
-            <Button onClick={next}>Continue →</Button>
+            <Link to="/dashboard" className="btn-ghost justify-center">{t("Back to Dashboard")}</Link>
+            <Button onClick={next}>{t("Continue")} →</Button>
           </div>
         </div>
       )}
@@ -1936,52 +1971,52 @@ export default function NewBatch() {
       {currentStage === "Volume & Parameters" && (
         <div className="space-y-6">
           <SectionHeader
-            eyebrow="Operator setup"
-            title="Volume & Parameters"
-            description="Review the live oil measurement, enter the test-strip FFA result, and configure the validated operating parameters."
+            eyebrow={t("Operator setup")}
+            title={t("Volume & Parameters")}
+            description={t("Review the live oil measurement, enter the test-strip FFA result, and configure the validated operating parameters.")}
           />
           <div className="grid gap-6 xl:grid-cols-2">
             <Card className="p-6 sm:p-8">
-              <Heading as="h2" className="text-lg font-semibold">1. Oil Input</Heading>
-              <p className="mt-1 text-sm text-gray-500">Pour the oil through the inlet filter. The reactor load cell is authoritative for the actual oil mass.</p>
+              <Heading as="h2" className="text-lg font-semibold">{t("1. Oil Input")}</Heading>
+              <p className="mt-1 text-sm text-gray-500">{t("Pour the oil through the inlet filter. The reactor load cell is authoritative for the actual oil mass.")}</p>
               <div className="mt-6 grid gap-4 sm:grid-cols-2">
                 <ReadOnlyTile label="Live oil mass" value={`${oilMassG.toFixed(1)} g`} secondary={realHardware ? "Reactor load cell · live" : "Reactor load cell · demonstration channel"} state={oilMassG > 0 ? "ready" : "checking"} />
-                <ReadOnlyTile label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} secondary={`Configured density: ${PROCESS_CONFIG.oil.densityGPerMl} g/mL · assumed`} state={oilMassG > 0 ? "ready" : "checking"} />
+                <ReadOnlyTile label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} secondary={t("Configured density: {density} g/mL · assumed", { density: PROCESS_CONFIG.oil.densityGPerMl })} state={oilMassG > 0 ? "ready" : "checking"} />
               </div>
               <div className="mt-5">
-                <Field label="Target batch volume" inputMode="decimal" value={targetVolume} onChange={(event) => { setTargetVolume(event.target.value); unconfirmOil(); }} unit="mL" aria-invalid={Boolean(targetError)} />
-                <p className={`mt-2 text-xs ${targetError ? "text-red-400" : "text-gray-600"}`}>{targetError || "Supported prototype capacity: 100–1,000 mL."}</p>
+                <Field label={t("Target batch volume")} inputMode="decimal" value={targetVolume} onChange={(event) => { setTargetVolume(event.target.value); setConfirmedOilG(null); }} unit="mL" aria-invalid={Boolean(targetError)} />
+                <p className={`mt-2 text-xs ${targetError ? "text-red-400" : "text-gray-600"}`}>{targetError || t("Supported prototype capacity: 100–1,000 mL.")}</p>
               </div>
               <div className="mt-5 flex flex-wrap items-center gap-3">
-                {!realHardware && <Button variant="secondary" disabled={Boolean(targetError)} onClick={loadDemoReading}>Load demonstration sensor reading</Button>}
-                {realHardware ? <Status>Live load cell</Status> : <Status tone="yellow">Not live hardware</Status>}
+                {!realHardware && <Button variant="secondary" disabled={Boolean(targetError)} onClick={loadDemoReading}>{t("Load demonstration sensor reading")}</Button>}
+                {realHardware ? <Status>{t("Live load cell")}</Status> : <Status tone="yellow">{t("Not live hardware")}</Status>}
               </div>
               {measuredOilError && <p className="mt-3 text-xs text-red-400">{measuredOilError}</p>}
             </Card>
 
             <Card className="p-6 sm:p-8">
-              <Heading as="h2" className="text-lg font-semibold">2. FFA Measurement</Heading>
-              <p className="mt-1 text-sm text-gray-500">Measure the feedstock using the FFA test strips, then enter the observed result. The strip reads up to {chemistrySettings.stripMaxFfa}%.</p>
+              <Heading as="h2" className="text-lg font-semibold">{t("2. FFA Measurement")}</Heading>
+              <p className="mt-1 text-sm text-gray-500">{t("Measure the feedstock using the FFA test strips, then enter the observed result. The strip reads up to {max}%.", { max: chemistrySettings.stripMaxFfa })}</p>
               <div className="mt-6">
-                <Field label="FFA Percentage" inputMode="decimal" value={ffaAboveStrip ? String(chemistrySettings.stripMaxFfa) : ffa} disabled={ffaAboveStrip} onChange={(event) => setFfa(event.target.value)} unit="%" aria-invalid={Boolean(ffaError)} />
+                <Field label={t("FFA Percentage")} inputMode="decimal" value={ffaAboveStrip ? String(chemistrySettings.stripMaxFfa) : ffa} disabled={ffaAboveStrip} onChange={(event) => setFfa(event.target.value)} unit="%" aria-invalid={Boolean(ffaError)} />
                 {ffaError && <p className="mt-2 text-xs text-red-400">{ffaError}</p>}
                 {!ffaError && !ffaAboveStrip && ffaNumber > chemistrySettings.stripMaxFfa && (
-                  <p className="mt-2 text-xs text-amber-400">The strip reads only up to {chemistrySettings.stripMaxFfa}%. If it shows its darkest color, tick the box below.</p>
+                  <p className="mt-2 text-xs text-amber-400">{t("The strip reads only up to {max}%. If it shows its darkest color, tick the box below.", { max: chemistrySettings.stripMaxFfa })}</p>
                 )}
                 <label className="mt-4 flex items-center gap-2 text-sm text-gray-300">
                   <input className="gv-checkbox" type="checkbox" checked={ffaAboveStrip} onChange={(event) => setFfaAboveStrip(event.target.checked)} />
-                  The strip shows its darkest color ({chemistrySettings.stripMaxFfa}% or more)
+                  {t("The strip shows its darkest color ({max}% or more)", { max: chemistrySettings.stripMaxFfa })}
                 </label>
               </div>
               {!ffaError && (
                 <div className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.025] p-4">
-                  <div className="gv-label">Pathway decision · threshold {PROCESS_CONFIG.ffaThreshold.toFixed(1)}%</div>
+                  <div className="gv-label">{t("Pathway decision · threshold {value}%", { value: PROCESS_CONFIG.ffaThreshold.toFixed(1) })}</div>
                   <p className="text-sm text-gray-300">
                     {ffaAboveStrip
-                      ? `FFA ${chemistrySettings.stripMaxFfa}% or more (recorded as ≥ ${chemistrySettings.stripMaxFfa}%). Esterification with the uniform dose for ${chemistrySettings.designFfa}% FFA, then an FFA re-check.`
+                      ? t("FFA {max}% or more (recorded as ≥ {max}%). Esterification with the uniform dose for {design}% FFA, then an FFA re-check.", { max: chemistrySettings.stripMaxFfa, design: chemistrySettings.designFfa })
                       : requiresEsterification
-                        ? `Esterification required before transesterification: the uniform dose for ${chemistrySettings.designFfa}% FFA, then an FFA re-check.`
-                        : "Proceed directly to transesterification."}
+                        ? t("Esterification required before transesterification: the uniform dose for {design}% FFA, then an FFA re-check.", { design: chemistrySettings.designFfa })
+                        : t("Proceed directly to transesterification.")}
                   </p>
                 </div>
               )}
@@ -1991,16 +2026,16 @@ export default function NewBatch() {
           <Card className="p-6 sm:p-8">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
-                <Heading as="h2" className="text-lg font-semibold">3. Chemical Quantity Calculator</Heading>
-                <p className="mt-1 text-sm text-gray-500">Calculated values are planning quantities, not actual dispensed amounts.</p>
+                <Heading as="h2" className="text-lg font-semibold">{t("3. Chemical Quantity Calculator")}</Heading>
+                <p className="mt-1 text-sm text-gray-500">{t("Calculated values are planning quantities, not actual dispensed amounts.")}</p>
               </div>
-              <Status tone="neutral">Read only calculations</Status>
+              <Status tone="neutral">{t("Read only calculations")}</Status>
             </div>
             <div className="mt-6 grid gap-5 sm:grid-cols-2">
-              <SelectField label="Methanol-to-oil ratio" value={ratio} onChange={(event) => setRatio(Number(event.target.value))}>
+              <SelectField label={t("Methanol-to-oil ratio")} value={ratio} onChange={(event) => setRatio(Number(event.target.value))}>
                 {[6, 7, 8, 9].map((value) => <option key={value} value={value}>{value}:1</option>)}
               </SelectField>
-              <SelectField label="Base catalyst" value={catalyst} onChange={(event) => setCatalyst(event.target.value as "NaOH" | "KOH")}>
+              <SelectField label={t("Base catalyst")} value={catalyst} onChange={(event) => setCatalyst(event.target.value as "NaOH" | "KOH")}>
                 <option value="NaOH">NaOH</option>
                 <option value="KOH">KOH</option>
               </SelectField>
@@ -2008,12 +2043,12 @@ export default function NewBatch() {
 
             <div className="mt-7">
               <div className="mb-3 flex items-center justify-between gap-3">
-                <Heading as="h3" className="text-base font-semibold">Esterification</Heading>
-                {calculatorReady && requiresEsterification && <Status tone="yellow">Uniform dose · {calculatorValues.doseFfa}% design FFA</Status>}
+                <Heading as="h3" className="text-base font-semibold">{t("Esterification")}</Heading>
+                {calculatorReady && requiresEsterification && <Status tone="yellow">{t("Uniform dose · {design}% design FFA", { design: calculatorValues.doseFfa })}</Status>}
               </div>
               {calculatorReady && !requiresEsterification ? (
                 <div className="rounded-xl border border-white/[0.07] bg-white/[0.025] p-5 text-sm text-gray-500">
-                  Esterification not needed — FFA is 4% or below.
+                  {t("Esterification not needed — FFA is 4% or below.")}
                 </div>
               ) : (
                 <>
@@ -2021,12 +2056,12 @@ export default function NewBatch() {
                     <ReadOnlyTile
                       label="Methanol"
                       value={calculatorReady ? `${calculatorValues.esterificationMethanolMl.toFixed(1)} mL` : "—"}
-                      secondary={calculatorReady ? `20:1 methanol to FFA · dosed for ${calculatorValues.doseFfa}% FFA: ${calculatorValues.ffaMassG.toFixed(1)} g × 2.84` : undefined}
+                      secondary={calculatorReady ? t("20:1 methanol to FFA · dosed for {dose}% FFA: {grams} g × 2.84", { dose: calculatorValues.doseFfa, grams: calculatorValues.ffaMassG.toFixed(1) }) : undefined}
                     />
                     <ReadOnlyTile
                       label="Sulfuric acid 98%"
                       value={calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—"}
-                      secondary={calculatorReady ? `5% of the dose's FFA weight · ${calculatorValues.ffaMassG.toFixed(1)} g × 0.027` : undefined}
+                      secondary={calculatorReady ? t("5% of the dose's FFA weight · {grams} g × 0.027", { grams: calculatorValues.ffaMassG.toFixed(1) }) : undefined}
                     />
                     <ReadOnlyTile
                       label="Acetone"
@@ -2036,7 +2071,7 @@ export default function NewBatch() {
                   </div>
                   {calculatorReady && requiresEsterification && (
                     <p className="mt-3 text-xs leading-5 text-gray-500">
-                      Every batch above {PROCESS_CONFIG.ffaThreshold}% FFA gets this dose, because the strip can't measure above {chemistrySettings.stripMaxFfa}%. It covers oil up to {chemistrySettings.designFfa}% FFA. Pump B loads it as one premix ({calculatorValues.esterificationPremixG.toFixed(1)} g). After the stage, an FFA re-check decides: at or below {chemistrySettings.ffaTarget}%, transesterification with the exact catalyst; above it, another stage dosed for the reading.
+                      {t("Every batch above {threshold}% FFA gets this dose, because the strip can't measure above {max}%. It covers oil up to {design}% FFA. Pump B loads it as one premix ({premix} g). After the stage, an FFA re-check decides: at or below {target}%, transesterification with the exact catalyst; above it, another stage dosed for the reading.", { threshold: PROCESS_CONFIG.ffaThreshold, max: chemistrySettings.stripMaxFfa, design: chemistrySettings.designFfa, premix: calculatorValues.esterificationPremixG.toFixed(1), target: chemistrySettings.ffaTarget })}
                     </p>
                   )}
                 </>
@@ -2045,25 +2080,25 @@ export default function NewBatch() {
 
             <div className="mt-7 border-t border-white/[0.07] pt-7">
               <div className="mb-3 flex items-center justify-between gap-3">
-                <Heading as="h3" className="text-base font-semibold">Transesterification</Heading>
+                <Heading as="h3" className="text-base font-semibold">{t("Transesterification")}</Heading>
                 <span className="text-xs text-gray-600">
-                  Oil molar mass: {chemistrySettings.oilMolarMass} g/mol
+                  {t("Oil molar mass: {value} g/mol", { value: chemistrySettings.oilMolarMass })}
                 </span>
               </div>
               <div className="grid gap-4 md:grid-cols-3">
                 <ReadOnlyTile
                   label="Methanol"
                   value={calculatorReady ? `${calculatorValues.transesterificationMethanolMl.toFixed(1)} mL` : "—"}
-                  secondary={calculatorReady ? `${ratio}:1 molar ratio · ${oilMassG.toFixed(1)} g oil` : undefined}
+                  secondary={calculatorReady ? t("{ratio}:1 molar ratio · {grams} g oil", { ratio, grams: oilMassG.toFixed(1) }) : undefined}
                 />
                 <ReadOnlyTile
-                  label={`${catalyst} to weigh`}
-                  value={calculatorReady ? `${requiresEsterification ? "Up to " : ""}${calculatorValues.catalystToWeighG.toFixed(1)} g` : "—"}
+                  label={t("{catalyst} to weigh", { catalyst })}
+                  value={calculatorReady ? `${requiresEsterification ? t("Up to") + " " : ""}${calculatorValues.catalystToWeighG.toFixed(1)} g` : "—"}
                   secondary={
                     calculatorReady
                       ? requiresEsterification
-                        ? `${calculatorValues.catalystBaseG.toFixed(1)} g catalyst + up to ${calculatorValues.neutralizationG.toFixed(1)} g to neutralize acid · final amount after the FFA re-check`
-                        : `${calculatorValues.catalystBaseG.toFixed(1)} g catalyst + ${calculatorValues.neutralizationG.toFixed(1)} g to neutralize FFA · ${calculatorValues.purity}% purity · pump A premix ${calculatorValues.transesterificationPremixG.toFixed(1)} g`
+                        ? t("{base} g catalyst + up to {neutral} g to neutralize acid · final amount after the FFA re-check", { base: calculatorValues.catalystBaseG.toFixed(1), neutral: calculatorValues.neutralizationG.toFixed(1) })
+                        : t("{base} g catalyst + {neutral} g to neutralize FFA · {purity}% purity · pump A premix {premix} g", { base: calculatorValues.catalystBaseG.toFixed(1), neutral: calculatorValues.neutralizationG.toFixed(1), purity: calculatorValues.purity, premix: calculatorValues.transesterificationPremixG.toFixed(1) })
                       : undefined
                   }
                 />
@@ -2074,71 +2109,92 @@ export default function NewBatch() {
                 />
               </div>
             </div>
+
+            <div className="mt-7 border-t border-white/[0.07] pt-7">
+              <Heading as="h3" className="mb-3 text-base font-semibold">{t("Purification")}</Heading>
+              <div className="grid gap-4 md:grid-cols-3">
+                <ReadOnlyTile
+                  label="Magnesol (dry wash)"
+                  value={calculatorReady ? `${calculatorValues.magnesolG.toFixed(1)} g` : "—"}
+                  secondary={calculatorReady ? t("Oil volume × 0.0092 (1% of the biodiesel)") : undefined}
+                />
+              </div>
+            </div>
           </Card>
 
           <Card className="p-6 sm:p-8">
-            <Heading as="h2" className="text-lg font-semibold">4. Reaction Parameters</Heading>
-            <p className="mt-1 text-sm text-gray-500">Temperature is monitored live and is not an operator-configurable parameter.</p>
+            <Heading as="h2" className="text-lg font-semibold">{t("4. Reaction Parameters")}</Heading>
+            <p className="mt-1 text-sm text-gray-500">{t("Temperature is monitored live and is not an operator-configurable parameter.")}</p>
             <div className={`mt-6 grid gap-6 ${requiresEsterification ? "xl:grid-cols-2" : ""}`}>
               {requiresEsterification && (
                 <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-5">
-                  <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">Esterification Settings</Heading><Status tone="yellow">Pump B · acid + methanol</Status></div>
-                  <div className="mt-5 grid gap-5 sm:grid-cols-3">
+                  <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">{t("Esterification Settings")}</Heading><Status tone="yellow">{t("Pump B · acid + methanol")}</Status></div>
+                  <div className="mt-5 grid gap-5 sm:grid-cols-2">
                     <ParameterField label="Voltage" value={esterVoltage} setValue={setEsterVoltage} unit="V" limits={PROCESS_CONFIG.esterification.voltage} />
+                    <ParameterField label="Current" value={esterCurrent} setValue={setEsterCurrent} unit="A" limits={PROCESS_CONFIG.esterification.current} />
                     <ParameterField label="Reaction time" value={esterTime} setValue={setEsterTime} unit="min" limits={PROCESS_CONFIG.esterification.time} />
                     <ParameterField label="Stirring speed" value={esterStirring} setValue={setEsterStirring} unit="RPM" limits={PROCESS_CONFIG.esterification.stirring} />
                   </div>
-                  <p className="mt-4 text-xs text-amber-400">Sulfuric acid (98%): {calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—"}, mixed by hand into the methanol in tank B. Pump B loads the premix into the reactor.</p>
+                  <p className="mt-4 text-xs text-amber-400">{t("Sulfuric acid (98%): {ml}, mixed by hand into the methanol in tank B. Pump B loads the premix into the reactor.", { ml: calculatorReady ? `${calculatorValues.sulfuricAcidMl.toFixed(2)} mL` : "—" })}</p>
                 </div>
               )}
               <div className="rounded-xl border border-green-500/15 bg-green-500/[0.025] p-5">
-                <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">Transesterification Settings</Heading><Status tone="green">Project defaults</Status></div>
-                <div className="mt-5 grid gap-5 sm:grid-cols-3">
+                <div className="flex items-center justify-between gap-3"><Heading as="h3" className="text-base font-semibold">{t("Transesterification Settings")}</Heading><Status tone="green">{t("Project defaults")}</Status></div>
+                <div className="mt-5 grid gap-5 sm:grid-cols-2">
                   <ParameterField label="Voltage" value={transVoltage} setValue={setTransVoltage} unit="V" limits={PROCESS_CONFIG.transesterification.voltage} />
+                  <ParameterField label="Current" value={transCurrent} setValue={setTransCurrent} unit="A" limits={PROCESS_CONFIG.transesterification.current} />
                   <ParameterField label="Reaction time" value={transTime} setValue={setTransTime} unit="min" limits={PROCESS_CONFIG.transesterification.time} />
                   <ParameterField label="Stirring speed" value={transStirring} setValue={setTransStirring} unit="RPM" limits={PROCESS_CONFIG.transesterification.stirring} />
                 </div>
               </div>
             </div>
+            <p className="mt-4 text-xs leading-5 text-gray-500">
+              {processConfigCurrentControl
+                ? t("The Pi sets the power supply's current limit to the current setting. The electrodes stop if the measured current goes above it.")
+                : t("Set the power supply's current limit to the current setting before each stage. The electrodes stop if the measured current goes above it.")}
+            </p>
           </Card>
-          <div className="flex justify-end"><Button disabled={!parametersValid} onClick={next}>Continue to Oil Loading →</Button></div>
+          <div className="flex justify-end"><Button disabled={!parametersValid} onClick={next}>{t("Continue to Oil Loading")} →</Button></div>
         </div>
       )}
 
       {currentStage === "Oil Loading" && (
         <Card className="p-6 sm:p-8">
-          <SectionHeader eyebrow="Manual stage" title="Oil Loading" description="Pour the oil through the inlet filter while the reactor load cell weighs it. Confirm to record the oil weight; the calculations use it from then on." />
+          <SectionHeader eyebrow={t("Manual stage")} title={t("Oil Loading")} description={t("Pour the oil through the inlet filter while the reactor load cell weighs it.")} />
           <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Card className="p-5"><Metric label="Target oil volume" value={`${Number(targetVolume).toFixed(1)} mL`} /></Card>
-            <Card className="p-5"><Metric label="Live measured mass" value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? "Live load-cell data" : "Demonstration load-cell data"} /></Card>
-            <Card className="p-5"><Metric label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} sub="Using configured assumed density" /></Card>
-            <Card className="p-5"><Metric label="Loading status" value={loadingConfirmed ? "Quantity confirmed" : loadingStatus} accent={targetReached} /></Card>
+            <Card className="p-5"><Metric label={t("Target oil volume")} value={`${Number(targetVolume).toFixed(1)} mL`} /></Card>
+            <Card className="p-5"><Metric label={t("Live measured mass")} value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? t("Live load-cell data") : t("Demonstration load-cell data")} /></Card>
+            <Card className="p-5"><Metric label={t("Converted volume")} value={oilVolumeMl === null ? t("Unavailable") : `${oilVolumeMl.toFixed(1)} mL`} sub={t("Using configured assumed density")} /></Card>
+            <Card className="p-5"><Metric label={t("Loading status")} value={loadingStatus} accent={targetReached} /></Card>
           </div>
           <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <div className="gv-label">Load-cell status</div>
-                <p className="text-sm text-gray-300">{targetReached ? "Required quantity detected within ±2% tolerance." : "Continue loading until the target quantity is detected."}</p>
+                <div className="gv-label">{t("Load-cell status")}</div>
+                <p className="text-sm text-gray-300">{targetReached ? t("Required quantity detected within ±2% tolerance.") : t("Continue loading until the target quantity is detected.")}</p>
               </div>
               <Status tone={targetReached ? "green" : measuredOilError ? "red" : "yellow"}>{loadingStatus}</Status>
             </div>
           </div>
           <div className="mt-7 flex flex-wrap gap-3">
-            {!targetReached && !realHardware && <Button variant="secondary" onClick={loadDemoReading}>Simulate target reading</Button>}
-            <Button disabled={!targetReached || loadingConfirmed} onClick={() => { setLoadingConfirmed(true); setConfirmedOilG(reactorG); }} variant={loadingConfirmed ? "secondary" : "primary"}>{loadingConfirmed ? "Quantity confirmed" : "Confirm detected quantity"}</Button>
-            {loadingConfirmed && <Button onClick={next}>Continue to {requiresEsterification ? "Esterification" : "Transesterification"} →</Button>}
+            {!targetReached && !realHardware && <Button variant="secondary" onClick={loadDemoReading}>{t("Simulate target reading")}</Button>}
+            <Button
+              disabled={!targetReached}
+              onClick={() => {
+                setConfirmedOilG(reactorG);
+                next();
+              }}
+            >
+              {requiresEsterification ? t("Continue to Esterification") : t("Continue to Transesterification")} →
+            </Button>
           </div>
-          {loadingConfirmed && (
-            <p className="mt-3 text-xs leading-5 text-gray-500">Oil recorded: {oilMassG.toFixed(1)} g. The load cell keeps weighing everything added from now on (acetone and the pumped doses).</p>
-          )}
         </Card>
       )}
 
       {currentStage === "Esterification" && doseKey && (() => {
         const key = doseKey;
         const run = pumpRunFor(key);
-        const loaded = doseLoaded(key, esterDoseNow.premixG);
-        const reactorDraining = draining("reactor_outlet");
+        const autoUsed = autoStageStarted.current.has(key);
         return (
           <ReactionStage
             kind="Esterification"
@@ -2153,39 +2209,35 @@ export default function NewBatch() {
             transDose={transDoseNow}
             transExact={transExact}
             voltage={Number(esterVoltage)}
+            current={Number(esterCurrent)}
             time={Number(esterTime)}
             stirring={Number(esterStirring)}
             batchId={batchId}
             onContinue={next}
             liveStage={liveStageFor("Esterification")}
-            connected={backend}
-            liveMock={mock}
+            sourceLabel={sourceLabel}
             onReset={() => resetStage(setEsterState)}
-            startBlocked={run?.phase === "pumping" ? "Pump B is still loading." : !loaded ? "Load the dose with pump B first (or tick that you added it by hand)." : null}
+            hideStart={!autoUsed}
+            startBlocked={!doseIn ? t("The dose isn't loaded yet.") : null}
             hideContinue
             preparation={
-              <DosingPanel
+              <LoadingPanel
                 pump="acid"
-                premixParts={[`${esterDoseNow.methanolMl.toFixed(1)} mL methanol`, `${esterDoseNow.sulfuricAcidMl.toFixed(2)} mL sulfuric acid (98%)`]}
-                mixingNote="Pour the acid slowly into the methanol while stirring (never the other way round); it gets warm."
+                premixParts={[`${esterDoseNow.methanolMl.toFixed(1)} mL ${t("methanol")}`, `${esterDoseNow.sulfuricAcidMl.toFixed(2)} mL H₂SO₄`]}
                 targetG={esterDoseNow.premixG}
-                premixMl={esterDoseNow.premixMl}
                 run={run}
-                completedG={loads[key]?.completedG ?? 0}
-                manual={loads[key]?.manual ?? false}
-                setManual={(value) => setManualDose(key, value)}
-                onLoad={() => loadDose(key, "acid", esterDoseNow.premixG, esterDoseNow.premixMl)}
-                onStop={stopPump}
+                deliveredG={pumpedG(key)}
+                onRetry={() => loadDose(key, "acid", esterDoseNow.premixG, esterDoseNow.premixMl)}
                 onSkip={realHardware ? undefined : skipPump}
-                locked={reactorDraining ? "The reactor outlet is open." : pumpRunning && run?.phase !== "pumping" ? "The other pump is running." : null}
-                acetone={esterStage === 1 && esterDoseNow.acetoneG > 0 ? {
+                acetone={acetoneNeeded ? {
                   ml: esterDoseNow.acetoneMl,
                   g: esterDoseNow.acetoneG,
                   addedG: acetonePouredG(key),
                   onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(esterDoseNow.acetoneG - acetonePouredG(key)),
                 } : null}
-                reactorG={reactorG}
-                live={realHardware}
+                current={Number(esterCurrent)}
+                currentByHand={!processConfigCurrentControl}
+                status={autoUsed ? "loaded" : doseIn && acetoneOk ? "starting" : "loading"}
               />
             }
             footer={esterState === "complete" ? (
@@ -2209,7 +2261,7 @@ export default function NewBatch() {
       {currentStage === "Transesterification" && doseKey && (() => {
         const key = doseKey;
         const run = pumpRunFor(key);
-        const loaded = doseLoaded(key, transDoseNow.premixG);
+        const autoUsed = autoStageStarted.current.has(key);
         return (
           <ReactionStage
             kind="Transesterification"
@@ -2223,49 +2275,44 @@ export default function NewBatch() {
             transDose={transDoseNow}
             transExact={transExact}
             voltage={Number(transVoltage)}
+            current={Number(transCurrent)}
             time={Number(transTime)}
             stirring={Number(transStirring)}
             batchId={batchId}
             onContinue={next}
             liveStage={liveStageFor("Transesterification")}
-            connected={backend}
-            liveMock={mock}
+            sourceLabel={sourceLabel}
             onReset={() => resetStage(setTransState)}
-            startBlocked={run?.phase === "pumping" ? "Pump A is still loading." : !loaded ? "Load the dose with pump A first (or tick that you added it by hand)." : null}
+            hideStart={!autoUsed}
+            startBlocked={!doseIn ? t("The dose isn't loaded yet.") : null}
+            hideContinue
             preparation={
-              <DosingPanel
+              <LoadingPanel
                 pump="catalyst"
-                premixParts={[`${transDoseNow.catalystToWeighG.toFixed(2)} g ${catalyst}`, `${transDoseNow.methanolMl.toFixed(1)} mL methanol`]}
-                mixingNote={`Stir until the ${catalyst} has fully dissolved; it gets warm.`}
+                premixParts={[`${transDoseNow.catalystToWeighG.toFixed(2)} g ${catalyst}`, `${transDoseNow.methanolMl.toFixed(1)} mL ${t("methanol")}`]}
                 targetG={transDoseNow.premixG}
-                premixMl={transDoseNow.premixMl}
                 run={run}
-                completedG={loads[key]?.completedG ?? 0}
-                manual={loads[key]?.manual ?? false}
-                setManual={(value) => setManualDose(key, value)}
-                onLoad={() => loadDose(key, "catalyst", transDoseNow.premixG, transDoseNow.premixMl)}
-                onStop={stopPump}
+                deliveredG={pumpedG(key)}
+                onRetry={() => loadDose(key, "catalyst", transDoseNow.premixG, transDoseNow.premixMl)}
                 onSkip={realHardware ? undefined : skipPump}
-                locked={draining("reactor_outlet") ? "The reactor outlet is open." : pumpRunning && run?.phase !== "pumping" ? "The other pump is running." : null}
-                acetone={transDoseNow.acetoneG > 0 ? {
+                acetone={acetoneNeeded ? {
                   ml: transDoseNow.acetoneMl ?? 0,
                   g: transDoseNow.acetoneG,
                   addedG: acetonePouredG(key),
                   onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(transDoseNow.acetoneG - acetonePouredG(key)),
                 } : null}
-                reactorG={reactorG}
-                live={realHardware}
+                current={Number(transCurrent)}
+                currentByHand={!processConfigCurrentControl}
+                status={autoUsed ? "loaded" : doseIn && acetoneOk ? "starting" : "loading"}
               />
             }
             footer={transState === "complete" ? (
-              <DrainPanel
-                valve="reactor_outlet"
-                view={drainViewFor("reactor_outlet")}
-                minutes={drainMinutes("reactor_outlet")}
-                onAgain={() => openDrainAgain("reactor_outlet")}
-                onStop={closeDrain}
-                onSkip={realHardware ? undefined : skipDrain}
-              />
+              <>
+                <ValveIndicator valve="reactor_outlet" view={reactorView} />
+                {reactorDrained && (
+                  <div className="mt-6"><Button onClick={next}>{t("Continue to Separation")} →</Button></div>
+                )}
+              </>
             ) : null}
           />
         );
@@ -2274,23 +2321,28 @@ export default function NewBatch() {
       {currentStage === "Separation" && (
         <Card className="p-6 sm:p-8">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <SectionHeader eyebrow={`Batch ${batchId}`} title="Separation" description="Separating biodiesel and glycerol." />
-            <Status tone={separationState === "complete" ? "green" : separationState === "fault" ? "red" : "blue"}>{separationState.toUpperCase()}</Status>
+            <SectionHeader eyebrow={t("Batch {id}", { id: batchId })} title={t("Separation")} description={t("Separating biodiesel and glycerol.")} />
+            <Status tone={separationState === "complete" ? "green" : separationState === "fault" ? "red" : "blue"}>{t({ ready: "READY", running: "RUNNING", paused: "PAUSED", complete: "COMPLETE", fault: "FAULT" }[separationState])}</Status>
           </div>
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-            <Card className="p-5"><Metric label="Configured duration" value={`${PROCESS_CONFIG.separation.timeMinutes} min`} /></Card>
-            <Card className="p-5"><Metric label="Configured speed" value={`${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} /></Card>
-            <Card className="p-5"><Metric label="Elapsed" value={liveSeparation ? formatTimer(liveSeparation.elapsedSeconds) : separationState === "complete" ? "10 min" : separationState === "running" ? "6 min" : "0 min"} /></Card>
-            <Card className="p-5"><Metric label="Remaining" value={liveSeparation ? formatTimer(liveSeparation.remainingSeconds) : separationState === "complete" ? "0 min" : separationState === "running" ? "4 min" : "10 min"} /></Card>
-            <Card className="p-5"><Metric label="Batch ID" value={batchId} sub={liveSeparation && liveSeparation.liveRpm != null ? `Centrifuge ${liveSeparation.liveRpm.toLocaleString()} RPM` : undefined} /></Card>
-          </div>
-          <div className="mt-6"><Progress value={liveSeparation && liveSeparation.timeMinutes ? (liveSeparation.elapsedSeconds / (liveSeparation.timeMinutes * 60)) * 100 : separationState === "complete" ? 100 : separationState === "running" ? 60 : 0} /></div>
-          <p className="mt-4 text-xs leading-5 text-gray-500">{liveSeparation ? (mock ? "Simulated by the Greenova backend (demo mode)." : "Live from the Raspberry Pi. The centrifuge stops by itself when the time is over.") : "Demonstration state only."} The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes and the centrifuge has stopped, its outlet valve opens by itself and the biodiesel flows to the purification tank; purification then starts by itself.</p>
-          {liveSeparation?.faultReason && <p className="mt-2 text-sm text-red-400">Stopped: {liveSeparation.faultReason}</p>}
-          {separationState === "ready" && drainViewFor("reactor_outlet") && (
-            <DrainPanel valve="reactor_outlet" view={drainViewFor("reactor_outlet")} minutes={drainMinutes("reactor_outlet")} onStop={closeDrain} onSkip={realHardware ? undefined : skipDrain} />
+          {separationState === "ready" && (
+            <div className="mt-8 grid gap-4 sm:grid-cols-2">
+              <Card className="p-5"><Metric label={t("Configured duration")} value={`${PROCESS_CONFIG.separation.timeMinutes} min`} /></Card>
+              <Card className="p-5"><Metric label={t("Configured speed")} value={`${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} /></Card>
+            </div>
           )}
-          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? "Start centrifuge" : "Record centrifuge start"} onContinue={next} continueLabel="Continue to Purification" onReset={() => resetStage(setSeparationState)} startBlocked={draining("reactor_outlet") ? "Wait for the reactor outlet to close: the reactor is still draining into the centrifuge." : null} />
+          {separationState !== "ready" && (
+            <LiveReadings
+              source={sourceLabel}
+              progress={liveSeparation && liveSeparation.timeMinutes ? (liveSeparation.elapsedSeconds / (liveSeparation.timeMinutes * 60)) * 100 : separationState === "complete" ? 100 : 60}
+              fault={liveSeparation?.faultReason}
+            >
+              <Metric label={t("Time remaining")} value={liveSeparation ? formatTimer(liveSeparation.remainingSeconds) : separationState === "complete" ? "0 min" : "4 min"} />
+              <Metric label={t("Centrifuge")} value={liveSeparation && liveSeparation.liveRpm != null ? `${liveSeparation.liveRpm.toLocaleString()} / ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM` : `${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
+            </LiveReadings>
+          )}
+          <p className="mt-4 text-xs leading-5 text-gray-500">{t("The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes and the centrifuge has stopped, its outlet valve opens by itself and the biodiesel flows to the purification tank; purification then starts by itself.")}</p>
+          {separationState === "ready" && reactorDraining && <ValveIndicator valve="reactor_outlet" view={reactorView} />}
+          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? t("Start centrifuge") : t("Record centrifuge start")} onContinue={next} continueLabel={t("Continue to Purification")} onReset={() => resetStage(setSeparationState)} startBlocked={reactorDraining ? t("Wait for the reactor outlet to close: the reactor is still draining into the centrifuge.") : null} />
         </Card>
       )}
 
@@ -2298,164 +2350,114 @@ export default function NewBatch() {
         <Card className="p-6 sm:p-8">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <SectionHeader
-              eyebrow={`Batch ${batchId}`}
-              title="Purification"
-              description={`Runs by itself: heats to ${Number(targetTemperature)} °C and holds ${purificationSettings.holdTimeMinutes} min with the dry wash stirrer running, to remove leftover methanol. Then the outlet valve lets the biodiesel through the activated-bentonite mesh bed into the biodiesel container, which the output load cell weighs. Confirm when it's finished.`}
+              eyebrow={t("Batch {id}", { id: batchId })}
+              title={t("Purification")}
+              description={t("Dry wash with Magnesol. It runs by itself: you only add the Magnesol when asked, then confirm at the end.")}
             />
-            <Status tone={purificationPhase === "complete" ? "green" : purificationPhase === "fault" ? "red" : PURIFYING.includes(purificationPhase) ? "yellow" : "neutral"}>
-              {purificationPhase === "flow" ? "MESH BED FLOW" : purificationPhase === "hold" ? "HOLDING" : purificationPhase === "drain" ? "DRAINING" : purificationPhase === "ready" ? "WAITING" : purificationPhase.toUpperCase()}
+            <Status tone={purification.phase === "complete" ? "green" : purification.phase === "fault" ? "red" : purifying ? "yellow" : "neutral"}>
+              {purification.phase === "ready" ? t("WAITING") : purification.phase === "fault" ? t("STOPPED") : t(stepLabel ?? "").toUpperCase()}
             </Status>
           </div>
 
-          <div className="mt-7 flex items-center">
-            {["Heating", "Holding", "Mesh bed flow", "Draining", "Complete"].map((label, index) => {
-              const activeIndex = { ready: 0, heating: 0, fault: 0, hold: 1, flow: 2, drain: 3, complete: 4 }[purificationPhase];
-              const done = index < activeIndex || purificationPhase === "complete";
-              return (
-                <div key={label} className="relative flex flex-1 flex-col items-center text-center">
-                  {index < 4 && <div className={`absolute left-1/2 top-3 h-px w-full ${index < activeIndex ? "bg-green-500/60" : "bg-white/10"}`} />}
-                  <div className={`relative z-10 h-6 w-6 rounded-full border ${done ? "border-green-500 bg-green-500" : index === activeIndex ? "border-green-400 bg-green-500/15" : "border-white/10 bg-gv-surface"}`} />
-                  <div className={`mt-2 text-xs ${index === activeIndex && !done ? "text-white" : done ? "text-green-400" : "text-gray-600"}`}>{label}</div>
-                </div>
-              );
-            })}
+          <div className="mt-7 overflow-x-auto">
+            <div className="flex min-w-[640px] items-center">
+              {PURIFICATION_STEPS.map(([phase, label], index) => {
+                const done = index < purificationStepIndex || purification.phase === "complete";
+                const active = index === purificationStepIndex && purification.phase !== "complete";
+                return (
+                  <div key={phase} className="relative flex flex-1 flex-col items-center text-center">
+                    {index < PURIFICATION_STEPS.length - 1 && <div className={`absolute left-1/2 top-3 h-px w-full ${index < purificationStepIndex ? "bg-green-500/60" : "bg-white/10"}`} />}
+                    <div className={`relative z-10 h-6 w-6 rounded-full border ${done ? "border-green-500 bg-green-500" : active ? "border-green-400 bg-green-500/15" : "border-white/10 bg-gv-surface"}`} />
+                    <div className={`mt-2 text-[11px] leading-4 ${active ? "text-white" : done ? "text-green-400" : "text-gray-600"}`}>{t(label)}</div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
-          {(purificationPhase === "ready" || centrifugeDraining) && drainViewFor("centrifuge_outlet") && (
-            <DrainPanel
-              valve="centrifuge_outlet"
-              view={drainViewFor("centrifuge_outlet")}
-              minutes={drainMinutes("centrifuge_outlet")}
-              onAgain={purificationPhase === "ready" ? () => openDrainAgain("centrifuge_outlet") : undefined}
-              onStop={closeDrain}
-              onSkip={realHardware ? undefined : skipDrain}
-            />
+          {(purification.phase === "ready" || centrifugeDraining) && drainViewFor("centrifuge_outlet") && (
+            <ValveIndicator valve="centrifuge_outlet" view={drainViewFor("centrifuge_outlet")} />
           )}
 
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Card className="p-5">
-              <Metric label="Live temperature" value={liveTemperature === null ? "Unavailable" : `${liveTemperature.toFixed(1)} °C`} sub={`Target ${Number(targetTemperature).toFixed(1)} °C · ${realHardware ? "Live sensor" : "Demonstration"}`} />
-              <div className="mt-4"><Progress value={liveTemperature === null ? 0 : ((liveTemperature - startingTemperature) / Math.max(Number(targetTemperature) - startingTemperature, 1)) * 100} /></div>
-            </Card>
-            <Card className="p-5">
-              <Metric
-                label="Automatic plan"
-                value={`${Number(targetTemperature)} °C · ${purificationSettings.holdTimeMinutes} min`}
-                sub={`Flow ${formatMinutes(shownPlannedFlowSeconds)}${shownBiodieselMl ? ` for ${shownBiodieselMl.toFixed(0)} mL` : ""} at ${purificationSettings.flowRateMlPerMinute} mL/min · drain up to ${purificationSettings.drainTimeMinutes} min`}
-              />
-            </Card>
-            <Card className="p-5">
-              <div className="gv-label">Immersion heater</div>
-              <Status tone={heaterOn ? "yellow" : "neutral"}>{heaterOn ? "● ON" : "OFF"}</Status>
-            </Card>
-            <Card className="p-5">
-              <div className="gv-label">Dry wash stirrer</div>
-              <Status tone={stirrerOn ? "green" : "neutral"}>{stirrerOn ? "● RUNNING" : "OFF"}</Status>
-              <div className="mt-2 text-xs text-gray-500">
-                {stirrerOn ? `${stirrerRpm == null ? "RPM reading unavailable" : `${stirrerRpm} RPM`} · set ${transferSettings.stirringSpeed} RPM` : `Runs during heating and hold · ${transferSettings.stirringSpeed} RPM`}
-              </div>
-            </Card>
-            <Card className="p-5">
-              <div className="gv-label">Purification outlet valve</div>
-              <Status tone={purificationPhase === "flow" || purificationPhase === "drain" ? "green" : "neutral"}>{purificationPhase === "flow" || purificationPhase === "drain" ? "OPEN" : "CLOSED"}</Status>
-              <div className="mt-2 text-xs text-gray-500">To the mesh bed, then the biodiesel container</div>
-            </Card>
-            <Card className="p-5">
-              <Metric
-                label="Timer"
-                value={
-                  purificationPhase === "heating" ? formatTimer(heatingTimeSeconds)
-                    : purificationPhase === "hold" ? formatTimer(holdRemainingSeconds)
-                      : purificationPhase === "flow" ? formatTimer(Math.max(shownPlannedFlowSeconds - flowElapsedSeconds, 0))
-                        : purificationPhase === "drain" ? formatTimer(drainElapsedSeconds)
-                          : purificationPhase === "complete" ? "Done"
-                            : "00:00"
-                }
-                sub={
-                  purificationPhase === "heating" ? `Heating to ${Number(targetTemperature)} °C · about 1 min expected`
-                    : purificationPhase === "hold" ? "Hold remaining · removing leftover methanol"
-                      : purificationPhase === "flow" ? `Flow remaining · ${formatTimer(flowElapsedSeconds)} elapsed`
-                        : purificationPhase === "drain" ? `Draining · output steady ${flowStableSeconds} s`
-                          : purificationPhase === "complete" ? `${formatMinutes(Math.round(purificationSettings.holdTimeMinutes * 60) - holdRemainingSeconds)} hold · ${formatMinutes(flowElapsedSeconds)} flow · ${formatTimer(drainElapsedSeconds)} drain`
-                            : purificationPhase === "fault" ? "Stopped"
-                              : centrifugeDraining ? "Waiting for the centrifuge outlet"
-                                : showManualStart ? "Waiting for Start purification" : "Starts by itself"
-                }
-              />
-            </Card>
-          </div>
+          {(purification.phase === "heating" || purification.phase === "methanol") && (
+            <p className="mt-6 text-sm text-gray-400" data-testid="prepare-magnesol">{t("Prepare {grams} g Magnesol", { grams: magnesolG.toFixed(1) })}</p>
+          )}
 
-          {(purificationPhase === "flow" || purificationPhase === "drain" || (purificationPhase === "complete" && outputWeightG > 0)) && (
-            <div className="mt-4 grid gap-4 sm:grid-cols-2">
-              <Card className="p-5"><Metric label="Biodiesel collected" value={`${outputWeightG.toFixed(1)} g`} sub={`Output load cell · ${realHardware ? "Live" : "Demonstration"}${shownBiodieselMl ? ` · about ${(shownBiodieselMl * 0.88).toFixed(0)} g expected` : ""}`} /></Card>
-              <Card className="p-5"><Metric label="Flow rate" value={`${flowRateGPerMinute.toFixed(1)} g/min`} sub={purificationPhase === "drain" ? "Closes when nothing more comes out for 1 min" : `Planned ${purificationSettings.flowRateMlPerMinute} mL/min`} /></Card>
+          {purification.phase === "magnesol" && (
+            <div className="mt-6 rounded-xl border border-green-500/30 bg-green-500/[0.06] p-5" data-testid="add-magnesol">
+              <div className="font-display text-lg font-semibold text-green-400">{t("Add {grams} g Magnesol (1% of biodiesel)", { grams: magnesolG.toFixed(1) })}</div>
+              <p className="mt-1 text-sm text-gray-400">{t("The heater is off and the stirrer keeps running. Wear a dust mask.")}</p>
+              <Button className="mt-4" onClick={confirmMagnesol}>{t("Confirm")}</Button>
             </div>
           )}
 
-          {purificationPhase === "hold" && (
-            <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-4 text-sm text-amber-400">
-              Holding at {Number(targetTemperature)} °C — removing leftover methanol
-            </div>
+          {purification.phase !== "ready" && (
+            <LiveReadings source={sourceLabel}>
+              <Metric label={t("Temperature")} value={purification.temperature === null ? "—" : `${purification.temperature.toFixed(1)} °C`} sub={purification.phase === "heating" || purification.phase === "methanol" ? t("target {value} °C", { value: p.holdTemperature }) : purification.phase === "cooling" ? t("drain at {value} °C or below", { value: purificationSettings.maxDrainTemperature }) : undefined} />
+              <Metric label={t("Stirrer")} value={purification.stirrerOn ? `${purification.stirrerRpm ?? "—"} / ${p.stirringSpeedRpm} RPM` : t("Off")} />
+              <Metric label={t("Heater")} value={purification.heaterOn ? t("On") : t("Off")} />
+              <Metric label={t("Outlet valve")} value={purification.valveOpen ? t("Open") : t("Closed")} />
+              {purification.phase === "drain" ? (
+                <Metric label={t("Collected")} value={`${purification.outputG.toFixed(1)} g`} sub={t("output load cell")} />
+              ) : (
+                <Metric label={t("Step time left")} value={purification.stepRemaining === null ? "—" : formatTimer(purification.stepRemaining)} sub={stepLabel ? t(stepLabel) : undefined} />
+              )}
+            </LiveReadings>
           )}
 
-          {purificationPhase === "ready" && autoStartPending && levelSwitch === false && (
+          {purification.phase === "ready" && autoStartPending && levelSwitch === false && (
             <div className="mt-6 rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-5 text-sm text-amber-400">
-              Waiting for biodiesel to cover the heater. Purification starts by itself when the level switch detects it.
+              {t("Waiting for biodiesel to cover the heater. Purification starts by itself when the level switch detects it.")}
             </div>
           )}
-          {purificationPhase === "ready" && autoStartPending && levelSwitch === true && (
-            <div className="mt-6 rounded-xl border border-green-500/20 bg-green-500/[0.04] p-5 text-sm text-green-400">Starting purification…</div>
+          {purification.phase === "ready" && autoStartPending && levelSwitch === true && (
+            <div className="mt-6 rounded-xl border border-green-500/20 bg-green-500/[0.04] p-5 text-sm text-green-400">{t("Starting purification…")}</div>
           )}
 
-          {purificationWarning && (
-            <div className="mt-6 rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-5 text-sm text-amber-400">{purificationWarning}</div>
+          {purification.warning && (
+            <div className="mt-6 rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-5 text-sm text-amber-400">{t(purification.warning)}</div>
           )}
 
-          {safetyStopReason && (
+          {purification.stopReason && purification.phase === "fault" && (
             <div className="mt-6 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-5">
-              <div className="font-display font-semibold text-red-400">Heater stopped: {safetyStopReason}</div>
-              <p className="mt-1 text-xs text-gray-500">Heater OFF · valve CLOSED</p>
-              <Button className="mt-4" variant="danger" onClick={acknowledgeSafetyStop}>Acknowledge</Button>
+              <div className="font-display font-semibold text-red-400">{t("Heater stopped:")} {t(purification.stopReason)}</div>
+              <p className="mt-1 text-xs text-gray-500">{t("Heater OFF · stirrer OFF · valve CLOSED")}</p>
+              <Button className="mt-4" variant="danger" onClick={acknowledgeSafetyStop}>{t("Acknowledge")}</Button>
             </div>
           )}
 
-          {purificationPhase === "complete" && (
+          {purification.phase === "complete" && (
             <div className="mt-6 rounded-xl border border-green-500/25 bg-green-500/[0.05] p-5">
-              <div className="font-display font-semibold text-green-400">Purification complete</div>
-              <p className="mt-1 text-sm text-gray-400">The valve is closed. Check the collected biodiesel, then confirm that the process is finished.</p>
+              <div className="font-display font-semibold text-green-400">{t("Purification complete")}</div>
+              <p className="mt-1 text-sm text-gray-400">{t("The valve is closed. Check the collected biodiesel, then confirm that the process is finished.")}</p>
             </div>
           )}
 
-          <div className="mt-6 space-y-2 rounded-xl border border-white/[0.07] bg-gv-inset p-5 text-xs leading-5 text-gray-500">
-            <p>{purificationSettings.thermalFuseRating === null ? "Hardware backup: a thermal fuse cuts heater power if the software fails (set its rating in Settings)." : `Hardware backup: a thermal fuse cuts heater power at ${purificationSettings.thermalFuseRating} °C if the software fails.`} The heater also stops above {purificationSettings.maximumTemperature} °C.</p>
-            <p className="text-amber-400">Heat in a ventilated area. Leftover methanol evaporates when heated.</p>
-          </div>
+          <p className="mt-6 text-xs leading-5 text-amber-400">{t("The heater stops above {max} °C. The tank gets hot (90 °C): don't touch it, keep the area ventilated, no flames nearby.", { max: p.maximumTemperature })}</p>
 
-          <div className="mt-7 flex flex-wrap items-center gap-4">
+          <div className="mt-6 flex flex-wrap items-center gap-4">
             {showManualStart && (
               <>
                 {backend && levelSwitch === null && (
                   <label className="flex items-center gap-2 text-sm text-gray-300">
                     <input className="gv-checkbox" type="checkbox" checked={heaterConfirmed} onChange={(event) => setHeaterConfirmed(event.target.checked)} />
-                    No level switch installed: I checked that the heater is fully submerged
+                    {t("No level switch installed: I checked that the heater is fully submerged")}
                   </label>
                 )}
                 <Button
-                  disabled={(backend && levelSwitch === null && !heaterConfirmed) || (backend && levelSwitch === false) || liveTemperature === null}
-                  onClick={() => startPurificationNow(false)}
+                  disabled={(backend && levelSwitch === null && !heaterConfirmed) || (backend && levelSwitch === false)}
+                  onClick={startPurificationNow}
                 >
-                  {safetyStopOccurred ? "Start purification again" : "Start purification"}
+                  {purification.stopOccurred ? t("Start purification again") : t("Start purification")}
                 </Button>
-                {backend && levelSwitch === false && <span className="text-xs text-amber-400">The level switch doesn't detect biodiesel at the heater.</span>}
+                {backend && levelSwitch === false && <span className="text-xs text-amber-400">{t("The level switch doesn't detect biodiesel at the heater.")}</span>}
               </>
             )}
-            {PURIFYING.includes(purificationPhase) && (
-              <Button variant="danger" onClick={stopPurification}>Stop</Button>
+            {purifying && <Button variant="danger" onClick={stopPurification}>{t("Stop")}</Button>}
+            {purifying && purification.phase !== "magnesol" && !realHardware && (
+              <Button variant="secondary" onClick={skipPurificationPhase}>{t("Skip timer (demo)")}</Button>
             )}
-            {PURIFYING.includes(purificationPhase) && !realHardware && (
-              <Button variant="secondary" onClick={skipPurificationPhase}>Skip timer (demo)</Button>
-            )}
-            {purificationPhase === "complete" && <Button onClick={completeBatch}>Confirm process finished →</Button>}
+            {purification.phase === "complete" && <Button onClick={completeBatch}>{t("Confirm process finished")} →</Button>}
           </div>
         </Card>
       )}
@@ -2464,45 +2466,45 @@ export default function NewBatch() {
         <Card className="overflow-hidden">
           <div className="border-b border-green-500/10 bg-green-500/[0.04] p-8 text-center">
             <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-gv-green text-2xl font-bold text-black">✓</div>
-            <Heading as="h1" className="mt-5 text-3xl font-bold">Process Complete</Heading>
-            <p className="mt-2 text-sm text-gray-500">{savedBatch?.createdAt ? "The batch has been saved on the Raspberry Pi, together with the values it measured." : "The recorded batch information has been saved to local history."}</p>
-            <p className="mt-3 text-sm text-amber-400">Lab result pending. Record it in Batch History when the lab certificate arrives.</p>
+            <Heading as="h1" className="mt-5 text-3xl font-bold">{t("Process Complete")}</Heading>
+            <p className="mt-2 text-sm text-gray-500">{savedBatch?.createdAt ? t("The batch has been saved on the Raspberry Pi, together with the values it measured.") : t("The recorded batch information has been saved to local history.")}</p>
+            <p className="mt-3 text-sm text-amber-400">{t("Lab result pending. Record it in Batch History when the lab certificate arrives.")}</p>
           </div>
           <div className="p-6 sm:p-8">
             <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-              <Metric label="Batch ID" value={batchId} accent />
-              <Metric label="Oil volume" value={oilVolumeMl === null ? "Not available" : `${oilVolumeMl.toFixed(1)} mL`} sub="Converted using configured density" />
-              <Metric label="Oil mass" value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? "Load-cell record" : "Demonstration load-cell record"} />
-              <Metric label="FFA percentage" value={formatFfa({ ffa: ffaNumber, ffaAboveStrip })} sub={ffaAboveStrip ? "Strip's darkest color · operator entered" : "Test strip · operator entered"} />
-              <Metric label="Reaction pathway" value={requiresEsterification ? `Esterification${esterStagesRun > 1 ? ` (${esterStagesRun} stages)` : ""} → Transesterification` : "Transesterification"} />
+              <Metric label={t("Batch ID")} value={batchId} accent />
+              <Metric label={t("Oil volume")} value={oilVolumeMl === null ? t("Not available") : `${oilVolumeMl.toFixed(1)} mL`} sub={t("Converted using configured density")} />
+              <Metric label={t("Oil mass")} value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? t("Load-cell record") : t("Demonstration load-cell record")} />
+              <Metric label={t("FFA percentage")} value={formatFfa({ ffa: ffaNumber, ffaAboveStrip })} sub={ffaAboveStrip ? t("Strip's darkest color · operator entered") : t("Test strip · operator entered")} />
+              <Metric label={t("Reaction pathway")} value={requiresEsterification ? `${t("Esterification")}${esterStagesRun > 1 ? ` (${t("{count} stages", { count: esterStagesRun })})` : ""} → ${t("Transesterification")}` : t("Transesterification")} />
               {requiresEsterification && (
                 <Metric
-                  label="FFA re-checks"
-                  value={esterRecords.length ? [formatFfa({ ffa: ffaNumber, ffaAboveStrip }), ...esterRecords.map((record) => `${(record.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ") : "Not recorded"}
-                  sub={`Stage 1 dosed for ${chemistrySettings.designFfa}% FFA (uniform)`}
+                  label={t("FFA re-checks")}
+                  value={esterRecords.length ? [formatFfa({ ffa: ffaNumber, ffaAboveStrip }), ...esterRecords.map((record) => `${(record.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ") : t("Not recorded")}
+                  sub={t("Stage 1 dosed for {design}% FFA (uniform)", { design: chemistrySettings.designFfa })}
                 />
               )}
-              {requiresEsterification && <Metric label="Esterification duration" value={`${Number(esterTime) * esterStagesRun} min`} sub={esterStagesRun > 1 ? `${esterStagesRun} × ${esterTime} min` : undefined} />}
-              <Metric label="Transesterification duration" value={`${transTime} min`} />
-              <Metric label="Methanol-to-oil ratio" value={`${ratio}:1`} sub="Molar convention" />
-              <Metric label="Methanol" value={`${(transDoseNow.methanolMl + esterMethanolTotal).toFixed(1)} mL`} sub={requiresEsterification ? "Esterification + transesterification · loaded by the pumps" : "Loaded by pump A"} />
-              <Metric label={catalyst} value={`${transExact ? "" : "Up to "}${transDoseNow.catalystToWeighG.toFixed(2)} g`} sub={`Including neutralization · ${transDoseNow.purity}% purity${transExact ? " · exact" : ""}`} />
-              <Metric label="Acetone" value={transDoseNow.acetoneMl === null ? "Unavailable" : `${acetoneTotalMl.toFixed(1)} mL`} sub="Per reaction stage · provisional · poured by hand" />
-              {requiresEsterification && <Metric label="Sulfuric acid" value={`${esterAcidTotal.toFixed(2)} mL`} sub="98% · in the pump B premix" />}
-              <Metric label="Separation" value={`${PROCESS_CONFIG.separation.timeMinutes} min · ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
+              {requiresEsterification && <Metric label={t("Esterification duration")} value={`${Number(esterTime) * esterStagesRun} min`} sub={esterStagesRun > 1 ? `${esterStagesRun} × ${esterTime} min` : undefined} />}
+              <Metric label={t("Transesterification duration")} value={`${transTime} min`} />
+              <Metric label={t("Methanol-to-oil ratio")} value={`${ratio}:1`} sub={t("Molar convention")} />
+              <Metric label={t("Methanol")} value={`${(transDoseNow.methanolMl + esterMethanolTotal).toFixed(1)} mL`} sub={requiresEsterification ? t("Esterification + transesterification · loaded by the pumps") : t("Loaded by pump A")} />
+              <Metric label={catalyst} value={`${transExact ? "" : t("Up to") + " "}${transDoseNow.catalystToWeighG.toFixed(2)} g`} sub={t("Including neutralization · {purity}% purity", { purity: transDoseNow.purity }) + (transExact ? ` · ${t("exact")}` : "")} />
+              <Metric label={t("Acetone")} value={transDoseNow.acetoneMl === null ? t("Unavailable") : `${acetoneTotalMl.toFixed(1)} mL`} sub={t("Per reaction stage · provisional · poured by hand")} />
+              {requiresEsterification && <Metric label={t("Sulfuric acid")} value={`${esterAcidTotal.toFixed(2)} mL`} sub={t("98% · in the pump B premix")} />}
+              <Metric label={t("Separation")} value={`${PROCESS_CONFIG.separation.timeMinutes} min · ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
               <Metric
-                label="Purification"
-                value={purificationPhase === "complete" ? `${purificationAutomatic ? "Automatic" : "Completed"} · ${Number(targetTemperature)} °C` : "Not recorded"}
-                sub={purificationPhase === "complete" ? `${formatMinutes(Math.round(purificationSettings.holdTimeMinutes * 60) - holdRemainingSeconds)} hold · ${formatMinutes(flowElapsedSeconds)} flow · ${formatMinutes(drainElapsedSeconds)} drain` : undefined}
+                label={t("Purification")}
+                value={purification.phase === "complete" || saved ? t("Magnesol {grams} g · {temp} °C", { grams: magnesolG.toFixed(1), temp: p.holdTemperature }) : t("Not recorded")}
+                sub={t("{methanol} methanol removal · {contact} contact · {settling} settling · {drain} drain", { methanol: formatMinutes(purification.methanolSeconds), contact: formatMinutes(purification.contactSeconds), settling: formatMinutes(purification.settlingSeconds), drain: formatTimer(purification.drainSeconds) })}
               />
-              <Metric label="Biodiesel output" value={savedBatch?.biodieselOutputMl ? `${savedBatch.biodieselOutputMl.toFixed(1)} mL · ${savedBatch.yield}% yield` : "Not measured"} sub={savedBatch?.biodieselOutputMl ? `Output load cell${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
-              {savedBatch?.createdAt && <Metric label="Average reaction temperature" value={`${savedBatch.temperature} °C`} sub="Measured during transesterification" />}
-              {savedBatch?.createdAt && <Metric label="Energy used" value={`${savedBatch.energy} kWh`} sub="Electrodes (plus heater, if configured)" />}
-              <Metric label="Completion date" value={new Date().toLocaleString()} />
+              <Metric label={t("Biodiesel output")} value={savedBatch?.biodieselOutputMl ? t("{ml} mL · {pct}% yield", { ml: savedBatch.biodieselOutputMl.toFixed(1), pct: savedBatch.yield }) : t("Not measured")} sub={savedBatch?.biodieselOutputMl ? `${t("Output load cell")}${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
+              {savedBatch?.createdAt && <Metric label={t("Average reaction temperature")} value={`${savedBatch.temperature} °C`} sub={t("Measured during transesterification")} />}
+              {savedBatch?.createdAt && <Metric label={t("Energy used")} value={`${savedBatch.energy} kWh`} sub={t("Electrodes (plus heater, if configured)")} />}
+              <Metric label={t("Completion date")} value={new Date().toLocaleString()} />
             </div>
             <div className="mt-7 flex flex-wrap gap-3">
-              <Link to="/dashboard" className="btn-primary">Return to Dashboard</Link>
-              <Link to="/batches" className="btn-secondary">View Batch History →</Link>
+              <Link to="/dashboard" className="btn-primary">{t("Return to Dashboard")}</Link>
+              <Link to="/batches" className="btn-secondary">{t("View Batch History")} →</Link>
             </div>
           </div>
         </Card>

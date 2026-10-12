@@ -14,6 +14,7 @@ from .models import (AfterEsterificationRequest, Batch, BatchIn, CalculateReques
                      DrainStart, EsterificationStage, LabResultIn, MotorIn, PumpIn, PumpStart,
                      PurificationRecord, PurificationStart, Settings, StageStart, SwitchIn, TimelineEvent,
                      ValveIn)
+from . import purification as dry_wash
 from .stages import REACTIONS, StageError
 from .transfers import TransferError
 
@@ -137,16 +138,18 @@ def process_config(request: Request):
                            "designFfa": s.esterification_design_ffa, "stripMaxFfa": s.strip_max_ffa},
         "transesterification": s.transesterification.dump(),
         "separation": {"timeMinutes": s.separation_time, "speedRpm": s.separation_speed},
-        "purification": {"targetTemperature": s.purification_target_temperature,
-                         "maximumTemperature": s.purification_maximum_temperature,
-                         "thermalFuseRating": s.thermal_fuse_rating,
-                         "holdTimeMinutes": s.purification_hold_time,
-                         "meshBedFlowRate": s.mesh_bed_flow_rate,
-                         "drainTimeMinutes": s.drain_time,
-                         "heatingTimeoutMinutes": s.heating_timeout,
-                         "automatic": s.purification_auto_start,
-                         "stirringSpeedRpm": s.purification_stirring_speed,
-                         "targetRange": {"min": 40, "max": 70}},
+        "purification": {"holdTemperature": dry_wash.HOLD_TEMPERATURE_C, "holdBand": dry_wash.HOLD_BAND_C,
+                         "maximumTemperature": dry_wash.MAXIMUM_TEMPERATURE_C,
+                         "heatingTimeoutMinutes": dry_wash.HEATING_TIMEOUT_S / 60,
+                         "methanolRemovalMinutes": s.methanol_removal_time, "contactMinutes": s.contact_time,
+                         "settlingMinutes": s.settling_time, "maxDrainTemperature": s.max_drain_temperature,
+                         "stirringSpeedRpm": dry_wash.STIRRING_SPEED_RPM,
+                         "drainStableGrams": dry_wash.DRAIN_STABLE_G, "drainStableSeconds": dry_wash.DRAIN_STABLE_S,
+                         "drainMaximumMinutes": dry_wash.DRAIN_MAXIMUM_S / 60,
+                         "lowOutputFraction": dry_wash.LOW_OUTPUT_FRACTION,
+                         "magnesolGramsPerMlOil": round(s.oil_density * calculations.MAGNESOL_FRACTION, 4),
+                         "thermalFuseRating": s.thermal_fuse_rating, "automatic": s.purification_auto_start},
+        "powerSupply": {"currentControl": config.POWER_SUPPLY_CURRENT_CONTROL},
         "pumps": {"catalystRateMlPerMinute": s.pump_catalyst_rate, "acidRateMlPerMinute": s.pump_acid_rate,
                   "noFlowSeconds": s.pump_no_flow_seconds},
         "drains": {"reactorMinutes": s.reactor_drain_time, "centrifugeMinutes": s.centrifuge_drain_time,
@@ -410,6 +413,8 @@ def _stage_event(app):
     def record(label: str, st: dict) -> None:
         rec = _pending(app, st["batchId"])
         rec["timeline"].append({"label": label, "time": datetime.now().isoformat()})
+        if st["stage"] in REACTIONS and st.get("faultReason") and "current" in st["faultReason"]:
+            app.state.alarm = f"Electrodes stopped: {st['faultReason']}."
         if label == "Transesterification completed":
             _after_stage(app, "reactor_outlet", st["batchId"])
         elif label == "Separation completed":
@@ -439,11 +444,11 @@ async def start_stage(data: StageStart, request: Request):
     app.state.purification_armed = None
     try:
         app.state.stage.start(data.stage, _settings(request), data.batch_id, data.voltage, data.time,
-                              data.stirring, _stage_event(app))
+                              data.stirring, _stage_event(app), current=data.current)
     except (StageError, InterlockError) as e:
         raise HTTPException(409, str(e))
     if data.batch_id and data.oil_mass_g:
-        _pending(app, data.batch_id)["oilMassG"] = data.oil_mass_g   # for the mesh bed flow time
+        _pending(app, data.batch_id)["oilMassG"] = data.oil_mass_g   # for the Magnesol and the output check
     return app.state.stage.state
 
 
@@ -563,21 +568,19 @@ def purification_state(request: Request):
     return request.app.state.purification.state
 
 
-def _biodiesel_ml(app, s: Settings, batch_id: Optional[str], oil_volume_ml: Optional[float] = None) -> Optional[float]:
-    """The batch's biodiesel volume for the mesh bed flow time. It's about the same as the oil
-    volume: the oil the website sent, else the oil measured when the batch's stage started,
-    else the oil load cell now."""
+def _oil_volume_ml(app, s: Settings, batch_id: Optional[str], oil_volume_ml: Optional[float] = None) -> Optional[float]:
+    """The batch's oil volume, for the Magnesol amount and the low-output check: the oil the
+    website sent, else the oil measured when the batch's stage started."""
     if oil_volume_ml:
         return oil_volume_ml
     oil_g = app.state.records.get(batch_id, {}).get("oilMassG") if batch_id else None
-    if not oil_g:
-        oil_g = app.state.hw.read().get("oilMassG")
     return oil_g / s.oil_density if oil_g else None
 
 
-def begin_purification(app, s: Settings, target: float, batch_id: Optional[str], automatic: bool = False,
+def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: bool = False,
                        oil_volume_ml: Optional[float] = None) -> None:
-    """Starts heating → hold → mesh bed flow → drain. Raises RuntimeError or InterlockError."""
+    """Starts heating → methanol removal → Magnesol → contact → settling → cooling → drain.
+    Raises RuntimeError or InterlockError."""
     if app.state.drain.running and app.state.drain.state["valve"] == "centrifuge_outlet":
         raise RuntimeError("The centrifuge is still draining into the purification tank.")
     def save_record(record: dict) -> None:
@@ -594,8 +597,10 @@ def begin_purification(app, s: Settings, target: float, batch_id: Optional[str],
                                     else f"Purification stopped ({record['safetyStopReason']})",
                                     "time": datetime.now().isoformat()})
 
-    app.state.purification.start(s, target, batch_id, save_record,
-                                 biodiesel_ml=_biodiesel_ml(app, s, batch_id, oil_volume_ml), automatic=automatic)
+    volume = _oil_volume_ml(app, s, batch_id, oil_volume_ml)
+    app.state.purification.start(s, batch_id, save_record, oil_g=volume * s.oil_density if volume else None,
+                                 magnesol_g=calculations.magnesol_g(volume, s) if volume else None,
+                                 automatic=automatic)
     app.state.purification_armed = None
     if batch_id:
         _pending(app, batch_id)["timeline"].append(
@@ -617,7 +622,7 @@ def auto_start_purification(app) -> None:
         return
     s = app.state.settings
     try:
-        begin_purification(app, s, s.purification_target_temperature, batch_id, automatic=True)
+        begin_purification(app, s, batch_id, automatic=True)
     except (RuntimeError, InterlockError) as e:
         app.state.purification_armed = None
         app.state.alarm = f"Purification did not start: {e}"
@@ -633,12 +638,24 @@ async def start_purification(data: PurificationStart, request: Request):
         raise HTTPException(400, "Confirm that the heater is fully submerged first.")
     if app.state.stage.active:
         raise HTTPException(409, f"{app.state.stage.state['stage']} is still running.")
-    target = s.purification_target_temperature if data.target_temperature is None else data.target_temperature
     try:
-        begin_purification(app, s, target, data.batch_id, oil_volume_ml=data.oil_volume_ml)
+        begin_purification(app, s, data.batch_id, oil_volume_ml=data.oil_volume_ml)
     except (RuntimeError, InterlockError) as e:
         raise HTTPException(409, str(e))
     return app.state.purification.state
+
+
+@router.post("/process/purification/magnesol-added")
+async def confirm_magnesol(request: Request):
+    """"Confirm" on the website: the operator has added the Magnesol."""
+    runner = request.app.state.purification
+    try:
+        runner.confirm_magnesol()
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    if runner.state["batchId"]:
+        _event(request.app, runner.state["batchId"], f"Magnesol added ({runner.state['magnesolG'] or '?'} g)")
+    return runner.state
 
 
 @router.post("/process/purification/skip")
@@ -685,8 +702,8 @@ async def control_heater(data: SwitchIn, request: Request):
         t = hw.read().get("temperature")
         if t is None:
             raise HTTPException(409, "No temperature reading, so the heater stays off.")
-        if t >= s.purification_maximum_temperature:
-            raise HTTPException(409, f"Temperature is at or above {s.purification_maximum_temperature:g} °C.")
+        if t >= dry_wash.MAXIMUM_TEMPERATURE_C:
+            raise HTTPException(409, f"Temperature is at or above {dry_wash.MAXIMUM_TEMPERATURE_C:g} °C.")
     try:
         hw.set_heater(data.on)
     except InterlockError as e:

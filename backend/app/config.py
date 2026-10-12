@@ -39,7 +39,7 @@ PINS = {
     "electrode_power_relay": 25,
     "valve_reactor_outlet": 16,      # main reactor -> centrifuge (opens after transesterification)
     "valve_centrifuge_outlet": 20,   # centrifuge -> purification tank (opens after separation)
-    "valve_mesh_bed": 24,            # purification outlet -> mesh bed -> output container
+    "valve_mesh_bed": 24,            # purification outlet -> filter -> output container
     "pump_catalyst": 5,              # pump A: NaOH/KOH + methanol
     "pump_acid": 6,                  # pump B: H2SO4 + methanol
     "stirrer_pwm": 18,               # reactor stirrer
@@ -50,6 +50,12 @@ PINS = {
     # the heater if the level drops. None = no switch: the operator confirms on the website.
     "heater_level_switch": None,
 }
+
+# Can the Pi set the power supply's current limit (e.g. a supply with a serial/USB or PWM control
+# input)? Then fill in PiHardware._write_current_limit and set this to 1. If not (a supply with
+# knobs), the website tells the operator to set the current by hand before each stage. Either
+# way the electrodes stop when the measured current goes above the setting.
+POWER_SUPPLY_CURRENT_CONTROL = os.getenv("GREENOVA_PSU_CURRENT_CONTROL", "0") == "1"
 
 # Many relay modules switch ON when the input is LOW. If yours does, set this to False,
 # otherwise the heater could turn ON when the Pi starts. Test with the heater unplugged first.

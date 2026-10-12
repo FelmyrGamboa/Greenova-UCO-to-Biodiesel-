@@ -19,7 +19,10 @@ export const API_BASE = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "")
 export type Catalyst = "NaOH" | "KOH";
 export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-export type PurificationPhase = "ready" | "heating" | "hold" | "flow" | "drain" | "complete" | "fault";
+/** Dry wash with Magnesol: heating → methanol removal → add Magnesol (operator) → contact →
+ * settling → cooling (only if needed) → drain → complete. */
+export type PurificationPhase =
+  | "ready" | "heating" | "methanol" | "magnesol" | "contact" | "settling" | "cooling" | "drain" | "complete" | "fault";
 export type TileState = "ready" | "checking" | "fault";
 /** Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H₂SO₄ in methanol. */
 export type PumpName = "catalyst" | "acid";
@@ -77,6 +80,8 @@ export type QuantityCards = {
   /** Pump A premix (methanol + NaOH/KOH). */
   transesterificationPremixMl: number;
   transesterificationPremixG: number;
+  /** Magnesol for the dry wash: oil mL × 0.0092 g (1% of the biodiesel). */
+  magnesolG: number;
   isEstimate: boolean;
   warnings: string[];
 };
@@ -105,7 +110,7 @@ export type Sensors = {
   heaterSubmerged: boolean | null;
   heaterOn: boolean;
   electrodePowerOn: boolean;
-  /** Purification outlet valve (to the mesh bed and the biodiesel container). */
+  /** Purification outlet valve (through the filter to the biodiesel container). */
   meshBedValveOpen: boolean;
   reactorValveOpen: boolean;
   centrifugeValveOpen: boolean;
@@ -156,6 +161,10 @@ export type StageStatus = {
   timeMinutes: number | null;
   stirringRpm: number | null;
   speedRpm: number | null;
+  /** The current setting (A); the electrodes stop if the measured current goes above it. */
+  current: number | null;
+  /** True when the Pi set the power supply's current limit itself. */
+  currentLimitSet: boolean;
   elapsedSeconds: number;
   remainingSeconds: number;
   liveVoltage: number | null;
@@ -167,39 +176,50 @@ export type StageStatus = {
   faultReason: string | null;
 };
 
-/** Automatic purification: heating → hold → mesh bed flow → drain → complete. */
+/** Automatic purification (dry wash with Magnesol). The step timer is stepRemainingSeconds. */
 export type PurificationStatus = {
   phase: PurificationPhase;
   batchId: string | null;
   /** Started by itself after separation (level switch), rather than by hand. */
   automatic: boolean;
-  targetTemperature: number | null;
+  /** Fixed: hold at 90 °C (±2), heater stops above 95 °C. */
+  targetTemperature: number;
+  maximumTemperature: number;
   liveTemperature: number | null;
   startingTemperature: number | null;
   highestTemperature: number | null;
   heatingTimeSeconds: number;
-  holdTimeSeconds: number;
-  holdTotalSeconds: number;
-  holdRemainingSeconds: number;
-  /** About the batch's oil volume; sets plannedFlowSeconds. */
-  expectedBiodieselMl: number | null;
-  plannedFlowSeconds: number;
-  flowElapsedSeconds: number;
-  flowRemainingSeconds: number;
+  heatingTimeoutSeconds: number;
+  methanolTotalSeconds: number;
+  methanolRemainingSeconds: number;
+  /** Magnesol to add: oil mL × 0.0092 g. */
+  magnesolG: number | null;
+  magnesolAdded: boolean;
+  magnesolWaitSeconds: number;
+  contactTotalSeconds: number;
+  contactRemainingSeconds: number;
+  settlingTotalSeconds: number;
+  settlingRemainingSeconds: number;
+  coolingSeconds: number;
+  maxDrainTemperature: number | null;
   drainElapsedSeconds: number;
   drainMaximumSeconds: number;
-  flowStableSeconds: number;
+  /** Seconds the output weight has stayed within ±2 g. */
+  stableSeconds: number;
   /** Biodiesel collected in this run (output load cell). */
   outputWeightG: number | null;
-  flowRateGPerMinute: number | null;
+  oilWeightG: number | null;
+  /** The current step's timer (null for steps without one, e.g. heating). */
+  stepRemainingSeconds: number | null;
+  stepTotalSeconds: number | null;
   heaterOn: boolean;
   valveOpen: boolean;
   heaterOnSeconds: number;
-  /** Dry wash stirrer: runs during heating and hold. */
+  /** Dry wash stirrer: target 200 RPM (fixed). */
   stirrerOn: boolean;
   stirrerRpm: number | null;
   stirringSpeed: number;
-  /** E.g. less output than expected: check the mesh bed. */
+  /** "Low output – check the filter" when less than 70% of the oil weight came out. */
   warning: string | null;
   safetyStopReason: string | null;
   safetyStopOccurred: boolean;
@@ -228,7 +248,7 @@ export type SystemStatus = {
 };
 
 type Limit = { min: number; max: number; default: number };
-type StageLimits = { voltage: Limit; time: Limit; stirring: Limit };
+type StageLimits = { voltage: Limit; time: Limit; stirring: Limit; current: Limit };
 
 /** Same structure as PROCESS_CONFIG in NewBatch.tsx. */
 export type ProcessConfig = {
@@ -241,9 +261,12 @@ export type ProcessConfig = {
   esterification: StageLimits & { sulfuricAcidMlPerGramFfa: number; designFfa: number; stripMaxFfa: number };
   transesterification: StageLimits;
   separation: { timeMinutes: number; speedRpm: number };
-  purification: { targetTemperature: number; maximumTemperature: number; thermalFuseRating: number | null;
-    holdTimeMinutes: number; meshBedFlowRate: number; drainTimeMinutes: number; heatingTimeoutMinutes: number;
-    automatic: boolean; stirringSpeedRpm: number; targetRange: { min: number; max: number } };
+  purification: { holdTemperature: number; holdBand: number; maximumTemperature: number; heatingTimeoutMinutes: number;
+    methanolRemovalMinutes: number; contactMinutes: number; settlingMinutes: number; maxDrainTemperature: number;
+    stirringSpeedRpm: number; drainStableGrams: number; drainStableSeconds: number; drainMaximumMinutes: number;
+    lowOutputFraction: number; magnesolGramsPerMlOil: number; thermalFuseRating: number | null; automatic: boolean };
+  /** currentControl: the Pi sets the power supply's current limit (otherwise the operator does). */
+  powerSupply: { currentControl: boolean };
   pumps: { catalystRateMlPerMinute: number; acidRateMlPerMinute: number; noFlowSeconds: number };
   drains: { reactorMinutes: number; centrifugeMinutes: number; centrifugeSpinDownSeconds: number };
   reactionMaximumTemperature: number;
@@ -255,14 +278,12 @@ export type Settings = Record<string, unknown> & {
   operator: string;
   units: string;
   format: string;
-  purificationTargetTemperature: number;
-  purificationMaximumTemperature: number;
+  /** Purification: the only editable values (the 90 °C hold and 200 RPM are fixed). */
+  methanolRemovalTime: number;
+  contactTime: number;
+  settlingTime: number;
+  maxDrainTemperature: number;
   thermalFuseRating: number | null;
-  purificationHoldTime: number;
-  meshBedFlowRate: number;
-  drainTime: number;
-  heatingTimeout: number;
-  purificationStirringSpeed: number;
   esterificationDesignFfa: number;
   stripMaxFfa: number;
   pumpCatalystRate: number;
@@ -546,7 +567,7 @@ export const startDrain = (valve: DrainValve, batchId?: string) =>
 export const drainAction = (action: "stop" | "skip") => send<DrainStatus>("POST", `/api/process/drain/${action}`);
 
 // ---------- process stages ----------
-export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; oilMassG?: number }) =>
+export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; current?: number; oilMassG?: number }) =>
   send<StageStatus>("POST", "/api/process/stage/start", input);
 
 export const stageAction = (action: "pause" | "resume" | "complete" | "emergency-stop" | "reset") =>
@@ -554,10 +575,11 @@ export const stageAction = (action: "pause" | "resume" | "complete" | "emergency
 
 /** Purification normally starts by itself after separation. Use this only when there's no level
  * switch (heaterSubmerged = the operator's confirmation) or to start again after a stop. */
-export const startPurification = (input: { heaterSubmerged?: boolean; targetTemperature?: number; batchId?: string; oilVolumeMl?: number }) =>
+export const startPurification = (input: { heaterSubmerged?: boolean; batchId?: string; oilVolumeMl?: number }) =>
   send<PurificationStatus>("POST", "/api/process/purification/start", input);
 
-export const purificationAction = (action: "skip" | "abort" | "acknowledge") =>
+/** "magnesol-added" = the operator's Confirm after adding the Magnesol. */
+export const purificationAction = (action: "skip" | "abort" | "acknowledge" | "magnesol-added") =>
   send<PurificationStatus>("POST", `/api/process/purification/${action}`);
 
 /** Emergency stop for everything: stage, pumps, purification, heater, valves and motors. */

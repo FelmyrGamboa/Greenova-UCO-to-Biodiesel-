@@ -33,9 +33,17 @@ def get_settings() -> Settings:
     if not row:
         return Settings()
     s = Settings.model_validate_json(row[0])
+    # Old defaults saved by earlier versions become the new defaults (values you changed stay).
     if s.ffa_range_boundaries == "0,2,4,6,8,10":
-        # the old default: the strip now reads only up to 5%, so the ranges end at 5%+
+        # the strip reads only up to 5%, so the ranges end at 5%+
         s.ffa_range_boundaries = Settings().ffa_range_boundaries
+    for limits in (s.esterification, s.transesterification):
+        if limits.voltage.min == 18:
+            limits.voltage.min = 10
+        if limits.time.max == 120:
+            limits.time.max = 180
+    if s.reactor_drain_time == 3:
+        s.reactor_drain_time = 1
     return s
 
 

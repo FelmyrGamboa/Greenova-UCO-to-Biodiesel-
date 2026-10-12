@@ -26,20 +26,26 @@ class Limit(CamelModel):
     default: float
 
 
+def _current_limit() -> "Limit":
+    return Limit(min=0.5, max=2, default=1)
+
+
 class StageLimits(CamelModel):
     voltage: Limit
     time: Limit        # minutes
     stirring: Limit    # RPM
+    # A: the power supply's current limit. The electrodes stop if the measured current goes above it.
+    current: Limit = Field(default_factory=_current_limit)
 
 
 def _esterification_limits() -> StageLimits:
-    return StageLimits(voltage=Limit(min=18, max=30, default=20), time=Limit(min=30, max=120, default=120),
-                       stirring=Limit(min=400, max=700, default=500))
+    return StageLimits(voltage=Limit(min=10, max=30, default=20), time=Limit(min=30, max=180, default=120),
+                       stirring=Limit(min=400, max=700, default=500), current=_current_limit())
 
 
 def _transesterification_limits() -> StageLimits:
-    return StageLimits(voltage=Limit(min=18, max=30, default=30), time=Limit(min=30, max=180, default=120),
-                       stirring=Limit(min=400, max=700, default=500))
+    return StageLimits(voltage=Limit(min=10, max=30, default=30), time=Limit(min=30, max=180, default=120),
+                       stirring=Limit(min=400, max=700, default=500), current=_current_limit())
 
 
 class Settings(CamelModel):
@@ -48,16 +54,15 @@ class Settings(CamelModel):
     operator: str = "Operator 01"
     units: str = "metric"
     batch_format: str = Field(default="B-{YEAR}-{SEQ}", alias="format")
-    # Purification runs by itself: heat to the target, hold, mesh bed flow, drain.
-    purification_target_temperature: float = 70
-    purification_maximum_temperature: float = 75
+    # Purification (dry wash with Magnesol) runs by itself: heat to 90 °C, methanol removal, the
+    # operator adds the Magnesol, contact, settling, cooling if needed, drain. The 90 °C hold, the
+    # 95 °C cutoff and the 200 RPM stirrer are fixed (purification.py); only these are settings:
+    methanol_removal_time: float = 10         # minutes at 90 ±2 °C (5-30)
+    contact_time: float = 15                  # minutes stirring the Magnesol, heater off
+    settling_time: float = 10                 # minutes, stirrer off, so the Magnesol settles
+    max_drain_temperature: float = 50         # °C: the outlet opens only at or below this (water filter limit)
     thermal_fuse_rating: Optional[float] = None
-    purification_hold_time: float = 25        # minutes at the target, to remove leftover methanol
-    mesh_bed_flow_rate: float = 40            # mL per minute through the mesh bed; sets the flow time from the oil volume
-    drain_time: float = 3                     # minutes at most, valve open after the flow, so the bed drains
-    heating_timeout: float = 10               # minutes to reach the target before it stops (expected: about 1 min)
     purification_auto_start: bool = True      # start by itself after separation, once the level switch sees biodiesel
-    purification_stirring_speed: float = 300  # RPM of the dry wash stirrer during heating and hold (0 = off)
     # Esterification: the FFA strip reads only up to strip_max_ffa, so every batch above the
     # threshold gets one uniform dose, calculated as if the oil had esterification_design_ffa.
     esterification_design_ffa: float = 10     # %
@@ -65,7 +70,7 @@ class Settings(CamelModel):
     # Dosing pumps (A: NaOH/KOH + methanol, B: H2SO4 + methanol) and outlet valves
     pump_catalyst_rate: float = 100           # mL/min of pump A, for its time limit (and dosing without a load cell)
     pump_acid_rate: float = 100               # mL/min of pump B
-    reactor_drain_time: float = 3             # minutes the reactor outlet stays open after transesterification
+    reactor_drain_time: float = 1             # minutes the reactor outlet stays open after transesterification
     centrifuge_drain_time: float = 3          # minutes the centrifuge outlet stays open after separation
     centrifuge_spin_down_time: float = 30     # seconds to wait for the centrifuge to stop when there's no RPM reading
     ffa_range_boundaries: str = "0,2,4,5"
@@ -102,8 +107,6 @@ class Settings(CamelModel):
 
     # --- safety and hardware (backend only) ---
     reaction_maximum_temperature: float = 60  # electrodes stop above this (methanol boils at 64.7 °C)
-    flow_stable_seconds: float = 60           # draining is done when the output weight stays the same this long
-    minimum_flow_time: float = 2              # minutes; shortest mesh bed flow, for very small batches
     stirrer_max_rpm: float = 900              # RPM at full PWM, for the open-loop speed setting
     centrifuge_max_rpm: float = 3000
     purification_stirrer_max_rpm: float = 600
@@ -127,30 +130,21 @@ class Settings(CamelModel):
     def _check(self):
         if len(self.boundaries()) < 2:
             raise ValueError("ffaRangeBoundaries needs at least two numbers, e.g. 0,2,4,6,8,10.")
-        if not 40 <= self.purification_target_temperature <= 70:
-            raise ValueError("purificationTargetTemperature must be between 40 and 70 °C.")
-        if self.purification_target_temperature >= self.purification_maximum_temperature:
-            raise ValueError("purificationTargetTemperature must be below purificationMaximumTemperature.")
-        if self.mesh_bed_flow_rate <= 0:
-            raise ValueError("meshBedFlowRate must be more than 0 mL/min.")
-        if self.purification_hold_time < 0 or self.drain_time < 0:
-            raise ValueError("purificationHoldTime and drainTime can't be negative.")
-        if self.heating_timeout <= 0:
-            raise ValueError("heatingTimeout must be more than 0 min.")
+        if not 5 <= self.methanol_removal_time <= 30:
+            raise ValueError("methanolRemovalTime must be between 5 and 30 min.")
+        if not 1 <= self.contact_time <= 60:
+            raise ValueError("contactTime must be between 1 and 60 min.")
+        if not 0 <= self.settling_time <= 60:
+            raise ValueError("settlingTime must be between 0 and 60 min.")
+        if not 30 <= self.max_drain_temperature <= 85:
+            raise ValueError("maxDrainTemperature must be between 30 and 85 °C.")
         if not self.ffa_threshold < self.esterification_design_ffa <= 30:
             raise ValueError("esterificationDesignFfa must be above the 4% threshold and at most 30%.")
         if self.pump_catalyst_rate <= 0 or self.pump_acid_rate <= 0:
             raise ValueError("Pump rates must be more than 0 mL/min.")
-        if (self.reactor_drain_time < 0 or self.centrifuge_drain_time < 0 or self.centrifuge_spin_down_time < 0
-                or self.purification_stirring_speed < 0):
-            raise ValueError("Drain times and the stirring speed can't be negative.")
+        if self.reactor_drain_time < 0 or self.centrifuge_drain_time < 0 or self.centrifuge_spin_down_time < 0:
+            raise ValueError("Drain times can't be negative.")
         return self
-
-    def planned_flow_seconds(self, biodiesel_ml: Optional[float]) -> int:
-        """Mesh bed flow time for a batch: its biodiesel volume ÷ the flow rate. The biodiesel
-        volume is about the same as the oil volume. Unknown volume: plan for the largest batch."""
-        volume = biodiesel_ml if biodiesel_ml and biodiesel_ml > 0 else self.oil_maximum_volume_ml
-        return round(max(volume / self.mesh_bed_flow_rate, self.minimum_flow_time) * 60)
 
     def boundaries(self) -> list[float]:
         """Same parsing as the website: numbers only, sorted, without duplicates."""
@@ -177,9 +171,14 @@ class PurificationRecord(CamelModel):
     target_temperature: float
     highest_temperature: float
     heating_time_seconds: float
-    hold_time_seconds: float = 0
-    flow_time_seconds: float
+    hold_time_seconds: float = 0               # methanol removal at 90 °C
+    flow_time_seconds: float = 0               # old records (mesh bed flow)
     drain_time_seconds: float = 0
+    contact_time_seconds: float = 0
+    settling_time_seconds: float = 0
+    cooling_time_seconds: float = 0
+    magnesol_added: bool = False
+    oil_weight_g: Optional[float] = None
     expected_biodiesel_ml: Optional[float] = None
     planned_flow_seconds: Optional[float] = None
     automatic: bool = False
@@ -188,6 +187,7 @@ class PurificationRecord(CamelModel):
     safety_stop_reason: Optional[str] = None
     output_weight_g: Optional[float] = None
     stirring_speed: Optional[float] = None    # dry wash stirrer RPM during heating and hold
+    magnesol_g: Optional[float] = None        # Magnesol for the dry wash: oil mL × 0.0092 (1% of the oil weight)
 
 
 class EsterificationStage(CamelModel):
@@ -222,10 +222,12 @@ class Batch(CamelModel):
     reaction_time: float = 0                   # transesterification minutes
     stirring_speed: float = 0                  # transesterification RPM
     voltage: Optional[float] = None            # transesterification V
+    current: Optional[float] = None            # transesterification current limit, A
     methanol_ratio: Optional[float] = None
     esterification_voltage: Optional[float] = None
     esterification_time: Optional[float] = None
     esterification_stirring: Optional[float] = None
+    esterification_current: Optional[float] = None
     biodiesel_output_ml: Optional[float] = None
     catalyst_type: Optional[Catalyst] = None
     materials: Optional[Materials] = None
@@ -279,14 +281,14 @@ class StageStart(CamelModel):
     voltage: Optional[float] = None
     time: Optional[float] = None       # minutes
     stirring: Optional[float] = None   # RPM
-    oil_mass_g: Optional[float] = None  # measured oil; sets the mesh bed flow time later
+    current: Optional[float] = None    # A, the power supply's current limit
+    oil_mass_g: Optional[float] = None  # measured oil; sets the Magnesol amount and the low-output check
 
 
 class PurificationStart(CamelModel):
     heater_submerged: bool = False   # operator confirmation; only needed when there's no level switch
-    target_temperature: Optional[float] = None
     batch_id: Optional[str] = None
-    oil_volume_ml: Optional[float] = None   # sets the mesh bed flow time; else the batch's measured oil
+    oil_volume_ml: Optional[float] = None   # sets the Magnesol amount; else the batch's measured oil
 
 
 class DemoOilIn(CamelModel):

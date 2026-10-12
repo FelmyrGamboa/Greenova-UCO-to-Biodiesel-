@@ -4,6 +4,7 @@ import socket
 
 from . import config
 from .hardware import PUMP_LABELS, VALVE_LABELS
+from .purification import MAXIMUM_TEMPERATURE_C
 
 
 def _tile(label: str, value: str, secondary: str = "", state: str = "ready") -> dict:
@@ -12,6 +13,13 @@ def _tile(label: str, value: str, secondary: str = "", state: str = "ready") -> 
 
 def _grams(value) -> str:
     return f"{value:.1f} g"
+
+
+def _motor_tile(label: str, rpm, duty) -> dict:
+    """Ready when its RPM sensor gives a reading (so the Pi can see it turn)."""
+    if rpm is None:
+        return _tile(label, "Not ready", "No RPM reading — check the RPM sensor", "fault")
+    return _tile(label, "Ready", f"Running · {rpm:g} RPM" if duty else "Stopped · RPM sensor online")
 
 
 def status(reading: dict, stage_state: dict, purification_state: dict,
@@ -28,15 +36,22 @@ def status(reading: dict, stage_state: dict, purification_state: dict,
     running_pump = next((name for name, on in pumps.items() if on), None)
     open_valves = [VALVE_LABELS[name] for name, is_open in valves.items() if is_open and name in VALVE_LABELS]
     wash_rpm = reading.get("purificationStirrerRpm")
+    purification_fault = purification_state.get("phase") == "fault"
     tiles = [
         _tile("Power Supply", "On" if power_on else "Ready",
               f"Output {'on' if power_on else 'off'} · 0–30 V DC"
               + (f" · {voltage:g} V" if power_on and voltage is not None else "")),
-        _tile("Electrodes", "Copper tube – stainless steel",
+        _tile("Electrodes", "Graphite – graphite",
               "Fault — controller reset required" if stage_fault else "Connected",
               "fault" if stage_fault else "ready"),
-        _tile("Stirrer", "Running" if duty.get("stirrer") else "Ready",
-              f"{reading.get('stirrerRpm') or 0:g} RPM" if reading.get("stirrerRpm") is not None else "RPM reading unavailable"),
+        _motor_tile("Reactor Stirrer", reading.get("stirrerRpm"), duty.get("stirrer")),
+        _motor_tile("Centrifuge Motor", reading.get("centrifugeRpm"), duty.get("centrifuge")),
+        _motor_tile("Purification Stirrer", wash_rpm, duty.get("purification_stirrer")),
+        _tile("Heater", "Not ready" if t is None or purification_fault else "Ready",
+              "No temperature reading" if t is None
+              else "Safety stop — acknowledge it on the Purification screen" if purification_fault
+              else f"{'On' if reading.get('heaterOn') else 'Off'} · stops above {MAXIMUM_TEMPERATURE_C:g} °C",
+              "fault" if t is None or purification_fault else "ready"),
         _tile("Temperature Sensor", "Online" if t is not None else "No reading",
               f"{t:.1f} °C · {mode} reading" if t is not None else "Check the sensor wiring",
               "ready" if t is not None else "fault"),
@@ -52,12 +67,11 @@ def status(reading: dict, stage_state: dict, purification_state: dict,
         _tile("Outlet Valves", "All closed" if not open_valves else f"{len(open_valves)} open",
               "Reactor, centrifuge and purification outlets" if not open_valves else ", ".join(open_valves),
               "ready" if not open_valves or drain_state.get("phase") in ("waiting", "draining")
-              or purification_state.get("phase") in ("flow", "drain") else "checking"),
+              or purification_state.get("phase") == "drain" else "checking"),
         _tile("Output Load Cell", "Online" if output is not None else "No reading",
               f"{_grams(output)} in the biodiesel container" if output is not None else "Check the HX711 wiring",
               "ready" if output is not None else "fault"),
     ]
-    purification_fault = purification_state.get("phase") == "fault"
     devices = [
         {"label": "Raspberry Pi", "status": "Connected"},
         {"label": "Temperature Sensor", "status": "Connected" if t is not None else "No reading"},

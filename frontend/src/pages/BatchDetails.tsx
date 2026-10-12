@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router";
 import { Button, Card, Field, Heading, Metric, Status } from "../components/ui";
 import { formatFfa, getBatches } from "../lib/greenovaData";
 import { getBatch, isOffline, updateBatchLabResult, type BatchRecord } from "../lib/api";
+import { useT } from "../lib/i18n";
 
 const demoTimeline = [
   ["Start", "09:02 AM"],
@@ -12,12 +13,13 @@ const demoTimeline = [
   ["Reaction Started", "09:35 AM"],
   ["Reaction Completed", "10:35 AM"],
   ["Separation Started", "10:40 AM"],
-  ["Dry Wash", "11:02 AM"],
-  ["Filtration & Drain", "11:19 AM"],
+  ["Dry Wash (Magnesol)", "11:02 AM"],
+  ["Draining", "11:19 AM"],
   ["Complete", "11:16 AM"],
 ];
 
 export default function BatchDetails() {
+  const t = useT();
   const { batchId } = useParams();
   const [batch, setBatch] = useState<BatchRecord>(() => getBatches().find((item) => item.id === batchId) ?? getBatches()[0]);
   const [fromBackend, setFromBackend] = useState(false);
@@ -45,59 +47,61 @@ export default function BatchDetails() {
       const updated = await updateBatchLabResult(batch.id, result, labReference);
       if (updated) setBatch(updated);
     } catch (problem) {
-      setError(isOffline(problem) ? "Backend offline." : problem instanceof Error ? problem.message : String(problem));
+      setError(isOffline(problem) ? t("Backend offline.") : t(problem instanceof Error ? problem.message : String(problem)));
     }
   }
 
   const timeline: Array<[string, string]> = batch.timeline?.length
-    ? batch.timeline.map((event) => [event.label, new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })])
-    : demoTimeline.map(([label, time]) => [label, time]);
+    ? batch.timeline.map((event) => [t(event.label), new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })])
+    : demoTimeline.map(([label, time]) => [t(label), time]);
 
   return (
     <div className="space-y-6">
       <div>
-        <Link to="/batches" className="text-sm text-gray-500 hover:text-green-400">← Back to Batch History</Link>
+        <Link to="/batches" className="text-sm text-gray-500 hover:text-green-400">← {t("Back to Batch History")}</Link>
         <div className="mt-5 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <div className="section-kicker">Batch record</div>
+            <div className="section-kicker">{t("Batch record")}</div>
             <Heading as="h1" className="mt-2 text-3xl font-bold">{batch.id}</Heading>
-            <p className="mt-2 text-sm text-gray-500">Completed {new Date(batch.date).toLocaleDateString()} · {fromBackend ? "Raspberry Pi record" : "Prototype record"}</p>
+            <p className="mt-2 text-sm text-gray-500">{t("Completed {date}", { date: new Date(batch.date).toLocaleDateString() })} · {fromBackend ? t("Raspberry Pi record") : t("Prototype record")}</p>
           </div>
-          <Status tone={batch.status === "Completed" ? "green" : "red"}>{batch.status}</Status>
+          <Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status>
         </div>
       </div>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="p-5"><Metric label="Oil volume" value={`${batch.oilVolume.toLocaleString()} mL`} /></Card>
-        <Card className="p-5"><Metric label="Biodiesel yield" value={batch.yield ? `${batch.yield}%` : "—"} accent /></Card>
-        <Card className="p-5"><Metric label="Process duration" value={`${batch.duration} min`} /></Card>
-        <Card className="p-5"><Metric label="Energy used" value={`${batch.energy} kWh`} /></Card>
+        <Card className="p-5"><Metric label={t("Oil volume")} value={`${batch.oilVolume.toLocaleString()} mL`} /></Card>
+        <Card className="p-5"><Metric label={t("Biodiesel yield")} value={batch.yield ? `${batch.yield}%` : "—"} accent /></Card>
+        <Card className="p-5"><Metric label={t("Process duration")} value={`${batch.duration} min`} /></Card>
+        <Card className="p-5"><Metric label={t("Energy used")} value={`${batch.energy} kWh`} /></Card>
       </div>
       <div className="grid gap-6 xl:grid-cols-[0.75fr_1.25fr]">
         <Card className="p-6">
-          <Heading as="h2" className="text-lg font-semibold">Process Parameters</Heading>
+          <Heading as="h2" className="text-lg font-semibold">{t("Process Parameters")}</Heading>
           <div className="mt-6 space-y-5">
-            <Metric label="Starting FFA" value={formatFfa(batch)} sub={batch.ffaAboveStrip ? "The strip showed its darkest color" : "Test strip"} />
+            <Metric label={t("Starting FFA")} value={formatFfa(batch)} sub={batch.ffaAboveStrip ? t("The strip showed its darkest color") : t("Test strip")} />
             {batch.esterificationRun && (
               <Metric
-                label="Esterification"
-                value={batch.esterificationStages?.length ? `${batch.esterificationStages.length} stage${batch.esterificationStages.length > 1 ? "s" : ""}` : "Run"}
+                label={t("Esterification")}
+                value={batch.esterificationStages?.length ? t("{count} stages", { count: batch.esterificationStages.length }) : t("Run")}
                 sub={batch.esterificationStages?.length
                   ? `FFA ${[formatFfa(batch), ...batch.esterificationStages.map((stage) => `${(stage.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ")}`
                   : undefined}
               />
             )}
-            <Metric label="Temperature" value={`${batch.temperature} °C`} />
-            <Metric label="Reaction time" value={`${batch.reactionTime} min`} />
-            <Metric label="Stirring speed" value={`${batch.stirringSpeed} RPM`} />
+            <Metric label={t("Temperature")} value={`${batch.temperature} °C`} />
+            <Metric label={t("Reaction time")} value={`${batch.reactionTime} min`} />
+            <Metric label={t("Stirring speed")} value={`${batch.stirringSpeed} RPM`} />
+            {batch.current ? <Metric label={t("Current setting")} value={`${batch.current} A`} /> : null}
+            {batch.purification?.magnesolG ? <Metric label={t("Magnesol (dry wash)")} value={`${batch.purification.magnesolG.toFixed(1)} g`} /> : null}
             {batch.biodieselOutputMl ? (
-              <Metric label="Biodiesel output" value={`${batch.biodieselOutputMl.toFixed(1)} mL`} sub={batch.purification?.outputWeightG ? `${batch.purification.outputWeightG.toFixed(1)} g on the output load cell` : undefined} />
+              <Metric label={t("Biodiesel output")} value={`${batch.biodieselOutputMl.toFixed(1)} mL`} sub={batch.purification?.outputWeightG ? t("{grams} g on the output load cell", { grams: batch.purification.outputWeightG.toFixed(1) }) : undefined} />
             ) : null}
-            <div><div className="gv-label">Lab test</div><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{batch.labResult}</Status></div>
-            {batch.labReference && <Metric label="Lab reference no." value={batch.labReference} />}
+            <div><div className="gv-label">{t("Lab test")}</div><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></div>
+            {batch.labReference && <Metric label={t("Lab reference no.")} value={batch.labReference} />}
           </div>
         </Card>
         <Card className="p-6">
-          <Heading as="h2" className="text-lg font-semibold">Batch Timeline</Heading>
+          <Heading as="h2" className="text-lg font-semibold">{t("Batch Timeline")}</Heading>
           <div className="mt-6">
             {timeline.map(([label, time], index) => (
               <div key={`${index}-${label}`} className="relative flex gap-4 pb-6 last:pb-0">
@@ -114,14 +118,14 @@ export default function BatchDetails() {
       </div>
       {batch.labResult === "Pending" && (
         <Card className="p-6">
-          <Heading as="h2" className="text-lg font-semibold">Record lab result</Heading>
-          <p className="mt-1 text-sm text-gray-500">Update this batch when the laboratory certificate arrives.</p>
+          <Heading as="h2" className="text-lg font-semibold">{t("Record lab result")}</Heading>
+          <p className="mt-1 text-sm text-gray-500">{t("Update this batch when the laboratory certificate arrives.")}</p>
           <div className="mt-5 max-w-md">
-            <Field label="Lab reference no. (optional)" value={labReference} onChange={(event) => setLabReference(event.target.value)} />
+            <Field label={t("Lab reference no. (optional)")} value={labReference} onChange={(event) => setLabReference(event.target.value)} />
           </div>
           <div className="mt-5 flex flex-wrap gap-3">
-            <Button onClick={() => recordLabResult("Passed")}>Passed</Button>
-            <Button variant="danger" onClick={() => recordLabResult("Failed")}>Failed</Button>
+            <Button onClick={() => recordLabResult("Passed")}>{t("Passed")}</Button>
+            <Button variant="danger" onClick={() => recordLabResult("Failed")}>{t("Failed")}</Button>
           </div>
           {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
         </Card>

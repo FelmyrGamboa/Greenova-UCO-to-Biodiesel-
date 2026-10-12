@@ -89,6 +89,15 @@ def transesterification(oil_g: float, acid_pct: float, ratio: float, catalyst: s
     }
 
 
+MAGNESOL_FRACTION = 0.01                     # 1% of the biodiesel (about the oil weight)
+
+
+def magnesol_g(oil_volume_ml: float, s: Settings) -> float:
+    """Magnesol for the dry wash: oil mL × 0.92 × 1% = oil mL × 0.0092 g, rounded to 0.1 g.
+    (Faccini et al.: 1% was the best adsorbent dose; Dallas Group patent: 0.5-4%.)"""
+    return round(oil_volume_ml * s.oil_density * MAGNESOL_FRACTION + 1e-9, 1)
+
+
 def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Settings) -> dict:
     """Everything the Chemical Quantity Calculator shows. With esterification, the catalyst is an
     "up to" amount (neutralizing the target FFA); without it, the amount is exact."""
@@ -126,6 +135,7 @@ def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Set
         "transesterificationAcetoneMl": trans["acetoneMl"],
         "transesterificationPremixMl": trans["transesterificationPremixMl"],
         "transesterificationPremixG": trans["transesterificationPremixG"],
+        "magnesolG": magnesol_g(volume, s),
         "isEstimate": ester_needed,
         "warnings": warnings,
     }

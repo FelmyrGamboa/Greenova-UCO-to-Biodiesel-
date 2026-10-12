@@ -19,6 +19,7 @@ import {
 import { Card, Heading, Metric, SelectField, Status } from "../components/ui";
 import { ffaBoundaries, formatFfa, type DemoBatch } from "../lib/greenovaData";
 import { useBatches } from "../lib/api";
+import { useT, type TFunction } from "../lib/i18n";
 
 const chartColors = {
   green: "#22c55e",
@@ -110,12 +111,12 @@ function parameterSignature(batch: DemoBatch) {
   ].join("|");
 }
 
-function parameterDescription(batch?: DemoBatch) {
-  if (!batch) return "Using defaults";
+function parameterDescription(t: TFunction, batch?: DemoBatch) {
+  if (!batch) return t("Using defaults");
   const esterification = batch.esterificationRun
-    ? `Esterification ${batch.esterificationVoltage ?? 20} V · ${batch.esterificationTime ?? 120} min · ${batch.esterificationStirring ?? 500} RPM · 2 stages`
-    : "Esterification skipped · 1 stage";
-  return `${esterification}; Transesterification ${batch.voltage ?? 30} V · ${batch.reactionTime} min · ${batch.stirringSpeed} RPM · ${batch.methanolRatio ?? 7}:1`;
+    ? `${t("Esterification")} ${batch.esterificationVoltage ?? 20} V · ${batch.esterificationTime ?? 120} min · ${batch.esterificationStirring ?? 500} RPM · ${t("2 stages")}`
+    : t("Esterification skipped · 1 stage");
+  return `${esterification}; ${t("Transesterification")} ${batch.voltage ?? 30} V · ${batch.reactionTime} min · ${batch.stirringSpeed} RPM · ${batch.methanolRatio ?? 7}:1`;
 }
 
 function buildRangeRows(tested: DemoBatch[], settings: AnalyticsSettings) {
@@ -180,13 +181,14 @@ function ChartTooltip({
   payload?: Array<{ name: string; value: number; unit?: string; payload?: DemoBatch }>;
   label?: string;
 }) {
+  const t = useT();
   if (!active || !payload?.length) return null;
   const result = payload[0]?.payload?.labResult;
   return (
     <div className="rounded-lg border border-white/10 bg-gv-surface px-3 py-2 text-xs shadow-xl">
       {label && <div className="mb-1 text-gray-500">{label}</div>}
-      {result && <div className={result === "Passed" ? "mb-1 text-green-400" : "mb-1 text-red-400"}>{result}</div>}
-      {payload.map((item) => <div key={item.name} className="font-mono text-gray-300">{item.name}: {Number(item.value).toFixed(1)}{item.unit}</div>)}
+      {result && <div className={result === "Passed" ? "mb-1 text-green-400" : "mb-1 text-red-400"}>{t(result)}</div>}
+      {payload.map((item) => <div key={item.name} className="font-mono text-gray-300">{t(item.name)}: {Number(item.value).toFixed(1)}{item.unit}</div>)}
     </div>
   );
 }
@@ -198,15 +200,17 @@ function ResultMarker(props: { cx?: number; cy?: number; payload?: DemoBatch }) 
 }
 
 function ResultLegend() {
+  const t = useT();
   return (
     <div className="flex items-center justify-center gap-5 text-xs text-gray-500">
-      <span className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full bg-green-500" />Passed</span>
-      <span className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full border-2 border-red-500" />Failed</span>
+      <span className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full bg-green-500" />{t("Passed")}</span>
+      <span className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full border-2 border-red-500" />{t("Failed")}</span>
     </div>
   );
 }
 
 export default function BatchHistory() {
+  const t = useT();
   const [tab, setTab] = useState<"history" | "analytics">("history");
   const { batches, source } = useBatches();
   const settings = useMemo(readAnalyticsSettings, []);
@@ -237,45 +241,45 @@ export default function BatchHistory() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <div className="section-kicker">Production records</div>
-          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">Batch History</Heading>
-          <p className="mt-2 text-sm text-gray-500">Review production records, compare outcomes, and observe relationships in recorded batch data.</p>
+          <div className="section-kicker">{t("Production records")}</div>
+          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Batch History")}</Heading>
+          <p className="mt-2 text-sm text-gray-500">{t("Review production records, compare outcomes, and observe relationships in recorded batch data.")}</p>
         </div>
         <div className="flex rounded-lg border border-white/[0.08] bg-gv-inset p-1">
-          <button onClick={() => setTab("history")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "history" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>History</button>
-          <button onClick={() => setTab("analytics")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "analytics" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>Analytics</button>
+          <button onClick={() => setTab("history")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "history" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>{t("History")}</button>
+          <button onClick={() => setTab("analytics")} className={`rounded-md px-4 py-2 text-xs font-semibold transition-colors ${tab === "analytics" ? "bg-green-500 text-black" : "text-gray-500 hover:text-white"}`}>{t("Analytics")}</button>
         </div>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Card className="p-5"><Metric label="Total batches" value={batches.length} sub={source === "backend" ? "Raspberry Pi records" : "Sample prototype data"} /></Card>
-        <Card className="p-5"><Metric label="Completion rate" value={`${completionRate.toFixed(1)}%`} sub={`${completed.length} of ${batches.length} completed`} accent /></Card>
-        <Card className="p-5"><Metric label="Lab pass rate" value={labPassRate === null ? "—" : `${labPassRate.toFixed(1)}%`} sub={tested.length ? `${passed.length} of ${tested.length} tested` : "No lab results yet"} accent={labPassRate !== null} /></Card>
-        <Card className="p-5"><Metric label="Average yield" value={`${(completed.reduce((sum, item) => sum + item.yield, 0) / Math.max(completed.length, 1)).toFixed(1)}%`} sub="Sample prototype data" /></Card>
+        <Card className="p-5"><Metric label={t("Total batches")} value={batches.length} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
+        <Card className="p-5"><Metric label={t("Completion rate")} value={`${completionRate.toFixed(1)}%`} sub={t("{done} of {total} completed", { done: completed.length, total: batches.length })} accent /></Card>
+        <Card className="p-5"><Metric label={t("Lab pass rate")} value={labPassRate === null ? "—" : `${labPassRate.toFixed(1)}%`} sub={tested.length ? t("{passed} of {tested} tested", { passed: passed.length, tested: tested.length }) : t("No lab results yet")} accent={labPassRate !== null} /></Card>
+        <Card className="p-5"><Metric label={t("Average yield")} value={`${(completed.reduce((sum, item) => sum + item.yield, 0) / Math.max(completed.length, 1)).toFixed(1)}%`} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
       </div>
 
       {tab === "history" ? (
         <Card className="overflow-hidden">
           <div className="border-b border-white/[0.06] px-6 py-5">
-            <Heading as="h2" className="text-lg font-semibold">All batches</Heading>
-            <p className="mt-1 text-xs text-gray-600">{source === "backend" ? "Stored on the Raspberry Pi" : "Locally stored prototype records"}</p>
+            <Heading as="h2" className="text-lg font-semibold">{t("All batches")}</Heading>
+            <p className="mt-1 text-xs text-gray-600">{source === "backend" ? t("Stored on the Raspberry Pi") : t("Locally stored prototype records")}</p>
           </div>
           <div className="overflow-x-auto">
             <table className="gv-table min-w-[1080px]">
-              <thead><tr><th>Batch ID</th><th>Date</th><th>Oil Volume</th><th>FFA %</th><th>Biodiesel Yield</th><th>Duration</th><th>Energy Used</th><th>Status</th><th>Lab Test</th><th>Details</th></tr></thead>
+              <thead><tr><th>{t("Batch ID")}</th><th>{t("Date")}</th><th>{t("Oil Volume")}</th><th>{t("FFA %")}</th><th>{t("Biodiesel Yield")}</th><th>{t("Duration")}</th><th>{t("Energy Used")}</th><th>{t("Status")}</th><th>{t("Lab Test")}</th><th>{t("Details")}</th></tr></thead>
               <tbody>
                 {batches.map((batch) => (
                   <tr key={batch.id}>
                     <td className="font-mono !text-green-400">{batch.id}</td>
                     <td>{new Date(batch.date).toLocaleDateString()}</td>
                     <td>{batch.oilVolume.toLocaleString()} mL</td>
-                    <td><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">Esterified{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${batch.esterificationStages.length} stages` : ""}</div>}</td>
+                    <td><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">{t("Esterified")}{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${t("{count} stages", { count: batch.esterificationStages.length })}` : ""}</div>}</td>
                     <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
                     <td>{batch.duration} min</td>
                     <td>{batch.energy} kWh</td>
-                    <td><Status tone={batch.status === "Completed" ? "green" : batch.status === "In Progress" ? "blue" : batch.status === "Cancelled" ? "yellow" : "red"}>{batch.status}</Status></td>
-                    <td><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{batch.labResult}</Status></td>
-                    <td><Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">View details →</Link></td>
+                    <td><Status tone={batch.status === "Completed" ? "green" : batch.status === "In Progress" ? "blue" : batch.status === "Cancelled" ? "yellow" : "red"}>{t(batch.status)}</Status></td>
+                    <td><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></td>
+                    <td><Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">{t("View details")} →</Link></td>
                   </tr>
                 ))}
               </tbody>
@@ -286,23 +290,23 @@ export default function BatchHistory() {
         <div className="space-y-6">
           <Card className="overflow-hidden">
             <div className="border-b border-white/[0.06] p-6">
-              <div className="section-kicker">Tested batches only</div>
-              <Heading as="h2" className="mt-2 text-xl font-semibold">Best Parameters per FFA Range</Heading>
-              <p className="mt-1 text-xs text-gray-600">Recommendations use the highest average yield among Passed batches · Sample prototype data</p>
+              <div className="section-kicker">{t("Tested batches only")}</div>
+              <Heading as="h2" className="mt-2 text-xl font-semibold">{t("Best Parameters per FFA Range")}</Heading>
+              <p className="mt-1 text-xs text-gray-600">{t("Recommendations use the highest average yield among Passed batches")}</p>
             </div>
             <div className="overflow-x-auto">
               <table className="gv-table min-w-[1250px]">
-                <thead><tr><th>FFA range</th><th>Tested batches</th><th>Lab pass rate</th><th>Recommended parameters</th><th>Average yield</th><th>Yield spread</th><th>Status</th></tr></thead>
+                <thead><tr><th>{t("FFA range")}</th><th>{t("Tested batches")}</th><th>{t("Lab pass rate")}</th><th>{t("Recommended parameters")}</th><th>{t("Average yield")}</th><th>{t("Yield spread")}</th><th>{t("Status")}</th></tr></thead>
                 <tbody>
                   {rangeRows.map((row) => (
                     <tr key={row.range.key}>
-                      <td className="font-medium !text-white">{row.range.label}</td>
+                      <td className="font-medium !text-white">{t(row.range.label)}</td>
                       <td>{row.batches.length}</td>
                       <td>{row.batches.length ? `${((row.passed.length / row.batches.length) * 100).toFixed(1)}%` : "—"}</td>
-                      <td className="max-w-md leading-5">{parameterDescription(row.recommended)}</td>
+                      <td className="max-w-md leading-5">{parameterDescription(t, row.recommended)}</td>
                       <td>{row.averageYield === null ? "—" : `${row.averageYield.toFixed(1)}%`}</td>
                       <td>{row.minimumYield === null ? "—" : `${row.minimumYield.toFixed(1)}–${row.maximumYield?.toFixed(1)}%`}</td>
-                      <td><Status tone={row.status === "Proven" ? "green" : row.status === "Testing" ? "yellow" : "neutral"}>{row.status}</Status></td>
+                      <td><Status tone={row.status === "Proven" ? "green" : row.status === "Testing" ? "yellow" : "neutral"}>{t(row.status)}</Status></td>
                     </tr>
                   ))}
                 </tbody>
@@ -312,15 +316,15 @@ export default function BatchHistory() {
 
           <div className="grid gap-6 xl:grid-cols-2">
             <Card className="p-6">
-              <Heading as="h2" className="text-lg font-semibold">Yield Comparison</Heading>
-              <p className="mt-1 text-xs text-gray-600">Lab result shown by color and label · Sample prototype data</p>
+              <Heading as="h2" className="text-lg font-semibold">{t("Yield Comparison")}</Heading>
+              <p className="mt-1 text-xs text-gray-600">{t("Lab result shown by color and label")}</p>
               <div className="mt-6 h-72">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={data} margin={{ top: 22, bottom: 18 }}>
                     <CartesianGrid stroke={chartColors.grid} vertical={false} />
                     <XAxis dataKey="short" stroke={chartColors.text} fontSize={11} tick={(props) => {
                       const batch = data.find((item) => item.short === props.payload.value);
-                      return <text x={props.x} y={Number(props.y) + 10} textAnchor="middle" fill={chartColors.text} fontSize={10}><tspan x={props.x}>{props.payload.value}</tspan><tspan x={props.x} dy="13" fill={batch?.labResult === "Passed" ? chartColors.green : chartColors.red}>{batch?.labResult}</tspan></text>;
+                      return <text x={props.x} y={Number(props.y) + 10} textAnchor="middle" fill={chartColors.text} fontSize={10}><tspan x={props.x}>{props.payload.value}</tspan><tspan x={props.x} dy="13" fill={batch?.labResult === "Passed" ? chartColors.green : chartColors.red}>{batch ? t(batch.labResult) : ""}</tspan></text>;
                     }} />
                     <YAxis domain={[0, 100]} stroke={chartColors.text} fontSize={11} />
                     <Tooltip content={<ChartTooltip />} />
@@ -334,8 +338,8 @@ export default function BatchHistory() {
             </Card>
 
             <Card className="p-6">
-              <Heading as="h2" className="text-lg font-semibold">FFA % vs. Yield</Heading>
-              <p className="mt-1 text-xs text-gray-600">Starting FFA and tested yield · Sample prototype data</p>
+              <Heading as="h2" className="text-lg font-semibold">{t("FFA % vs. Yield")}</Heading>
+              <p className="mt-1 text-xs text-gray-600">{t("Starting FFA and tested yield")}</p>
               <div className="mt-5 h-64">
                 <ResponsiveContainer width="100%" height="100%">
                   <ScatterChart>
@@ -343,7 +347,7 @@ export default function BatchHistory() {
                     <XAxis type="number" dataKey="ffa" name="FFA" unit="%" stroke={chartColors.text} fontSize={10} />
                     <YAxis type="number" dataKey="yield" name="Yield" unit="%" domain={[0, 100]} stroke={chartColors.text} fontSize={10} />
                     <Tooltip content={<ChartTooltip />} />
-                    <ReferenceLine x={4} stroke={chartColors.amber} strokeDasharray="5 5" label={{ value: "Esterification cutoff", fill: chartColors.amber, fontSize: 10, position: "insideTopRight" }} />
+                    <ReferenceLine x={4} stroke={chartColors.amber} strokeDasharray="5 5" label={{ value: t("Esterification cutoff"), fill: chartColors.amber, fontSize: 10, position: "insideTopRight" }} />
                     <Scatter data={data} shape={<ResultMarker />} />
                   </ScatterChart>
                 </ResponsiveContainer>
@@ -353,15 +357,15 @@ export default function BatchHistory() {
           </div>
 
           <Card className="p-6">
-            <Heading as="h2" className="text-lg font-semibold">Energy and Processing Time</Heading>
-            <p className="mt-1 text-xs text-gray-600">Normalized energy and total process duration · Sample prototype data</p>
+            <Heading as="h2" className="text-lg font-semibold">{t("Energy and Processing Time")}</Heading>
+            <p className="mt-1 text-xs text-gray-600">{t("Normalized energy and total process duration")}</p>
             <div className="mt-6 grid gap-6 lg:grid-cols-2">
               {[
                 { title: "Energy per liter (kWh/L)", key: "energyPerLiter", color: chartColors.green, unit: " kWh/L" },
                 { title: "Processing time (min)", key: "duration", color: chartColors.blue, unit: " min" },
               ].map((chart) => (
                 <div key={chart.key} className="rounded-xl border border-white/[0.06] bg-gv-inset p-4">
-                  <div className="text-sm font-semibold text-gray-300">{chart.title}</div>
+                  <div className="text-sm font-semibold text-gray-300">{t(chart.title)}</div>
                   <div className="mt-3 h-52">
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={data}>
@@ -381,13 +385,13 @@ export default function BatchHistory() {
           <Card className="p-6">
             <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="max-w-3xl">
-                <div className="section-kicker">Batch data analysis</div>
-                <Heading as="h2" className="mt-2 text-xl font-semibold">Observed Batch Correlations</Heading>
-                <p className="mt-2 text-sm leading-6 text-gray-500">These charts show association only and do not establish scientific causation.</p>
+                <div className="section-kicker">{t("Batch data analysis")}</div>
+                <Heading as="h2" className="mt-2 text-xl font-semibold">{t("Observed Batch Correlations")}</Heading>
+                <p className="mt-2 text-sm leading-6 text-gray-500">{t("These charts show association only and do not establish scientific causation.")}</p>
               </div>
               <div className="w-full sm:w-48">
-                <SelectField label="FFA range" value={selectedRangeKey} onChange={(event) => setSelectedRangeKey(event.target.value)}>
-                  {settings.ranges.map((range) => <option key={range.key} value={range.key}>{range.label}</option>)}
+                <SelectField label={t("FFA range")} value={selectedRangeKey} onChange={(event) => setSelectedRangeKey(event.target.value)}>
+                  {settings.ranges.map((range) => <option key={range.key} value={range.key}>{t(range.label)}</option>)}
                 </SelectField>
               </div>
             </div>
@@ -398,7 +402,7 @@ export default function BatchHistory() {
                 { title: "Stirring speed vs. yield", x: "stirringSpeed", xName: "Stirring speed", unit: " RPM" },
               ].map((chart) => (
                 <div key={chart.title} className="rounded-xl border border-white/[0.06] bg-gv-inset p-4">
-                  <div className="text-sm font-semibold text-gray-300">{chart.title}</div>
+                  <div className="text-sm font-semibold text-gray-300">{t(chart.title)}</div>
                   <div className="mt-3 h-52">
                     <ResponsiveContainer width="100%" height="100%">
                       <ScatterChart>
@@ -419,14 +423,14 @@ export default function BatchHistory() {
           <Card className="p-6">
             <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
               <div>
-                <div className="section-kicker">Tested batches only</div>
-                <Heading as="h2" className="mt-2 text-xl font-semibold">Cost per Liter</Heading>
-                <p className="mt-1 text-xs text-gray-600">Recorded materials and configured Settings prices · Sample prototype data</p>
+                <div className="section-kicker">{t("Tested batches only")}</div>
+                <Heading as="h2" className="mt-2 text-xl font-semibold">{t("Cost per Liter")}</Heading>
+                <p className="mt-1 text-xs text-gray-600">{t("Recorded materials and configured Settings prices")}</p>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
-                <div><div className="gv-label">Average cost</div><Status tone={costTone}>{averageCost === null ? "—" : `₱${averageCost.toFixed(2)}/L`}</Status></div>
-                <Metric label="Diesel price" value={`₱${settings.prices.diesel.toFixed(2)}/L`} />
-                <Metric label="Target" value={`₱${targetCost.toFixed(2)}/L`} sub="Half of diesel price" />
+                <div><div className="gv-label">{t("Average cost")}</div><Status tone={costTone}>{averageCost === null ? "—" : `₱${averageCost.toFixed(2)}/L`}</Status></div>
+                <Metric label={t("Diesel price")} value={`₱${settings.prices.diesel.toFixed(2)}/L`} />
+                <Metric label={t("Target")} value={`₱${targetCost.toFixed(2)}/L`} sub={t("Half of diesel price")} />
               </div>
             </div>
             <div className="mt-6 h-56">

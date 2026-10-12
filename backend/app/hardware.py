@@ -4,17 +4,20 @@ MockHardware simulates the machine for demos and testing. PiHardware talks to th
 
 The machine:
 - Main reactor on the input load cell (oil and acetone are poured in by hand through the
-  filtered inlet; the two dosing pumps add their premix): electrodes, stirrer, temperature.
+  filtered inlet; the two dosing pumps add their premix): graphite-graphite electrodes on a DC
+  power supply with a current limit, stirrer, temperature.
   Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H2SO4 in methanol.
 - Reactor outlet valve -> centrifuge (opens after transesterification).
 - Centrifuge, and its outlet valve -> purification tank (opens after separation).
-- Purification tank: immersion heater, dry wash stirrer, level switch at the heater; its outlet
-  valve ("mesh_bed") lets the biodiesel through the activated-bentonite mesh bed into the
-  output container on the output load cell (the yield).
+- Purification tank (dry wash with Magnesol): immersion heater, dry wash stirrer, level switch
+  at the heater; its outlet valve (named "mesh_bed" in the code) lets the biodiesel through the
+  filter into the output container on the output load cell (the yield).
 
 The safety rules live here, so they apply no matter who switches things (a process sequence,
 a manual button on the website, or a bug):
-- The heater can't turn on while the purification outlet valve is open; opening it turns the heater off.
+- The heater runs only while the dry wash stirrer runs and the heater is submerged (level switch),
+  and never with the purification outlet open. Stopping the stirrer or opening the outlet turns
+  the heater off first.
 - The dosing pumps can't run while the reactor outlet valve is open, and the reverse.
 - The centrifuge outlet can't open while the centrifuge spins, and the centrifuge can't start
   while its outlet is open.
@@ -57,10 +60,24 @@ class Hardware:
 
     # ----- outputs, with interlocks -----
     def set_heater(self, on: bool) -> None:
-        if on and self.valves.get("mesh_bed"):
-            raise InterlockError("The heater can't turn on while the purification outlet valve is open.")
+        if on:
+            if self.valves.get("mesh_bed"):
+                raise InterlockError("The heater can't turn on while the purification outlet valve is open.")
+            if not self.motor_duty.get("purification_stirrer"):
+                raise InterlockError("The heater runs only while the purification stirrer is running.")
+            if self.read().get("heaterSubmerged") is False:
+                raise InterlockError("The heater can't turn on: the level switch doesn't detect biodiesel.")
         self._write_heater(on)
         self.heater_on = on
+
+    @property
+    def current_limit_control(self) -> bool:
+        """True when the Pi can set the power supply's current limit."""
+        return config.POWER_SUPPLY_CURRENT_CONTROL
+
+    def set_current_limit(self, amps: float) -> None:
+        if self.current_limit_control:
+            self._write_current_limit(amps)
 
     def set_valve(self, name: str, is_open: bool) -> None:
         if name not in self.valves:
@@ -85,6 +102,8 @@ class Hardware:
         duty = min(max(duty, 0.0), 1.0)
         if duty > 0 and name == "centrifuge" and self.valves.get("centrifuge_outlet"):
             raise InterlockError("The centrifuge can't start while its outlet valve is open.")
+        if duty == 0 and name == "purification_stirrer" and self.heater_on:
+            self.set_heater(False)          # the heater never runs without the stirrer
         self._write_motor(name, duty)
         self.motor_duty[name] = duty
 
@@ -99,7 +118,7 @@ class Hardware:
         self.pumps[name] = on
 
     def all_off(self) -> None:
-        self.set_heater(False)
+        self.set_heater(False)          # first, so stopping the stirrer below is safe
         self.set_electrode_power(False)
         for name in self.pumps:
             self.set_pump(name, False)
@@ -138,6 +157,9 @@ class Hardware:
         if self.heater_on and (problem or t > heater_max_c):
             self.set_heater(False)
             return f"Heater stopped: {problem or f'temperature exceeded {heater_max_c:g} °C'}."
+        if self.heater_on and self.read().get("heaterSubmerged") is False:
+            self.set_heater(False)
+            return "Heater stopped: biodiesel level dropped below the heater."
         if self.electrode_power_on and (problem or t > reaction_max_c):
             self.set_electrode_power(False)
             return f"Electrodes stopped: {problem or f'temperature exceeded {reaction_max_c:g} °C'}."
@@ -162,21 +184,26 @@ class Hardware:
     def _write_pump(self, name: str, on: bool) -> None:
         raise NotImplementedError
 
+    def _write_current_limit(self, amps: float) -> None:
+        raise NotImplementedError
+
     def close(self) -> None:
         pass
 
 
 class MockHardware(Hardware):
     """A simulated machine. Liquids move between the parts: pumps add premix to the reactor at
-    about 80 g/min, the reactor outlet and the centrifuge outlet pass about 6 g/s, and the mesh
-    bed about 35 g (40 mL) of biodiesel per minute. After separation, the biodiesel (85% of the
-    oil's weight) flows on to the purification tank; glycerol and the rest stay in the
-    centrifuge. The heater warms the biodiesel about 45 °C per minute (about a minute to 70 °C).
+    about 80 g/min, the reactor outlet and the centrifuge outlet pass about 15 g/s (a batch in
+    under a minute), and the
+    purification outlet (through the filter) about 3 g/s. After separation, the biodiesel (85% of
+    the oil's weight) flows on to the purification tank; glycerol and the rest stay in the
+    centrifuge. The heater warms the biodiesel about 45 °C per minute (under 1.5 min to 90 °C).
+    The electrode current stays just under the power supply's current limit.
     time_scale > 1 makes it run faster for demos."""
     AMBIENT_C = 27.0
     PUMP_G_PER_S = 80 / 60
-    DRAIN_G_PER_S = 6.0
-    MESH_G_PER_S = 0.59
+    DRAIN_G_PER_S = 15.0
+    OUTLET_G_PER_S = 3.0
     BIODIESEL_FRACTION = 0.85
 
     def __init__(self, time_scale: float = 1.0):
@@ -189,9 +216,10 @@ class MockHardware(Hardware):
         self.reactor_g = 0.0      # on the input load cell
         self.centrifuge_g = 0.0
         self.biodiesel_left_g = 0.0   # biodiesel still in the centrifuge
-        self.tank_g = 0.0         # purification tank, above the mesh bed
+        self.tank_g = 0.0         # purification tank, above the outlet filter
         self.output_g = 0.0       # on the output load cell
         self.supply_voltage = 30.0
+        self.supply_current_limit = 1.0   # set on the supply (by the Pi, or by hand in the simulation)
 
     # demo helpers (only used in demo mode)
     def demo_load_oil(self, volume_ml: float, density: float = 0.92) -> None:
@@ -261,7 +289,7 @@ class MockHardware(Hardware):
             if self.valves["centrifuge_outlet"] and self.biodiesel_left_g > 0:
                 self._move_to_tank(self.DRAIN_G_PER_S * dt)
             if self.valves["mesh_bed"] and self.tank_g > 0:
-                moved = min(self.tank_g, self.MESH_G_PER_S * dt)
+                moved = min(self.tank_g, self.OUTLET_G_PER_S * dt)
                 self.tank_g -= moved
                 self.output_g += moved
 
@@ -273,10 +301,11 @@ class MockHardware(Hardware):
             "outputWeightG": round(self.output_g, 1),
             "temperature": round(self.temp_c + random.uniform(-0.1, 0.1), 1),
             "voltage": self.supply_voltage if on else 0.0,
-            "current": round(1.8 + random.uniform(-0.05, 0.05), 2) if on else 0.0,
+            "current": round(self.supply_current_limit * 0.9 + random.uniform(-0.02, 0.02), 2) if on else 0.0,
             "stirrerRpm": round(self.motor_duty["stirrer"] * 900),
             "centrifugeRpm": round(self.motor_duty["centrifuge"] * 3000),
-            "purificationStirrerRpm": round(self.motor_duty["purification_stirrer"] * 600),
+            "purificationStirrerRpm": (round(self.motor_duty["purification_stirrer"] * 600 + random.uniform(-3, 2))
+                                       if self.motor_duty["purification_stirrer"] else 0),
             "heaterSubmerged": self.tank_g > 30,   # simulated level switch at the heater's height
         }
 
@@ -294,6 +323,9 @@ class MockHardware(Hardware):
 
     def _write_pump(self, name: str, on: bool) -> None:
         self._advance()
+
+    def _write_current_limit(self, amps: float) -> None:
+        self.supply_current_limit = amps
 
 
 class PiHardware(Hardware):
@@ -344,6 +376,12 @@ class PiHardware(Hardware):
 
     def _write_motor(self, name: str, duty: float) -> None:
         self._motors[name].value = duty
+
+    def _write_current_limit(self, amps: float) -> None:
+        # TODO: only if your power supply has a control input (GREENOVA_PSU_CURRENT_CONTROL=1),
+        # e.g. send the current limit over its serial/USB port. Otherwise leave it: the website
+        # tells the operator to set the current on the supply.
+        raise NotImplementedError("Set the power supply's current limit by hand, or fill in _write_current_limit.")
 
     def _read_sensors(self) -> dict:
         return {

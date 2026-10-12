@@ -20,25 +20,42 @@ def approx(value, expected, tol=0.01):
 
 # ---------- settings ----------
 def test_settings_use_the_website_keys():
-    s = Settings.model_validate({"purificationTargetTemperature": 60, "format": "G-{YEAR}-{SEQ}",
+    s = Settings.model_validate({"methanolRemovalTime": 12, "format": "G-{YEAR}-{SEQ}",
                                  "kohPurity": 85, "ffaRangeBoundaries": [0, 3, 6]})
     dumped = s.dump()
-    assert dumped["purificationTargetTemperature"] == 60 and dumped["format"] == "G-{YEAR}-{SEQ}"
+    assert dumped["methanolRemovalTime"] == 12 and dumped["format"] == "G-{YEAR}-{SEQ}"
     assert dumped["kohPurity"] == 85 and dumped["ffaRangeBoundaries"] == "0,3,6"
-    assert {"meshBedFlowRate", "drainTime", "heatingTimeout", "purificationHoldTime", "provenBatchCount",
+    assert {"methanolRemovalTime", "contactTime", "settlingTime", "maxDrainTemperature", "provenBatchCount",
             "dieselPrice"} <= dumped.keys()
+    # old purification keys saved by earlier versions are ignored
+    assert Settings.model_validate({"meshBedFlowRate": 40, "purificationTargetTemperature": 70}).methanol_removal_time == 10
 
 
-def test_purification_defaults_and_flow_time():
-    assert S.purification_target_temperature == 70 and S.purification_hold_time == 25
-    assert S.planned_flow_seconds(500) == 750            # 500 mL at 40 mL/min = 12.5 min
-    assert S.planned_flow_seconds(1000) == 1500
-    assert S.planned_flow_seconds(40) == 120             # never shorter than the 2 min minimum
-    assert S.planned_flow_seconds(None) == 1500          # unknown volume: plan for the largest batch
+def test_purification_and_stage_defaults():
+    assert (S.methanol_removal_time, S.contact_time, S.settling_time, S.max_drain_temperature) == (10, 15, 10, 50)
+    assert S.reactor_drain_time == 1
+    for limits in (S.esterification, S.transesterification):
+        assert (limits.voltage.min, limits.voltage.max) == (10, 30)
+        assert (limits.time.min, limits.time.max, limits.time.default) == (30, 180, 120)
+        assert (limits.current.min, limits.current.max, limits.current.default) == (0.5, 2, 1)
 
 
-@pytest.mark.parametrize("bad", [{"ffaRangeBoundaries": "5"}, {"purificationTargetTemperature": 80},
-                                 {"purificationTargetTemperature": 70, "purificationMaximumTemperature": 70}])
+def test_old_saved_settings_get_the_new_defaults(tmp_path):
+    config.DB_PATH = tmp_path / "old.db"
+    db.init_db()
+    old = Settings()
+    old.esterification.voltage.min = 18
+    old.esterification.time.max = 120
+    old.transesterification.voltage.min = 18
+    old.reactor_drain_time = 3
+    db.save_settings(old)
+    s = db.get_settings()
+    assert s.esterification.voltage.min == 10 and s.esterification.time.max == 180
+    assert s.transesterification.voltage.min == 10 and s.reactor_drain_time == 1
+
+
+@pytest.mark.parametrize("bad", [{"ffaRangeBoundaries": "5"}, {"methanolRemovalTime": 4},
+                                 {"methanolRemovalTime": 31}, {"maxDrainTemperature": 95}])
 def test_settings_validation(bad):
     with pytest.raises(ValueError):
         Settings.model_validate(bad)
@@ -60,6 +77,12 @@ def test_calculator_with_esterification():
     assert approx(q["transesterificationPremixG"], 122.58)
     same = calculations.quantity_cards(460, 4.5, 7, "NaOH", S)   # any FFA above 4%: the same dose
     assert same["esterificationMethanolMl"] == q["esterificationMethanolMl"]
+
+
+def test_magnesol_amount():
+    # oil mL × 0.92 × 1% = oil mL × 0.0092 g, rounded to 0.1 g
+    assert [calculations.magnesol_g(ml, S) for ml in (100, 250, 500, 750, 1000)] == [0.9, 2.3, 4.6, 6.9, 9.2]
+    assert calculations.quantity_cards(460, 3, 7, "NaOH", S)["magnesolG"] == 4.6
 
 
 def test_design_ffa_setting():
@@ -157,9 +180,26 @@ def test_summary_and_cost():
 # ---------- safety ----------
 def test_interlocks():
     hw = MockHardware()
+    hw.demo_fill_tank(400)
+    hw.refresh()
+    with pytest.raises(InterlockError):
+        hw.set_heater(True)                    # the heater needs the stirrer running
+    hw.set_motor("purification_stirrer", 0.33)
     hw.set_heater(True)
     hw.set_valve("mesh_bed", True)            # opening the valve turns the heater off
     assert not hw.heater_on and hw.valves["mesh_bed"]
+    with pytest.raises(InterlockError):
+        hw.set_heater(True)
+    hw.set_valve("mesh_bed", False)
+    hw.set_heater(True)
+    hw.set_motor("purification_stirrer", 0)   # stopping the stirrer turns the heater off
+    assert not hw.heater_on
+
+
+def test_heater_needs_biodiesel_at_the_level_switch():
+    hw = MockHardware()
+    hw.refresh()                              # empty tank: the level switch reads dry
+    hw.set_motor("purification_stirrer", 0.33)
     with pytest.raises(InterlockError):
         hw.set_heater(True)
 
@@ -188,36 +228,46 @@ def test_pump_and_valve_interlocks():
 
 def test_watchdog():
     hw = MockHardware()
-    hw.set_heater(True)
-    hw.demo_set_temperature(80)
+    hw.demo_fill_tank(400)
     hw.refresh()
-    assert hw.watchdog(75, 60) == "Heater stopped: temperature exceeded 75 °C." and not hw.heater_on
+    hw.set_motor("purification_stirrer", 0.33)
+    hw.set_heater(True)
+    hw.demo_set_temperature(97)
+    hw.refresh()
+    assert hw.watchdog(95, 60) == "Heater stopped: temperature exceeded 95 °C." and not hw.heater_on
     hw.set_electrode_power(True)
-    assert hw.watchdog(75, 60).startswith("Electrodes stopped") and not hw.electrode_power_on
+    assert hw.watchdog(95, 60).startswith("Electrodes stopped") and not hw.electrode_power_on
 
 
-# ---------- purification ----------
+# ---------- purification (dry wash with Magnesol) ----------
 SCALE = 400   # run the simulated machine 400x faster
 
 
-async def _purify(runner, hw, fault=None, skip=False, biodiesel_ml=500):
+async def _purify(runner, hw, fault=None, skip=False, oil_g=460, magnesol_g=4.6, confirm=True, settings=S):
+    """Runs a whole purification. The operator confirms the Magnesol when it's asked for."""
     async def sensor_loop():
         while True:
             hw.refresh()
             await asyncio.sleep(1 / runner.time_scale)
-    loop = None if fault else asyncio.create_task(sensor_loop())
-    records = []
-    runner.start(S, 70, "B-test", records.append, biodiesel_ml=biodiesel_ml, automatic=True)
-    if fault:
+    loop = asyncio.create_task(sensor_loop())
+    records, phases = [], []
+    runner.start(settings, "B-test", records.append, oil_g=oil_g, magnesol_g=magnesol_g, automatic=True)
+    if fault:   # a sensor goes wrong 20 simulated seconds into heating
         await asyncio.sleep(0.05)
-        hw._snapshot = {**hw.read(), **fault}
+        read = hw._read_sensors
+        hw._read_sensors = lambda: {**read(), **fault}
     while runner.running:
-        if skip:
+        phase = runner.state["phase"]
+        if not phases or phases[-1] != phase:
+            phases.append(phase)
+        if phase == "magnesol" and confirm:
+            runner.confirm_magnesol()
+        elif skip:
             runner.skip()
-        await asyncio.sleep(0.01)
-    if loop:
-        loop.cancel()
-    return records[0]
+        await asyncio.sleep(0.002)
+    phases.append(runner.state["phase"])
+    loop.cancel()
+    return records[0], phases
 
 
 def _demo_hw(scale=SCALE):
@@ -230,32 +280,37 @@ def _demo_hw(scale=SCALE):
 
 
 def test_purification_full_sequence():
-    # 100x (not 400x): finer simulated steps, so the ±1 °C hold isn't skewed by timer jitter
+    # 100x (not 400x): finer simulated steps, so the ±2 °C hold isn't skewed by timer jitter
     hw = _demo_hw(100)
     violations = []
     write = hw._write_heater
 
     def guarded(on):
-        if on and hw.valves["mesh_bed"]:
+        if on and (hw.valves["mesh_bed"] or not hw.motor_duty["purification_stirrer"]):
             violations.append(True)
         write(on)
     hw._write_heater = guarded
     runner = PurificationRunner(hw, 100)
-    rec = asyncio.run(_purify(runner, hw))
+    rec, phases = asyncio.run(_purify(runner, hw))
     st = runner.state
     assert st["phase"] == "complete", st
+    # the temperature is under 50 °C after contact and settling, so the cooling step is skipped
+    assert phases == ["heating", "methanol", "magnesol", "contact", "settling", "drain", "complete"]
     assert not rec["safetyStopOccurred"] and rec["automatic"] and rec["warning"] is None
-    assert rec["heatingTimeSeconds"] <= 90                     # about a minute to 70 °C
-    assert rec["holdTimeSeconds"] == 1500                      # 25 min default hold
-    assert 70 <= rec["highestTemperature"] < 72                # held at 70 ±1 °C, below the 75 °C cutoff
-    assert rec["plannedFlowSeconds"] == 750 and rec["flowTimeSeconds"] == 750   # 500 mL at 40 mL/min
-    assert 60 <= rec["drainTimeSeconds"] <= 180                # drained: weight steady for a minute
-    assert rec["outputWeightG"] > 380 and st["flowStableSeconds"] >= 60
+    assert rec["heatingTimeSeconds"] <= 100                    # 27 -> 90 °C at 45 °C per minute
+    assert rec["holdTimeSeconds"] == 600                       # 10 min methanol removal
+    assert 90 <= rec["highestTemperature"] < 93                # 90 ±2 °C, below the 95 °C cutoff
+    assert rec["magnesolAdded"] and rec["magnesolG"] == 4.6
+    assert rec["contactTimeSeconds"] == 900 and rec["settlingTimeSeconds"] == 600
+    assert rec["coolingTimeSeconds"] == 0
+    assert 30 <= rec["drainTimeSeconds"] <= 200                # stable ±2 g for 30 s after the flow
+    assert 385 < rec["outputWeightG"] < 395 and st["stableSeconds"] >= 30
+    assert rec["stirringSpeed"] == 200 and rec["oilWeightG"] == 460
     assert not violations and not hw.heater_on and not hw.valves["mesh_bed"]
-    assert rec["stirringSpeed"] == 300 and hw.motor_duty["purification_stirrer"] == 0
+    assert hw.motor_duty["purification_stirrer"] == 0
 
 
-def test_dry_wash_stirrer_runs_during_heating_and_hold():
+def test_purification_waits_for_the_magnesol():
     hw = _demo_hw()
     runner = PurificationRunner(hw, SCALE)
     seen = {}
@@ -266,54 +321,75 @@ def test_dry_wash_stirrer_runs_during_heating_and_hold():
                 hw.refresh()
                 await asyncio.sleep(1 / SCALE)
         loop = asyncio.create_task(sensor_loop())
-        runner.start(S, 70, "B-test", biodiesel_ml=500)
-        while runner.running:
+        runner.start(S, "B-test", oil_g=460, magnesol_g=4.6)
+        with pytest.raises(RuntimeError):
+            runner.confirm_magnesol()                          # not asked for yet
+        while runner.state["phase"] != "magnesol":
             st = runner.state
-            if st["phase"] in ("heating", "hold", "flow") and st["heatingTimeSeconds"] > 2:
-                seen.setdefault(st["phase"], set()).add((st["stirrerOn"], st["stirrerRpm"] if st["stirrerOn"] else None))
+            if st["phase"] in ("heating", "methanol") and st["heatingTimeSeconds"] > 2:
+                seen.setdefault(st["phase"], set()).add((st["stirrerOn"], st["stirrerRpm"] is not None and 195 <= st["stirrerRpm"] <= 202))
             await asyncio.sleep(0.002)
+        await asyncio.sleep(0.2)                               # 80 simulated seconds: still waiting
+        st = runner.state
+        seen["magnesol"] = (st["phase"], st["heaterOn"], st["stirrerOn"], st["magnesolWaitSeconds"] > 30)
+        runner.confirm_magnesol()
+        while runner.state["phase"] == "magnesol":
+            await asyncio.sleep(0.002)
+        seen["after"] = runner.state["phase"]
+        await runner.abort()
         loop.cancel()
     asyncio.run(scenario())
-    assert seen["heating"] == {(True, 300)} and seen["hold"] == {(True, 300)}   # 300 RPM default
-    assert seen["flow"] == {(False, None)}    # stopped before the outlet valve opens
+    assert seen["heating"] == {(True, True)} and seen["methanol"] == {(True, True)}   # 200 RPM, "198 / 200"
+    assert seen["magnesol"] == ("magnesol", False, True, True)   # heater off, stirrer on, waiting
+    assert seen["after"] == "contact"
+
+
+def test_purification_cools_before_draining():
+    hw = _demo_hw()
+    runner = PurificationRunner(hw, SCALE)
+    short = Settings(contact_time=1, settling_time=0)          # still hot when settling ends
+    rec, phases = asyncio.run(_purify(runner, hw, settings=short))
+    assert runner.state["phase"] == "complete" and "cooling" in phases
+    assert rec["coolingTimeSeconds"] > 60 and rec["highestTemperature"] >= 90
 
 
 def test_purification_warns_when_little_comes_out():
     hw = _demo_hw()
-    hw.tank_g = 100.0          # a clogged bed lets only 100 g through
+    hw.tank_g = 200.0          # a blocked filter lets only 200 g through (less than 70% of 460 g)
     runner = PurificationRunner(hw, SCALE)
-    rec = asyncio.run(_purify(runner, hw, skip=True))   # skip the timers: only the result matters
-    assert runner.state["phase"] == "complete" and "clogging" in rec["warning"]
+    rec, _ = asyncio.run(_purify(runner, hw, skip=True))   # skip the timers: only the result matters
+    assert runner.state["phase"] == "complete" and rec["warning"].startswith("Low output – check the filter")
 
 
 def test_purification_counts_only_this_batch_output():
     hw = _demo_hw()
     hw.output_g = 250.0        # last batch's biodiesel still in the collection container
     runner = PurificationRunner(hw, SCALE)
-    rec = asyncio.run(_purify(runner, hw, skip=True))
-    assert 380 < rec["outputWeightG"] < 400
-
-
-def test_purification_skip_in_demo():
-    hw = _demo_hw()
-    runner = PurificationRunner(hw, SCALE)
-    rec = asyncio.run(_purify(runner, hw, skip=True))
-    assert runner.state["phase"] == "complete" and rec["outputWeightG"] > 380
+    rec, _ = asyncio.run(_purify(runner, hw, skip=True))
+    assert 385 < rec["outputWeightG"] < 395 and rec["warning"] is None
 
 
 @pytest.mark.parametrize("fault,reason", [({"temperature": None}, "temperature reading lost"),
-                                          ({"temperature": 80.0}, "temperature exceeded 75 °C"),
+                                          ({"temperature": 97.0}, "temperature exceeded 95 °C"),
                                           ({"heaterSubmerged": False}, "biodiesel level dropped below the heater")])
 def test_purification_safety_stops(fault, reason):
     hw = _demo_hw()
     runner = PurificationRunner(hw, SCALE)
-    rec = asyncio.run(_purify(runner, hw, fault=fault))
+    rec, _ = asyncio.run(_purify(runner, hw, fault=fault))
     assert runner.state["phase"] == "fault" and rec["safetyStopReason"] == reason
     assert rec["safetyStopOccurred"] and not hw.heater_on and not hw.valves["mesh_bed"]
+    assert hw.motor_duty["purification_stirrer"] == 0
     with pytest.raises(RuntimeError):         # must acknowledge first
-        runner.start(S, 70)
+        runner.start(S)
     runner.acknowledge()
     assert runner.state["phase"] == "ready"
+
+
+def test_heater_stops_when_the_stirrer_stops_turning():
+    hw = _demo_hw()
+    runner = PurificationRunner(hw, SCALE)
+    rec, _ = asyncio.run(_purify(runner, hw, fault={"purificationStirrerRpm": 0}))
+    assert rec["safetyStopReason"] == "the purification stirrer stopped turning" and not hw.heater_on
 
 
 def test_purification_abort():
@@ -321,9 +397,15 @@ def test_purification_abort():
     runner = PurificationRunner(hw, SCALE)
 
     async def scenario():
-        runner.start(S, 70)
+        async def sensor_loop():
+            while True:
+                hw.refresh()
+                await asyncio.sleep(1 / SCALE)
+        loop = asyncio.create_task(sensor_loop())
+        runner.start(S)
         await asyncio.sleep(0.05)
         await runner.abort()
+        loop.cancel()
     asyncio.run(scenario())
     assert runner.state["phase"] == "fault" and runner.state["safetyStopReason"] == "stopped by operator"
     assert not hw.heater_on
@@ -398,6 +480,46 @@ def test_stage_limits():
     runner = StageRunner(MockHardware())
     with pytest.raises(StageError):
         asyncio.run(_start_bad(runner))
+    for bad in ({"voltage": 9}, {"current": 2.5}, {"time_min": 190}):
+        with pytest.raises(StageError):
+            asyncio.run(_start_with(StageRunner(MockHardware()), **bad))
+
+
+async def _start_with(runner, **kwargs):
+    runner.start("Esterification", S, **kwargs)
+
+
+def test_overcurrent_stops_the_electrodes():
+    hw = _demo_hw()
+    runner = StageRunner(hw, 2000)
+    events = []
+
+    async def scenario():
+        runner.start("Transesterification", S, "B-test", 30, 120, 500, lambda label, st: events.append(label), current=1)
+        assert runner.state["current"] == 1 and runner.state["currentLimitSet"] is False   # set by hand
+        await asyncio.sleep(0.01)
+        hw.supply_current_limit = 1.4          # the supply was set too high: 1.26 A flows
+        while runner.active:
+            hw.refresh()
+            await asyncio.sleep(0.0005)
+    asyncio.run(scenario())
+    st = runner.state
+    assert st["state"] == "fault" and "above the 1 A setting" in st["faultReason"]
+    assert not hw.electrode_power_on and hw.motor_duty["stirrer"] == 0
+    assert events[-1].startswith("Transesterification stopped (current")
+
+
+def test_pi_sets_the_current_limit_when_it_can(monkeypatch):
+    monkeypatch.setattr(config, "POWER_SUPPLY_CURRENT_CONTROL", True)
+    hw = MockHardware()
+    hw.supply_current_limit = 2.0
+    runner = StageRunner(hw)
+
+    async def scenario():
+        runner.start("Esterification", S, current=0.8)
+        assert runner.state["currentLimitSet"] is True and hw.supply_current_limit == 0.8
+        await runner.emergency_stop()
+    asyncio.run(scenario())
 
 
 async def _start_bad(runner):
@@ -536,8 +658,8 @@ def test_database(tmp_path):
     got = db.get_batch("B-2026-024")
     assert got.yield_ == 88.4 and got.dump()["yield"] == 88.4 and got.materials.oil_l == 1
     assert [b.id for b in db.list_batches()][:2] == ["B-2026-024", "B-2026-023"]
-    db.save_settings(Settings(purification_target_temperature=60))
-    assert db.get_settings().purification_target_temperature == 60
+    db.save_settings(Settings(methanol_removal_time=12))
+    assert db.get_settings().methanol_removal_time == 12
 
 
 def test_failed_batches_are_not_tested():

@@ -16,10 +16,13 @@ export type DemoBatch = {
   reactionTime: number;
   stirringSpeed: number;
   voltage?: number;
+  /** Transesterification current setting (A). */
+  current?: number;
   methanolRatio?: number;
   esterificationVoltage?: number;
   esterificationTime?: number;
   esterificationStirring?: number;
+  esterificationCurrent?: number;
   biodieselOutputMl?: number;
   catalystType?: "NaOH" | "KOH";
   /** Oil weighed by the reactor load cell. */
@@ -47,16 +50,25 @@ export type DemoBatch = {
     targetTemperature: number;
     highestTemperature: number;
     heatingTimeSeconds: number;
+    /** Methanol removal at 90 °C. */
     holdTimeSeconds: number;
-    flowTimeSeconds: number;
+    /** Older records only (mesh bed flow). */
+    flowTimeSeconds?: number;
     drainTimeSeconds?: number;
+    contactTimeSeconds?: number;
+    settlingTimeSeconds?: number;
+    coolingTimeSeconds?: number;
+    magnesolAdded?: boolean;
+    oilWeightG?: number | null;
     expectedBiodieselMl?: number | null;
     plannedFlowSeconds?: number;
     automatic?: boolean;
     warning?: string | null;
     safetyStopOccurred: boolean;
-    /** Dry wash stirrer RPM during heating and hold. */
+    /** Dry wash stirrer RPM (fixed 200). */
     stirringSpeed?: number;
+    /** Magnesol for the dry wash (g): oil mL × 0.0092. */
+    magnesolG?: number | null;
     outputWeightG?: number | null;
   };
 };

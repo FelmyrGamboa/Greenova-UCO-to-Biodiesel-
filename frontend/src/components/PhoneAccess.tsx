@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { getNetworkAddresses } from "../lib/api";
 import { qrModules, qrSvgPath } from "../lib/qr";
+import { useT } from "../lib/i18n";
 
 const LOCAL_HOSTS = ["localhost", "127.0.0.1", "::1", "[::1]"];
 
@@ -33,10 +34,11 @@ function usePhoneUrls(active: boolean): string[] | null {
 }
 
 function QrImage({ text }: { text: string }) {
+  const t = useT();
   const { size, d } = useMemo(() => qrSvgPath(qrModules(text)), [text]);
   return (
     // Always dark on white, in both themes, so every phone camera can read it.
-    <svg viewBox={`0 0 ${size} ${size}`} className="h-56 w-56 rounded-xl" shapeRendering="crispEdges" role="img" aria-label={`QR code for ${text}`}>
+    <svg viewBox={`0 0 ${size} ${size}`} className="h-56 w-56 rounded-xl" shapeRendering="crispEdges" role="img" aria-label={t("QR code for {url}", { url: text })}>
       <rect width={size} height={size} fill="#ffffff" />
       <path d={d} fill="#0b120e" />
     </svg>
@@ -52,6 +54,7 @@ const PhoneIcon = () => (
 
 /** "Open on phone": a button that shows a QR code of the website's address on the local network. */
 export default function PhoneAccess({ className = "" }: { className?: string }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [choice, setChoice] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -89,7 +92,7 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
         className={`flex w-full items-center justify-center gap-2 rounded-lg border border-white/[0.08] px-3 py-2 text-xs font-medium text-gray-400 transition-colors hover:bg-white/[0.04] hover:text-white ${className}`}
       >
         <PhoneIcon />
-        Open on phone
+        {t("Open on phone")}
       </button>
 
       {open &&
@@ -107,25 +110,25 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
             >
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <h2 id="phone-access-title" className="font-display text-lg font-semibold text-white">Open on your phone</h2>
-                  <p className="mt-1 text-sm text-gray-500">Scan with the phone's camera. The phone must be on the same Wi-Fi as this computer.</p>
+                  <h2 id="phone-access-title" className="font-display text-lg font-semibold text-white">{t("Open on your phone")}</h2>
+                  <p className="mt-1 text-sm text-gray-500">{t("Scan with the phone's camera. The phone must be on the same Wi-Fi as this computer.")}</p>
                 </div>
-                <button type="button" onClick={() => setOpen(false)} aria-label="Close" className="rounded-md px-2 py-1 text-lg leading-none text-gray-500 hover:text-white">×</button>
+                <button type="button" onClick={() => setOpen(false)} aria-label={t("Close")} className="rounded-md px-2 py-1 text-lg leading-none text-gray-500 hover:text-white">×</button>
               </div>
 
               <div className="mt-6 flex flex-col items-center">
                 {urls === null ? (
-                  <div className="flex h-56 w-56 items-center justify-center rounded-xl border border-white/[0.08] text-sm text-gray-500">Finding this computer's address…</div>
+                  <div className="flex h-56 w-56 items-center justify-center rounded-xl border border-white/[0.08] text-sm text-gray-500">{t("Finding this computer's address…")}</div>
                 ) : url ? (
                   <>
                     <QrImage text={url} />
                     <div className="mt-4 flex w-full items-center gap-2 rounded-lg border border-white/[0.08] bg-gv-inset px-3 py-2">
                       <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200">{url}</span>
-                      <button type="button" onClick={copy} className="shrink-0 text-xs font-semibold text-green-400 hover:text-green-300">{copied ? "Copied" : "Copy"}</button>
+                      <button type="button" onClick={copy} className="shrink-0 text-xs font-semibold text-green-400 hover:text-green-300">{copied ? t("Copied") : t("Copy")}</button>
                     </div>
                     {urls.length > 1 && (
                       <div className="mt-3 w-full">
-                        <div className="gv-label">Other addresses of this computer</div>
+                        <div className="gv-label">{t("Other addresses of this computer")}</div>
                         <div className="flex flex-wrap gap-2">
                           {urls.map((other, index) => (
                             <button
@@ -143,15 +146,15 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
                   </>
                 ) : (
                   <div className="w-full rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm leading-6 text-amber-400">
-                    Couldn't find this computer's network address. Start the backend (<span className="font-mono">python main.py</span>), or run <span className="font-mono">ipconfig</span> in Command Prompt and open <span className="font-mono">http://&lt;IPv4 Address&gt;:{window.location.port || "80"}</span> on the phone.
+                    {t("Couldn't find this computer's network address. Start the backend (python main.py), or run ipconfig in Command Prompt and open http://<IPv4 Address>:{port} on the phone.", { port: window.location.port || "80" })}
                   </div>
                 )}
               </div>
 
               <div className="mt-6 space-y-2 rounded-xl border border-white/[0.07] bg-gv-inset p-4 text-xs leading-5 text-gray-500">
-                <p className="font-semibold text-gray-300">It doesn't open on the phone?</p>
-                <p>When Windows asks, allow Node.js on <b>Private networks</b>, and set the Wi-Fi to Private (Settings → Network &amp; internet → Wi-Fi → your network → Private network).</p>
-                <p>School and public Wi-Fi often block devices from reaching each other. Turn on your phone's hotspot, connect this computer to it, and scan again.</p>
+                <p className="font-semibold text-gray-300">{t("It doesn't open on the phone?")}</p>
+                <p>{t("When Windows asks, allow Node.js on Private networks, and set the Wi-Fi to Private (Settings → Network & internet → Wi-Fi → your network → Private network).")}</p>
+                <p>{t("School and public Wi-Fi often block devices from reaching each other. Turn on your phone's hotspot, connect this computer to it, and scan again.")}</p>
               </div>
             </div>
           </div>,

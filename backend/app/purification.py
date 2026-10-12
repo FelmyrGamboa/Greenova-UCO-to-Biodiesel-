@@ -1,30 +1,50 @@
-"""Automatic purification: heating → hold → mesh bed flow → drain → complete.
+"""Automatic purification: dry wash with Magnesol (magnesium silicate).
 
-It runs by itself, without operator confirmations:
-1. Heating: heater on, valve closed, until the target (default 70 °C). With a heater sized for the
-   batch this takes about a minute.
-2. Hold: the target ±1 °C for the hold time (default 25 min), so leftover methanol evaporates.
-   The dry wash stirrer runs during heating and hold (purificationStirringSpeed, default 300 RPM).
-3. Mesh bed flow: heater and stirrer off, then the purification outlet valve opens for the planned flow time = the batch's
-   biodiesel volume (about its oil volume) ÷ the mesh bed flow rate (default 40 mL/min).
-4. Drain: the valve stays open until the output weight stops changing for a minute (at most the
-   drain time, default 3 min), then closes.
-The operator only confirms on the website that the process is finished.
+Steps, one after the other, run by the Pi:
+1. heating: the dry wash stirrer starts (200 RPM), then the heater, until 90 °C. Stops with a
+   fault if 90 °C isn't reached within 15 min.
+2. methanol: hold 90 ±2 °C for the methanol removal time (default 10 min), so leftover methanol
+   evaporates.
+3. magnesol: heater off, stirrer on. The website shows "Add X g Magnesol (1% of biodiesel)"; the
+   sequence waits until the operator confirms.
+4. contact: stir for the contact time (default 15 min), heater off.
+5. settling: stirrer off for the settling time (default 10 min), so the Magnesol settles.
+6. cooling: only if needed, wait until the biodiesel is at or below the max drain temperature
+   (default 50 °C, the water filter's limit).
+7. drain: the outlet valve opens. Done when the output load cell stays within ±2 g for 30 s
+   (once the biodiesel has started arriving), at most 20 min. Then the valve closes.
+8. complete: a "Low output – check the filter" warning when less than 70% of the oil weight came
+   out. The operator confirms on the website that the process is finished.
 
-Phase and field names match the website's Purification step (NewBatch.tsx):
-phase is "ready", "heating", "hold", "flow", "drain", "complete" or "fault".
+Fixed: the 90 °C hold, the 95 °C cutoff, the 200 RPM stirrer and the drain rule. Settings:
+methanolRemovalTime, contactTime, settlingTime and maxDrainTemperature.
 
-It runs on the Pi, not in the browser, so closing the website never leaves the heater on.
-Any fault turns the heater off and closes the valve; the operator must acknowledge it.
+Safety: the heater runs only while the stirrer runs and the heater is submerged (hardware.py
+enforces it for every caller), and the valve never opens while the heater is on. Any fault turns
+the heater and stirrer off and closes the valve; the operator must acknowledge it.
+
+Phase names: "ready", "heating", "methanol", "magnesol", "contact", "settling", "cooling",
+"drain", "complete" or "fault". It runs on the Pi, so closing the website never leaves the heater on.
 """
 import asyncio
-from collections import deque
 from typing import Callable, Optional
 
 from .hardware import Hardware
 from .models import Settings
 
-RUNNING_PHASES = ("heating", "hold", "flow", "drain")
+HOLD_TEMPERATURE_C = 90        # methanol removal temperature (fixed)
+HOLD_BAND_C = 2                # held at 90 ±2 °C
+MAXIMUM_TEMPERATURE_C = 95     # software cutoff: the heater stops above this
+HEATING_TIMEOUT_S = 15 * 60    # 90 °C must be reached within 15 min
+STIRRING_SPEED_RPM = 200       # dry wash stirrer target (fixed)
+STIRRER_STOPPED_RPM = 100      # with an RPM reading below this, the stirrer counts as not turning
+STIRRER_GRACE_S = 5            # seconds the stirrer may read low (spin-up) before the heater stops
+DRAIN_STABLE_G = 2             # draining is done when the output stays within ±2 g ...
+DRAIN_STABLE_S = 30            # ... for 30 s
+DRAIN_MAXIMUM_S = 20 * 60      # at most 20 min
+LOW_OUTPUT_FRACTION = 0.7      # warn below 70% of the oil weight
+
+RUNNING_PHASES = ("heating", "methanol", "magnesol", "contact", "settling", "cooling", "drain")
 
 
 class SafetyStop(Exception):
@@ -37,55 +57,72 @@ class PurificationRunner:
         self.time_scale = time_scale
         self._task: Optional[asyncio.Task] = None
         self._skip = False
+        self._magnesol_added: Optional[asyncio.Event] = None   # created in start()
         self._abort_reason = "stopped by operator"
         self._output_base = 0.0
+        self._low_rpm_seconds = 0
         self.state = self._ready_state()
 
     @staticmethod
     def _ready_state() -> dict:
-        return {"phase": "ready", "batchId": None, "automatic": False, "targetTemperature": None,
+        return {"phase": "ready", "batchId": None, "automatic": False,
+                "targetTemperature": HOLD_TEMPERATURE_C, "maximumTemperature": MAXIMUM_TEMPERATURE_C,
                 "liveTemperature": None, "startingTemperature": None, "highestTemperature": None,
-                "heatingTimeSeconds": 0, "holdTimeSeconds": 0, "holdTotalSeconds": 0, "holdRemainingSeconds": 0,
-                "expectedBiodieselMl": None, "plannedFlowSeconds": 0, "flowElapsedSeconds": 0,
-                "flowRemainingSeconds": 0, "drainElapsedSeconds": 0, "drainMaximumSeconds": 0,
-                "flowStableSeconds": 0, "outputWeightG": None, "flowRateGPerMinute": None,
-                "heaterOn": False, "valveOpen": False, "heaterOnSeconds": 0, "warning": None,
-                "stirrerOn": False, "stirrerRpm": None, "stirringSpeed": 0,
-                "safetyStopReason": None, "safetyStopOccurred": False, "record": None}
+                "heatingTimeSeconds": 0, "heatingTimeoutSeconds": HEATING_TIMEOUT_S,
+                "methanolTotalSeconds": 0, "methanolRemainingSeconds": 0,
+                "magnesolG": None, "magnesolAdded": False, "magnesolWaitSeconds": 0,
+                "contactTotalSeconds": 0, "contactRemainingSeconds": 0,
+                "settlingTotalSeconds": 0, "settlingRemainingSeconds": 0,
+                "coolingSeconds": 0, "maxDrainTemperature": None,
+                "drainElapsedSeconds": 0, "drainMaximumSeconds": DRAIN_MAXIMUM_S, "stableSeconds": 0,
+                "outputWeightG": None, "oilWeightG": None,
+                # the current step's timer, for the website: seconds left and the step's length
+                "stepRemainingSeconds": None, "stepTotalSeconds": None,
+                "heaterOn": False, "valveOpen": False, "heaterOnSeconds": 0,
+                "stirrerOn": False, "stirrerRpm": None, "stirringSpeed": STIRRING_SPEED_RPM,
+                "warning": None, "safetyStopReason": None, "safetyStopOccurred": False, "record": None}
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
     # ----- controls -----
-    def start(self, s: Settings, target: float, batch_id: Optional[str] = None,
-              on_finish: Optional[Callable[[dict], None]] = None, biodiesel_ml: Optional[float] = None,
-              automatic: bool = False) -> None:
-        """Starts the whole sequence. biodiesel_ml (about the oil volume) sets the flow time."""
+    def start(self, s: Settings, batch_id: Optional[str] = None,
+              on_finish: Optional[Callable[[dict], None]] = None, oil_g: Optional[float] = None,
+              magnesol_g: Optional[float] = None, automatic: bool = False) -> None:
+        """Starts the whole sequence. oil_g (the batch's oil) sets the low-output check."""
         if self.running:
             raise RuntimeError("Purification is already running.")
         if self.state["phase"] == "fault":
             raise RuntimeError("Acknowledge the safety stop first.")
-        if not 40 <= target <= 70:
-            raise RuntimeError("Target temperature must be between 40 and 70 °C.")
-        if target >= s.purification_maximum_temperature:
-            raise RuntimeError(f"Target must be below the {s.purification_maximum_temperature:g} °C cutoff.")
         t = self.hw.read().get("temperature")
         if t is None:
             raise RuntimeError("No temperature reading. Check the temperature sensor.")
-        planned = s.planned_flow_seconds(biodiesel_ml)
-        hold = round(s.purification_hold_time * 60)
+        methanol = round(s.methanol_removal_time * 60)
+        contact = round(s.contact_time * 60)
+        settling = round(s.settling_time * 60)
         self.state = {**self._ready_state(), "phase": "heating", "batchId": batch_id, "automatic": automatic,
-                      "targetTemperature": target, "liveTemperature": t, "startingTemperature": t,
-                      "highestTemperature": t, "holdTotalSeconds": hold, "holdRemainingSeconds": hold,
-                      "expectedBiodieselMl": round(biodiesel_ml, 1) if biodiesel_ml else None,
-                      "plannedFlowSeconds": planned, "flowRemainingSeconds": planned,
-                      "drainMaximumSeconds": round(s.drain_time * 60)}
+                      "liveTemperature": t, "startingTemperature": t, "highestTemperature": t,
+                      "methanolTotalSeconds": methanol, "methanolRemainingSeconds": methanol,
+                      "contactTotalSeconds": contact, "contactRemainingSeconds": contact,
+                      "settlingTotalSeconds": settling, "settlingRemainingSeconds": settling,
+                      "maxDrainTemperature": s.max_drain_temperature,
+                      "magnesolG": magnesol_g, "oilWeightG": round(oil_g, 1) if oil_g else None,
+                      "stepRemainingSeconds": None, "stepTotalSeconds": None}
         self._skip = False
-        self._task = asyncio.create_task(self._run(s, target, on_finish))
+        self._magnesol_added = asyncio.Event()
+        self._low_rpm_seconds = 0
+        self._task = asyncio.create_task(self._run(s, on_finish))
+
+    def confirm_magnesol(self) -> None:
+        """The operator added the Magnesol ("Confirm" on the website)."""
+        if not self.running or self.state["phase"] != "magnesol":
+            raise RuntimeError("Purification isn't waiting for the Magnesol.")
+        self._magnesol_added.set()
 
     def skip(self) -> None:
-        """Demo mode only: finish the current phase now ("Skip timer (demo)" on the website)."""
+        """Demo mode only: finish the current step now ("Skip timer (demo)" on the website).
+        It doesn't confirm the Magnesol: that stays the operator's step."""
         if self.running:
             self._skip = True
 
@@ -103,7 +140,7 @@ class PurificationRunner:
             raise RuntimeError("Purification is running.")
         self.state = self._ready_state()
 
-    # ----- sequence -----
+    # ----- helpers -----
     def _take_skip(self) -> bool:
         skipped, self._skip = self._skip, False
         return skipped
@@ -118,23 +155,33 @@ class PurificationRunner:
         self.state["heaterOn"] = self.hw.heater_on
         self.state["valveOpen"] = self.hw.valves.get("mesh_bed", False)
         self.state["stirrerOn"] = self.hw.motor_duty.get("purification_stirrer", 0) > 0
-        self.state["stirrerRpm"] = reading.get("purificationStirrerRpm")
+        self.state["stirrerRpm"] = reading.get("purificationStirrerRpm") if self.state["stirrerOn"] else 0
 
     def _stir(self, s: Settings, on: bool) -> None:
-        duty = s.purification_stirring_speed / s.purification_stirrer_max_rpm if on else 0.0
-        self.hw.set_motor("purification_stirrer", duty)
+        duty = STIRRING_SPEED_RPM / s.purification_stirrer_max_rpm if on else 0.0
+        self.hw.set_motor("purification_stirrer", duty)   # stopping it turns the heater off first
 
-    def _check_temperature(self, s: Settings, required: bool = True) -> Optional[float]:
-        t = self.hw.read().get("temperature")
+    def _step(self, remaining: Optional[int], total: Optional[int]) -> None:
+        self.state["stepRemainingSeconds"], self.state["stepTotalSeconds"] = remaining, total
+
+    def _check(self, required: bool = True) -> Optional[float]:
+        """Temperature, level switch and stirrer checks, every second."""
+        reading = self.hw.read()
+        t = reading.get("temperature")
         self.state["liveTemperature"] = t
         if t is None:
             if required:
                 raise SafetyStop("temperature reading lost")
             return None
-        if t > s.purification_maximum_temperature:
-            raise SafetyStop(f"temperature exceeded {s.purification_maximum_temperature:g} °C")
-        if self.hw.heater_on and self.hw.read().get("heaterSubmerged") is False:
-            raise SafetyStop("biodiesel level dropped below the heater")
+        if t > MAXIMUM_TEMPERATURE_C:
+            raise SafetyStop(f"temperature exceeded {MAXIMUM_TEMPERATURE_C:g} °C")
+        if self.hw.heater_on:
+            if reading.get("heaterSubmerged") is False:
+                raise SafetyStop("biodiesel level dropped below the heater")
+            rpm = reading.get("purificationStirrerRpm")
+            self._low_rpm_seconds = self._low_rpm_seconds + 1 if rpm is not None and rpm < STIRRER_STOPPED_RPM else 0
+            if self._low_rpm_seconds > STIRRER_GRACE_S:
+                raise SafetyStop("the purification stirrer stopped turning")
         if self.state["highestTemperature"] is None or t > self.state["highestTemperature"]:
             self.state["highestTemperature"] = t
         return t
@@ -144,94 +191,122 @@ class PurificationRunner:
         raw = self.hw.read().get("outputWeightG")
         return None if raw is None else round(raw - self._output_base, 1)
 
-    def _track_output(self, history: deque) -> Optional[float]:
-        """Output weight, flow rate over the last minute, and seconds without change."""
+    async def _countdown(self, key: str, check_required: bool = True) -> None:
+        """Counts a timed step down (e.g. contact), one second at a time."""
         st = self.state
-        weight = self._collected()
-        st["outputWeightG"] = weight
-        if weight is not None:
-            st["flowStableSeconds"] = (st["flowStableSeconds"] + 1
-                                       if history and abs(weight - history[-1]) < 0.5 else 0)
-            history.append(weight)
-            if len(history) > 1:
-                st["flowRateGPerMinute"] = round((history[-1] - history[0]) / ((len(history) - 1) / 60), 1)
-        return weight
+        total = st[key.replace("Remaining", "Total")]
+        while st[key] > 0 and not self._take_skip():
+            self._check(required=check_required)
+            self._sync()
+            self._step(st[key], total)
+            await self._tick()
+            st[key] -= 1
+        self._step(0, total)
 
-    async def _run(self, s: Settings, target: float, on_finish) -> None:
+    # ----- the sequence -----
+    async def _run(self, s: Settings, on_finish) -> None:
         cancelled = False
         st = self.state
+        target = HOLD_TEMPERATURE_C
         try:
-            # 1. Heating: valve closed, heater and stirrer on until the target is reached
+            # 1. Heating: valve closed, stirrer first, then the heater, until 90 °C
             self.hw.set_valve("mesh_bed", False)
-            self.hw.set_heater(True)
-            st["stirringSpeed"] = s.purification_stirring_speed
             self._stir(s, True)
+            self.hw.set_heater(True)
             self._sync()
-            while self._check_temperature(s) < target:
+            while self._check() < target:
                 if self._take_skip():
                     if hasattr(self.hw, "demo_set_temperature"):
                         self.hw.demo_set_temperature(target)
                         st["liveTemperature"] = st["highestTemperature"] = max(target, st["highestTemperature"])
                     break
-                if st["heatingTimeSeconds"] >= s.heating_timeout * 60:
-                    raise SafetyStop(f"target not reached within {s.heating_timeout:g} min")
+                if st["heatingTimeSeconds"] >= HEATING_TIMEOUT_S:
+                    raise SafetyStop(f"{target:g} °C not reached within {HEATING_TIMEOUT_S // 60} min")
+                self._step(None, None)
                 await self._tick()
                 st["heatingTimeSeconds"] += 1
                 self._sync()
 
-            # 2. Hold at target ±1 °C so leftover methanol evaporates
-            st["phase"] = "hold"
-            while st["holdRemainingSeconds"] > 0 and not self._take_skip():
-                t = self._check_temperature(s)
-                if t <= target - 1 and not self.hw.heater_on:
+            # 2. Methanol removal: hold 90 ±2 °C
+            st["phase"] = "methanol"
+            while st["methanolRemainingSeconds"] > 0 and not self._take_skip():
+                t = self._check()
+                if t <= target - HOLD_BAND_C and not self.hw.heater_on:
                     self.hw.set_heater(True)
-                elif t >= target + 1 and self.hw.heater_on:
+                elif t >= target + HOLD_BAND_C and self.hw.heater_on:
                     self.hw.set_heater(False)
                 self._sync()
+                self._step(st["methanolRemainingSeconds"], st["methanolTotalSeconds"])
                 await self._tick()
-                st["holdRemainingSeconds"] -= 1
-            st["holdTimeSeconds"] = st["holdTotalSeconds"] - st["holdRemainingSeconds"]
+                st["methanolRemainingSeconds"] -= 1
 
-            # 3. Mesh bed flow: heater and stirrer off first, then open the valve for the planned time
+            # 3. Add Magnesol: heater off, stirrer on, wait for the operator
             self.hw.set_heater(False)
+            st["phase"] = "magnesol"
+            self._step(None, None)
+            self._sync()
+            while not self._magnesol_added.is_set():
+                self._check(required=False)
+                self._sync()
+                await self._tick()
+                st["magnesolWaitSeconds"] += 1
+            st["magnesolAdded"] = True
+
+            # 4. Contact: stir, heater off
+            st["phase"] = "contact"
+            await self._countdown("contactRemainingSeconds", check_required=False)
+
+            # 5. Settling: stirrer off
             self._stir(s, False)
+            st["phase"] = "settling"
+            await self._countdown("settlingRemainingSeconds", check_required=False)
+
+            # 6. Cooling, only if needed: the filter takes at most maxDrainTemperature
+            st["phase"] = "cooling"
+            self._step(None, None)
+            while True:
+                t = self._check(required=True)   # the temperature decides when the valve may open
+                if t <= s.max_drain_temperature:
+                    break
+                if self._take_skip() and hasattr(self.hw, "demo_set_temperature"):
+                    self.hw.demo_set_temperature(s.max_drain_temperature)
+                self._sync()
+                await self._tick()
+                st["coolingSeconds"] += 1
+
+            # 7. Drain: heater off (it is), then open the valve until the output stops changing
+            self.hw.set_heater(False)
             self._output_base = self.hw.read().get("outputWeightG") or 0.0
             self.hw.set_valve("mesh_bed", True)
-            st["phase"] = "flow"
+            st["phase"] = "drain"
             self._sync()
-            history = deque(maxlen=61)   # output weight over the last minute
-            while st["flowElapsedSeconds"] < st["plannedFlowSeconds"]:
+            anchor, started = None, False
+            while st["drainElapsedSeconds"] < DRAIN_MAXIMUM_S:
                 if self._take_skip():
                     if hasattr(self.hw, "demo_finish_flow"):
                         self.hw.demo_finish_flow()
-                    st["flowElapsedSeconds"] = st["plannedFlowSeconds"]
                     break
-                self._check_temperature(s, required=False)   # heater is off: only the maximum matters
-                self._track_output(history)
-                await self._tick()
-                st["flowElapsedSeconds"] += 1
-                st["flowRemainingSeconds"] = st["plannedFlowSeconds"] - st["flowElapsedSeconds"]
-            st["flowRemainingSeconds"] = 0
-
-            # 4. Drain: valve still open until the output weight stops changing (or the drain time)
-            st["phase"] = "drain"
-            st["flowStableSeconds"] = 0
-            history.clear()
-            while st["drainElapsedSeconds"] < st["drainMaximumSeconds"]:
-                if self._take_skip():
-                    break
-                self._check_temperature(s, required=False)
-                weight = self._track_output(history)
-                if weight is not None and st["flowStableSeconds"] >= s.flow_stable_seconds:
-                    break   # nothing more comes out: drained
+                self._check(required=False)
+                weight = self._collected()
+                st["outputWeightG"] = weight
+                if weight is not None:
+                    started = started or weight > DRAIN_STABLE_G
+                    if anchor is not None and abs(weight - anchor) <= DRAIN_STABLE_G:
+                        st["stableSeconds"] += 1
+                    else:
+                        anchor, st["stableSeconds"] = weight, 0
+                    if started and st["stableSeconds"] >= DRAIN_STABLE_S:
+                        break   # nothing more comes out: drained
+                self._sync()
+                self._step(DRAIN_MAXIMUM_S - st["drainElapsedSeconds"], DRAIN_MAXIMUM_S)
                 await self._tick()
                 st["drainElapsedSeconds"] += 1
             self.hw.set_valve("mesh_bed", False)
             self.hw.refresh()
             st["outputWeightG"] = self._collected()
-            st["flowRateGPerMinute"] = 0
-            st["warning"] = self._output_warning(s)
+            st["warning"] = self._output_warning()
             st["phase"] = "complete"
+            self._step(None, None)
         except SafetyStop as e:
             st["safetyStopReason"] = str(e)
         except asyncio.CancelledError:
@@ -251,32 +326,32 @@ class PurificationRunner:
             "targetTemperature": target,
             "highestTemperature": st["highestTemperature"],
             "heatingTimeSeconds": st["heatingTimeSeconds"],
-            "holdTimeSeconds": st["holdTimeSeconds"],
-            "flowTimeSeconds": st["flowElapsedSeconds"],
+            "holdTimeSeconds": st["methanolTotalSeconds"] - st["methanolRemainingSeconds"],
+            "magnesolG": st["magnesolG"],
+            "magnesolAdded": st["magnesolAdded"],
+            "contactTimeSeconds": st["contactTotalSeconds"] - st["contactRemainingSeconds"],
+            "settlingTimeSeconds": st["settlingTotalSeconds"] - st["settlingRemainingSeconds"],
+            "coolingTimeSeconds": st["coolingSeconds"],
             "drainTimeSeconds": st["drainElapsedSeconds"],
-            "expectedBiodieselMl": st["expectedBiodieselMl"],
-            "plannedFlowSeconds": st["plannedFlowSeconds"],
             "automatic": st["automatic"],
             "warning": st["warning"],
             "safetyStopOccurred": st["safetyStopOccurred"],
             "safetyStopReason": st["safetyStopReason"],
             "outputWeightG": st["outputWeightG"],
+            "oilWeightG": st["oilWeightG"],
             "heaterOnSeconds": st["heaterOnSeconds"],
-            "stirringSpeed": st["stirringSpeed"],
+            "stirringSpeed": STIRRING_SPEED_RPM,
         }
         if on_finish:
             on_finish(st["record"])
         if cancelled:
             raise asyncio.CancelledError
 
-    def _output_warning(self, s: Settings) -> Optional[str]:
-        """Less than half the expected output usually means the mesh bed is clogged."""
-        st = self.state
-        weight, expected_ml = st["outputWeightG"], st["expectedBiodieselMl"]
-        if weight is None or not expected_ml:
+    def _output_warning(self) -> Optional[str]:
+        """Less than 70% of the oil weight usually means the filter is blocked."""
+        weight, oil = self.state["outputWeightG"], self.state["oilWeightG"]
+        if weight is None or not oil:
             return None
-        expected_g = expected_ml * s.biodiesel_density
-        if weight < 0.5 * expected_g:
-            return (f"Only {weight:.0f} g came out of about {expected_g:.0f} g expected. "
-                    "Check the mesh bed for clogging.")
+        if weight < LOW_OUTPUT_FRACTION * oil:
+            return f"Low output – check the filter. {weight:.0f} g collected from {oil:.0f} g of oil."
         return None

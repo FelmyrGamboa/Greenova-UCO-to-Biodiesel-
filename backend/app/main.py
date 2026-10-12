@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import config, db
 from .api import auto_start_purification, router, stop_transfers
 from .hardware import create_hardware
-from .purification import PurificationRunner
+from .purification import MAXIMUM_TEMPERATURE_C, PurificationRunner
 from .stages import StageRunner
 from .transfers import DrainRunner, PumpRunner
 
@@ -37,7 +37,7 @@ async def sensor_loop(app: FastAPI) -> None:
         try:
             await asyncio.to_thread(app.state.hw.refresh)
             s = app.state.settings
-            alarm = app.state.hw.watchdog(s.purification_maximum_temperature, s.reaction_maximum_temperature)
+            alarm = app.state.hw.watchdog(MAXIMUM_TEMPERATURE_C, s.reaction_maximum_temperature)
             if alarm:
                 app.state.alarm = alarm
                 log.warning(alarm)
