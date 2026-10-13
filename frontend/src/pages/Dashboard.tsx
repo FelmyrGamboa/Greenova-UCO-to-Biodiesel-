@@ -22,7 +22,7 @@ const demoDevices = [
 const PUMP_LABELS = { catalyst: "Pump A · NaOH/KOH + methanol", acid: "Pump B · H₂SO₄ + methanol" } as const;
 const VALVE_LABELS = { reactor_outlet: "reactor outlet", centrifuge_outlet: "centrifuge outlet" } as const;
 const PURIFICATION_STEP: Partial<Record<PurificationPhase, string>> = {
-  heating: "Heating", methanol: "Methanol removal", magnesol: "Add Magnesol", contact: "Contact",
+  heating: "Heating", methanol: "Methanol removal", magnesol: "Add adsorbent", contact: "Contact",
   settling: "Settling", cooling: "Cooling", drain: "Draining",
 };
 

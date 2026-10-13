@@ -1,4 +1,7 @@
-"""Automatic purification: dry wash with Magnesol (magnesium silicate).
+"""Automatic purification: dry wash with an adsorbent, Magnesol (magnesium silicate) or
+bentonite, chosen per batch on the website. The steps are the same for both; only the amount
+differs (Settings magnesolDose / bentoniteDose, % of the oil weight). The step where the operator
+adds it is still called "magnesol" in the code and the API, so older screens keep working.
 
 Steps, one after the other, run by the Pi:
 1. heating: the dry wash stirrer starts (200 RPM), then the heater, until 90 °C. Stops with a
@@ -70,6 +73,8 @@ class PurificationRunner:
                 "liveTemperature": None, "startingTemperature": None, "highestTemperature": None,
                 "heatingTimeSeconds": 0, "heatingTimeoutSeconds": HEATING_TIMEOUT_S,
                 "methanolTotalSeconds": 0, "methanolRemainingSeconds": 0,
+                # adsorbent: "Magnesol" or "Bentonite"; adsorbentG is its amount (magnesolG = same value, older name)
+                "adsorbent": "Magnesol", "adsorbentG": None,
                 "magnesolG": None, "magnesolAdded": False, "magnesolWaitSeconds": 0,
                 "contactTotalSeconds": 0, "contactRemainingSeconds": 0,
                 "settlingTotalSeconds": 0, "settlingRemainingSeconds": 0,
@@ -89,8 +94,10 @@ class PurificationRunner:
     # ----- controls -----
     def start(self, s: Settings, batch_id: Optional[str] = None,
               on_finish: Optional[Callable[[dict], None]] = None, oil_g: Optional[float] = None,
-              magnesol_g: Optional[float] = None, automatic: bool = False) -> None:
-        """Starts the whole sequence. oil_g (the batch's oil) sets the low-output check."""
+              magnesol_g: Optional[float] = None, automatic: bool = False,
+              adsorbent: str = "Magnesol") -> None:
+        """Starts the whole sequence. oil_g (the batch's oil) sets the low-output check;
+        magnesol_g is the amount of the adsorbent (Magnesol or bentonite) to add."""
         if self.running:
             raise RuntimeError("Purification is already running.")
         if self.state["phase"] == "fault":
@@ -107,6 +114,7 @@ class PurificationRunner:
                       "contactTotalSeconds": contact, "contactRemainingSeconds": contact,
                       "settlingTotalSeconds": settling, "settlingRemainingSeconds": settling,
                       "maxDrainTemperature": s.max_drain_temperature,
+                      "adsorbent": adsorbent, "adsorbentG": magnesol_g,
                       "magnesolG": magnesol_g, "oilWeightG": round(oil_g, 1) if oil_g else None,
                       "stepRemainingSeconds": None, "stepTotalSeconds": None}
         self._skip = False
@@ -328,6 +336,8 @@ class PurificationRunner:
             "heatingTimeSeconds": st["heatingTimeSeconds"],
             "holdTimeSeconds": st["methanolTotalSeconds"] - st["methanolRemainingSeconds"],
             "magnesolG": st["magnesolG"],
+            "adsorbent": st["adsorbent"],
+            "adsorbentG": st["adsorbentG"],
             "magnesolAdded": st["magnesolAdded"],
             "contactTimeSeconds": st["contactTotalSeconds"] - st["contactRemainingSeconds"],
             "settlingTimeSeconds": st["settlingTotalSeconds"] - st["settlingRemainingSeconds"],

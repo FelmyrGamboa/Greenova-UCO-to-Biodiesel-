@@ -305,6 +305,7 @@ body {
     transition: background-color 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
     display: inline-flex;
     align-items: center;
+    justify-content: center;   /* centered text when a button is stretched full width (phones) */
     gap: 7px;
   }
 

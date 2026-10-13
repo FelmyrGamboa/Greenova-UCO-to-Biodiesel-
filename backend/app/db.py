@@ -42,8 +42,16 @@ def get_settings() -> Settings:
             limits.voltage.min = 10
         if limits.time.max == 120:
             limits.time.max = 180
+        if limits.current.min == 0.5:          # current is a whole number now: 1-2 A
+            limits.current.min = 1
+        if limits.current.default < limits.current.min:
+            limits.current.default = limits.current.min
     if s.reactor_drain_time == 3:
         s.reactor_drain_time = 1
+    if s.centrifuge_drain_time == 3:           # old default: the centrifuge outlet now stays open 2 min
+        s.centrifuge_drain_time = 2
+    if s.ffa_threshold == 4:                   # old rule: now FFA <= 1% goes straight to transesterification
+        s.ffa_threshold = 1
     return s
 
 

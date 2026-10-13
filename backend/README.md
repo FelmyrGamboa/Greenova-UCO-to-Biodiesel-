@@ -30,7 +30,7 @@ Always start it from the backend folder. `python -m app.main` and `python app/ma
 
 Open **http://localhost:8000/docs**. Every endpoint is listed there with a "Try it out" button. Good first tries:
 
-- `POST /api/calculate` with `{"oilMassG": 460, "ffa": 6, "catalyst": "NaOH"}`. Expect esterification methanol 78.4 mL and NaOH up to 5.36 g.
+- `POST /api/calculate` with `{"oilMassG": 460, "ffa": 6, "catalyst": "NaOH"}`. Expect esterification methanol 130.6 mL (the uniform dose for 10% FFA) and NaOH up to 5.36 g. FFA is a whole percent: `"ffa": 2.5` is refused with "ffa: Use a whole number (no decimals)."
 - `POST /api/demo/load-oil` with `{"volumeMl": 500}`, then `POST /api/process/purification/start` with `{}`, and `GET /api/process/purification` a few times to watch it heat, hold, flow and drain by itself.
 
 To make the simulated machine run faster for demos, set a time scale before starting (20 = twenty times faster):
@@ -62,48 +62,38 @@ Run it from the backend folder or from the repo root (`python -m pytest backend`
 | `app/purification.py` | Automatic purification (dry wash with Magnesol): heating → methanol removal → add Magnesol → contact → settling → cooling → draining |
 | `app/transfers.py` | Dosing pumps A and B (load a dose by weight) and the reactor and centrifuge outlet valves |
 | `app/system.py` | System Status tiles and device list |
-| `app/hardware.py` | Safety interlocks, the simulated machine, and the real Pi hardware |
+| `app/hardware.py` | Safety interlocks, the simulated machine, and the real Pi hardware (`PiHardware`, configured by `hardware.toml`) |
+| `app/drivers.py` | Pi sensor drivers: HX711 load cells, INA226/INA219 power monitor, RPM counters, DS18B20, serial power supply |
+| `app/hwtest.py` | Bench test and calibration on the Pi: `python -m app.hwtest check / read / outputs / calibrate / i2c` |
+| `hardware.example.toml` | Template for `hardware.toml`: the Pi's pins, sensors and calibration |
+| `setup-pi.sh` | One-time setup on the Raspberry Pi |
 | `app/models.py` | Settings and batch fields, with their default values |
 | `app/db.py` | SQLite storage (`greenova.db`) |
 | `app/strip_reader.py` | FFA strip reader (TCS34725) |
 | `app/seed.py` | The website's sample batches |
-| `app/config.py` | Demo mode, GPIO pins, relay type, allowed website addresses |
+| `app/config.py` | Demo mode, database path, allowed website addresses, and the `hardware.toml` loader |
 | `frontend/dist` | Optional: the built website, served at `http://<pi-address>:8000` (section 4) |
 
 ## 3. Move it to the Raspberry Pi
 
-Copy the folder to the Pi (USB stick, `scp`, or GitHub), then:
+**Full guide: [`docs/RASPBERRY_PI_SETUP.md`](../docs/RASPBERRY_PI_SETUP.md)** (parts list, wiring diagram and default pins, every `hardware.toml` key, testing, calibration, troubleshooting). In short:
 
 ```bash
-sudo apt update
-sudo apt install -y python3-venv python3-gpiozero python3-lgpio
 cd ~/Greenova-UCO-to-Biodiesel-/backend
-python3 -m venv --system-site-packages .venv   # lets the venv use the Pi's GPIO libraries
-source .venv/bin/activate
-pip install -r requirements.txt -r requirements-pi.txt
+bash setup-pi.sh                              # packages, I2C + 1-Wire, .venv, hardware.toml, the service
+sudo reboot
+nano hardware.toml                            # your pins, relay type, valve/motor types, which sensors are fitted
+.venv/bin/python -m app.hwtest check          # pin conflicts
+.venv/bin/python -m app.hwtest read           # every sensor
+.venv/bin/python -m app.hwtest outputs        # each relay/pump/valve/motor (heater and supply unplugged!)
+.venv/bin/python -m app.hwtest calibrate reactor   # and: output
+sudo systemctl enable --now greenova          # hardware mode (GREENOVA_MOCK=0), starts on boot
+journalctl -u greenova -f
 ```
 
-Then, in this order:
+**All wiring lives in `hardware.toml`**, not in the code: pins (BCM numbers), `relays.active_high` (false for "low level trigger" boards), valves `single` (one relay) or `dual` (3-wire motorized ball valves), motors `pwm` or `esc` (brushless), the level switch, the DS18B20, both HX711 load cells with their calibration, the INA226/INA219 power monitor, the three RPM sensors, and the power supply (`manual`, or `serial` to set voltage and current over USB). A part that isn't enabled reads "—", and the backend works around it. The backend refuses to start if two parts share a pin.
 
-1. **Set your pins** in `app/config.py` (`PINS`): heater relay, electrode power relay, the three motorized valves (reactor outlet, centrifuge outlet, purification outlet), the two dosing pumps, the reactor stirrer, centrifuge and purification (dry wash) stirrer PWM, and the heater level switch (section 6). GPIO17 is already used by the strip reader's LED. The valve code assumes one relay per valve that opens it while ON; change `PiHardware._write_valve` if your valves work differently (3-wire or H-bridge).
-2. **Check the relay type with the heater and power supply unplugged.** Many relay modules switch ON when the input is LOW. If a relay clicks on when the backend starts, set `RELAY_ACTIVE_HIGH = False`.
-3. **Fill in the sensor readers** marked `TODO` in `app/hardware.py` (`PiHardware`): the two load cells (under the main reactor and under the biodiesel container, usually HX711 boards), electrode voltage and current, and the RPM of the reactor stirrer, centrifuge and purification stirrer. The website's Ready / Not ready tiles for the three motors use these RPM readings. The temperature reader is written for a waterproof DS18B20 probe. Enable 1-Wire with `sudo raspi-config` → Interface Options → 1-Wire, or replace it with your sensor's code. Each reader returns `None` when there's no valid reading. A missing temperature stops the heater and the electrodes.
-4. **Power supply current.** If the Pi can set the power supply's current limit, write it in `PiHardware._write_current_limit` and start with `GREENOVA_PSU_CURRENT_CONTROL=1`. Otherwise leave it off: the website then shows "Set the power supply current to 1 A" before each reaction stage. Either way, the backend stops the electrodes when the measured current stays above the setting for 2 readings.
-5. **Strip reader:** enable I2C in `raspi-config`, and put `white_ref.csv` and `ffa_calibration.csv` (made with `python3 app/strip_reader.py white` and `cal`) inside the `app` folder.
-6. **Start in hardware mode:**
-   ```bash
-   GREENOVA_MOCK=0 uvicorn app.main:app --host 0.0.0.0 --port 8000
-   ```
-7. From a laptop on the same Wi-Fi, open `http://<pi-address>:8000/docs`. Find the address with `hostname -I` on the Pi.
-8. **Test each output on its own** with the `/api/control/...` endpoints: heater and electrodes unplugged first, then each valve, each pump (`/api/control/pump`, with water in its tank), then the motors. Use `/api/control/all-off` to stop everything.
-
-**Start automatically when the Pi boots:** edit the user and paths in `greenova.service`, then:
-
-```bash
-sudo cp greenova.service /etc/systemd/system/
-sudo systemctl enable --now greenova
-journalctl -u greenova -f        # watch the logs
-```
+**Strip reader:** enable I2C, and put `white_ref.csv` and `ffa_calibration.csv` (made with `python3 app/strip_reader.py white` and `cal`) inside the `app` folder. Readings are rounded to whole percent.
 
 **If some sensors are wired to the ESP32:** have the ESP32 print one JSON line per second over USB, for example `{"oil_g": 461.2, "temp_c": 31.5}`, and read it in `PiHardware._read_sensors` with `pyserial`.
 
@@ -154,17 +144,17 @@ In PowerShell, use `$env:GREENOVA_API="http://192.168.1.50:8000"` instead.
 
 | Step | Who does it | What happens |
 |---|---|---|
-| Oil | Operator | Pours the oil through the inlet filter. The reactor load cell weighs it. The button says **Continue to Esterification** (FFA above 4%) or **Continue to Transesterification** (4% or below): it records the oil weight and goes straight to that stage. |
+| Oil | Operator | Pours the oil through the inlet filter. The reactor load cell weighs it. The button says **Continue to Esterification** (FFA above 1%) or **Continue to Transesterification** (1% or below): it records the oil weight and goes straight to that stage. FFA is entered as a whole percent. |
 | Esterification dose | Pump B | The operator mixes the methanol and H₂SO₄ in tank B beforehand. When the stage opens, pump B loads the premix by itself and stops when the reactor load cell has gained its weight. If the pump faults, the website shows "Pump problem – check the line" and a **Retry** button. |
 | Acetone | Operator | Poured through the inlet **after** the pump has finished (the pump doses by the reactor's weight, so pouring during pumping would stop it early). The website shows the weight gained against the target (10% of the oil volume, provisional). |
-| Esterification | Pi | Starts by itself once the dose and the acetone are in. Electrodes and stirrer for the set time, at the set voltage and current (default 1 A, 0.5–2 A). Then the operator enters the FFA re-check: at or below 1%, go on; above it, another stage dosed for the reading (40:1, no new acetone). |
+| Esterification | Pi | Starts by itself once the dose and the acetone are in. Electrodes and stirrer for the set time, at the set voltage and current (default 1 A, 1–2 A, whole amperes). Then the operator enters the FFA re-check: at or below 1%, go on; above it, another stage dosed for the reading (40:1, no new acetone). |
 | Transesterification dose | Pump A | NaOH or KOH dissolved in the methanol in tank A, loaded by itself when the stage opens. The catalyst amount is exact here: it neutralizes the last re-check reading. |
-| Transesterification | Pi | Starts by itself once loaded. Then the **reactor outlet valve opens by itself** for `reactorDrainTime` (default 1 min): reactor → centrifuge, and closes. **Continue to Separation** appears only after it has closed. |
-| Separation | Pi | Centrifuge for the set time. When it has stopped (RPM ≈ 0, or `centrifugeSpinDownTime` without an RPM sensor), the **centrifuge outlet valve opens by itself** for `centrifugeDrainTime`: biodiesel → purification tank. |
+| Transesterification | Pi | Starts by itself once loaded. Then the **reactor outlet valve opens by itself** for `reactorDrainTime` (default 1 min): reactor → centrifuge, and closes. |
+| Separation | Pi | **Starts by itself as soon as the reactor outlet has closed** (`autoAdvance`, default on; the website moves on to it too). Centrifuge for the set time. When it has stopped (RPM ≈ 0, or `centrifugeSpinDownTime` without an RPM sensor), the **centrifuge outlet valve opens by itself** for `centrifugeDrainTime` (default **2 min**): biodiesel → purification tank. |
 | Purification | Pi | Starts by itself once the centrifuge outlet has closed and the level switch sees biodiesel (section 6). |
-| Yield | Pi | The output load cell weighs the biodiesel container; the saved batch gets the output volume and yield. |
+| Yield | Pi | The output load cell weighs the biodiesel container. When the purification outlet has closed, the website saves the batch by itself (output volume and yield included) and shows Process Complete. |
 
-**Uniform esterification dose.** The FFA strip reads only up to 5% (its darkest color). Every batch above 4% gets one dose, calculated as if the oil had `esterificationDesignFfa` (default 10%): per 100 mL of oil, about 26 mL methanol and 0.25 mL H₂SO₄. When the strip shows its darkest color, tick that on the website; the batch is recorded as "≥ 5%". The re-check after each stage decides the next one.
+**Uniform esterification dose.** The FFA strip reads only up to 5% (its darkest color). Every batch above 1% gets one dose, calculated as if the oil had `esterificationDesignFfa` (default 10%): per 100 mL of oil, about 26 mL methanol and 0.25 mL H₂SO₄. When the strip shows its darkest color, tick that on the website; the batch is recorded as "≥ 5%". The re-check after each stage decides the next one.
 
 **Pumps.** Each pump has its own tank. Mix about 10% extra in the same proportions so the line stays full: the pump stops by weight, so only the dose enters. The pump stops with a fault when the load cell doesn't rise for `pumpNoFlowSeconds` (default 20 s: empty tank or blocked line) or after twice the expected time. Without a load cell reading, it doses by time at `pumpCatalystRate` / `pumpAcidRate` (mL/min). Only one pump runs at a time. After an emergency stop and a controller reset, the stage starts with its Start button instead of by itself.
 
@@ -175,26 +165,26 @@ In PowerShell, use `$env:GREENOVA_API="http://192.168.1.50:8000"` instead.
 - The purification stirrer runs at a fixed 200 RPM from heating to the end of contact, and is off for settling and draining.
 - Each pump tank holds one batch's premix, mixed by the operator.
 
-## 6. Automatic purification (dry wash with Magnesol)
+## 6. Automatic purification (dry wash with Magnesol or bentonite)
 
-After separation, purification runs by itself. The operator only adds the Magnesol when asked, and confirms at the end:
+After separation, purification runs by itself. The operator only adds the adsorbent (Magnesol or bentonite, chosen per batch on the website) when asked. The steps are the same for both; the API phase is still called `magnesol`:
 
 | Step | What happens | Time |
 |---|---|---|
 | 1. Heating | Stirrer on (200 RPM), then the heater, until **90 °C**. The website shows "Prepare X g Magnesol". | Fault if 90 °C isn't reached in 15 min |
 | 2. Methanol removal | Hold 90 ±2 °C with the stirrer running, so leftover methanol evaporates | `methanolRemovalTime`, default **10 min** (5–30) |
-| 3. Add Magnesol | Heater off, stirrer on. The website shows "Add X g Magnesol (1% of biodiesel)" and waits for **Confirm** | Waits for the operator |
+| 3. Add adsorbent | Heater off, stirrer on. The website shows "Add X g Magnesol (1% of the oil weight)" or "Add X g Bentonite (2% …)" and waits for **Confirm** | Waits for the operator |
 | 4. Contact | Stirring, heater off | `contactTime`, default **15 min** |
 | 5. Settling | Stirrer off | `settlingTime`, default **10 min** |
 | 6. Cooling | Only if needed: waits until the tank is at or below the water filter's limit | `maxDrainTemperature`, default **50 °C** |
 | 7. Draining | The purification outlet valve opens: tank → filter → output container. Done when the output load cell stays within ±2 g for 30 s (counted once the flow has started), 20 min at most | |
-| 8. Done | Valve closed. Warns "Low output – check the filter" when less than 70% of the oil weight came out. The operator confirms on the website, and the batch is saved | |
+| 8. Done | Valve closed. Warns "Low output – check the filter" when less than 70% of the oil weight came out. The website saves the batch by itself and shows Process Complete | |
 
-**Magnesol** = oil volume (mL) × 0.92 g/mL × 1% = oil volume × 0.0092 g, rounded to 0.1 g (500 mL → 4.6 g). The same value is shown in Volume & Parameters as "Magnesol (dry wash)".
+**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g. Magnesol 1% (`magnesolDose`) = oil volume × 0.0092 g (500 mL → 4.6 g); bentonite 2% (`bentoniteDose`) = oil volume × 0.0184 g (500 mL → 9.2 g). The same value is shown in Volume & Parameters. The batch record keeps `adsorbent` and `adsorbentG`, and the cost per liter counts `magnesolKg` or `bentoniteKg` (prices `magnesolPrice`, `bentonitePrice`).
 
-Only the four times above are in Settings → Purification. The 90 °C hold, the 95 °C cutoff, the 200 RPM stirrer and the drain rule are fixed in `app/purification.py`.
+Settings → Purification has the four times above, the two doses and the default adsorbent. The 90 °C hold, the 95 °C cutoff, the 200 RPM stirrer and the drain rule are fixed in `app/purification.py`.
 
-It starts as soon as the centrifuge outlet has closed after separation **and** the level switch (`heater_level_switch` in `app/config.py`) detects biodiesel covering the heater. The switch is a float switch at the heater's height in the purification tank, wired between a GPIO pin and GND. Without a level switch, the website asks the operator to confirm once that the heater is submerged. That one check stays because an immersion heater that runs dry can start a fire.
+It starts as soon as the centrifuge outlet has closed after separation **and** the level switch (`[level_switch]` in `hardware.toml`) detects biodiesel covering the heater. The switch is a float switch at the heater's height in the purification tank, wired between a GPIO pin and GND. Without a level switch, the website asks the operator to confirm once that the heater is submerged. That one check stays because an immersion heater that runs dry can start a fire.
 
 The output weight counts only this batch's biodiesel, even if the collection container isn't empty.
 

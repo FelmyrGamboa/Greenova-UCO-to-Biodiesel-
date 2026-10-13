@@ -201,3 +201,13 @@ The tiles are Power Supply, Electrodes ("Graphite – graphite"), Reactor Stirre
 | `settlingTime` | 10 | minutes with the stirrer off (0–60) |
 | `maxDrainTemperature` | 50 | °C: the outlet opens only at or below this (the water filter's limit, 30–85) |
 | `ffaRangeBoundaries` | `0,2,4,5` | FFA ranges for the analytics; the last one is "5% and above" |
+
+## Changes in this version
+
+- **FFA ≤ 1%** skips esterification (`ffaThreshold` 1, was 4). `GET /api/config` also returns `wholeNumberInputs: true` and `autoAdvance`.
+- **Whole numbers only** for operator inputs: `ffa` / `ffaAfter` in `/api/calculate*`, `voltage`, `time`, `stirring` and `current` in `/api/process/stage/start` (current limits are now 1–2 A), and the Settings page keys in `PUT /api/settings`. A decimal is refused: 422 `"ffa: Use a whole number (no decimals)."` or 400 `"contactTime must be a whole number (no decimals)."`. `/api/strip/read` returns a whole percent.
+- **Readable validation errors:** every 422 has `detail` as one sentence naming each field (`"targetG: Field required"`), plus `errors` with the raw list.
+- **Adsorbent:** `adsorbent` (`"Magnesol"` or `"Bentonite"`) can be sent with `/api/calculate`, `/api/process/stage/start` (kept for the batch, used when purification starts by itself) and `/api/process/purification/start`. The purification state and record have `adsorbent` and `adsorbentG` (`magnesolG` holds the same amount, under its old name). `/api/calculate` returns `magnesolG`, `bentoniteG`, `adsorbent`, `adsorbentG`, `adsorbentDosePct`. Batches have `adsorbent`; `materials` has `magnesolKg` next to `bentoniteKg`. New settings: `magnesolDose` (1), `bentoniteDose` (2), `defaultAdsorbent` (Magnesol), `magnesolPrice` (250 ₱/kg, placeholder).
+- **Auto-advance:** when the reactor outlet has closed after transesterification, the Pi starts the separation by itself (setting `autoAdvance`, default true). The timeline gets "Separation started"; a problem becomes the alarm "Separation did not start by itself: …".
+- **Centrifuge outlet** default `centrifugeDrainTime` 2 min (was 3; a saved 3 becomes 2).
+- **Saving a batch never fails on the purification record:** every `purification` field has a default, the Pi's measured record is merged with the website's, and `oilVolume` is filled in from `oilMassG` when it's missing.

@@ -51,6 +51,7 @@ type AnalyticsSettings = {
     sulfuricAcid: number;
     acetone: number;
     bentonite: number;
+    magnesol: number;
     electricity: number;
     diesel: number;
   };
@@ -89,6 +90,7 @@ function readAnalyticsSettings(): AnalyticsSettings {
       sulfuricAcid: numberValue("sulfuricAcidPrice", 120),
       acetone: numberValue("acetonePrice", 100),
       bentonite: numberValue("bentonitePrice", 80),
+      magnesol: numberValue("magnesolPrice", 250),
       electricity: numberValue("electricityPrice", 12),
       diesel: numberValue("dieselPrice", 55),
     },
@@ -168,6 +170,7 @@ function calculateCostPerLiter(batch: DemoBatch, settings: AnalyticsSettings) {
     batch.materials.sulfuricAcidL * settings.prices.sulfuricAcid +
     batch.materials.acetoneL * settings.prices.acetone +
     batch.materials.bentoniteKg * settings.prices.bentonite +
+    (batch.materials.magnesolKg ?? 0) * settings.prices.magnesol +
     batch.energy * settings.prices.electricity;
   return materialCost / (batch.biodieselOutputMl / 1000);
 }

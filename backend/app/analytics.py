@@ -131,6 +131,7 @@ def cost_per_liter(b: Batch, s: Settings) -> Optional[float]:
             + b.materials.sulfuric_acid_l * m.sulfuric_acid_price
             + b.materials.acetone_l * m.acetone_price
             + b.materials.bentonite_kg * m.bentonite_price
+            + b.materials.magnesol_kg * m.magnesol_price
             + b.energy * m.electricity_price)
     return cost / (b.biodiesel_output_ml / 1000)
 

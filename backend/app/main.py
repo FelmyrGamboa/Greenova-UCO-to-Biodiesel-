@@ -17,6 +17,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -80,6 +81,27 @@ app = FastAPI(title="Greenova API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
 app.include_router(router)
+
+
+def _field_path(loc) -> str:
+    """("body", "purification", "heatingTimeSeconds") -> "purification → heatingTimeSeconds"."""
+    parts = [str(part) for part in loc if part not in ("body", "query", "path")]
+    return " → ".join(parts) or "request"
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, error: RequestValidationError):
+    """A request that doesn't pass validation (422): one readable sentence that names each field,
+    e.g. "ffa: Use a whole number (no decimals)." instead of a bare "Field required"."""
+    problems = [f"{_field_path(e.get('loc', ()))}: {str(e.get('msg', 'invalid')).removeprefix('Value error, ')}"
+                for e in error.errors()]
+    log.warning("Invalid request on %s %s: %s", request.method, request.url.path, "; ".join(problems))
+    return JSONResponse(status_code=422, content={"detail": "; ".join(problems), "errors": jsonable(error.errors())})
+
+
+def jsonable(errors) -> list:
+    """Validation errors with only JSON-safe values (the input can hold anything)."""
+    return [{"loc": list(e.get("loc", ())), "msg": str(e.get("msg", "")), "type": str(e.get("type", ""))} for e in errors]
 
 
 @app.exception_handler(Exception)

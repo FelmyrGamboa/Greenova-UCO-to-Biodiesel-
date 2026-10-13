@@ -84,7 +84,7 @@ export default function BatchDetails() {
                 label={t("Esterification")}
                 value={batch.esterificationStages?.length ? t("{count} stages", { count: batch.esterificationStages.length }) : t("Run")}
                 sub={batch.esterificationStages?.length
-                  ? `FFA ${[formatFfa(batch), ...batch.esterificationStages.map((stage) => `${(stage.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ")}`
+                  ? `FFA ${[formatFfa(batch), ...batch.esterificationStages.map((stage) => formatFfa({ ffa: stage.ffaAfter ?? 0 }))].join(" → ")}`
                   : undefined}
               />
             )}
@@ -92,7 +92,12 @@ export default function BatchDetails() {
             <Metric label={t("Reaction time")} value={`${batch.reactionTime} min`} />
             <Metric label={t("Stirring speed")} value={`${batch.stirringSpeed} RPM`} />
             {batch.current ? <Metric label={t("Current setting")} value={`${batch.current} A`} /> : null}
-            {batch.purification?.magnesolG ? <Metric label={t("Magnesol (dry wash)")} value={`${batch.purification.magnesolG.toFixed(1)} g`} /> : null}
+            {(batch.purification?.adsorbentG ?? batch.purification?.magnesolG) ? (
+              <Metric
+                label={t((batch.adsorbent ?? batch.purification?.adsorbent) === "Bentonite" ? "Bentonite (dry wash)" : "Magnesol (dry wash)")}
+                value={`${(batch.purification?.adsorbentG ?? batch.purification?.magnesolG ?? 0).toFixed(1)} g`}
+              />
+            ) : null}
             {batch.biodieselOutputMl ? (
               <Metric label={t("Biodiesel output")} value={`${batch.biodieselOutputMl.toFixed(1)} mL`} sub={batch.purification?.outputWeightG ? t("{grams} g on the output load cell", { grams: batch.purification.outputWeightG.toFixed(1) }) : undefined} />
             ) : null}

@@ -1,12 +1,25 @@
 """Data shapes. The JSON uses the same camelCase names as the website
 (src/lib/greenovaData.ts, the greenova_settings keys, and PROCESS_CONFIG in NewBatch.tsx)."""
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 Catalyst = Literal["NaOH", "KOH"]
+# Dry wash adsorbent for purification (chosen per batch on the website's Volume & Parameters step)
+Adsorbent = Literal["Magnesol", "Bentonite"]
+
+
+def _whole(value: Optional[float]) -> Optional[float]:
+    """Operator inputs are whole numbers only (no decimals): 3, not 3.5."""
+    if value is not None and float(value) != int(float(value)):
+        raise ValueError("Use a whole number (no decimals).")
+    return value
+
+
+# A number the operator typed: must be a whole number (3 or 3.0 are fine, 3.5 is refused).
+WholeNumber = Annotated[float, AfterValidator(_whole)]
 BatchStatus = Literal["Completed", "Failed", "In Progress", "Cancelled"]
 LabResult = Literal["Pending", "Passed", "Failed", "Not tested"]
 StageName = Literal["Esterification", "Transesterification", "Separation"]
@@ -27,7 +40,8 @@ class Limit(CamelModel):
 
 
 def _current_limit() -> "Limit":
-    return Limit(min=0.5, max=2, default=1)
+    # Whole amperes only (operator inputs have no decimals): 1 or 2 A.
+    return Limit(min=1, max=2, default=1)
 
 
 class StageLimits(CamelModel):
@@ -63,6 +77,15 @@ class Settings(CamelModel):
     max_drain_temperature: float = 50         # °C: the outlet opens only at or below this (water filter limit)
     thermal_fuse_rating: Optional[float] = None
     purification_auto_start: bool = True      # start by itself after separation, once the level switch sees biodiesel
+    # Dry wash adsorbent doses, in % of the oil weight (the website lets the operator pick one per batch).
+    # Magnesol: 1% (Faccini et al.). Bentonite: 2% default; studies use 1% (10 min) up to 10 wt% (acid-activated).
+    magnesol_dose: float = 1                  # % of oil weight
+    bentonite_dose: float = 2                 # % of oil weight
+    default_adsorbent: Adsorbent = "Magnesol"
+    # After a drain, go straight on to the next stage: when the reactor outlet has closed after
+    # transesterification, the Pi starts the separation by itself (the centrifuge outlet -> purification
+    # step already ran by itself). Off = the operator presses Start on the website.
+    auto_advance: bool = True
     # Esterification: the FFA strip reads only up to strip_max_ffa, so every batch above the
     # threshold gets one uniform dose, calculated as if the oil had esterification_design_ffa.
     esterification_design_ffa: float = 10     # %
@@ -71,8 +94,9 @@ class Settings(CamelModel):
     pump_catalyst_rate: float = 100           # mL/min of pump A, for its time limit (and dosing without a load cell)
     pump_acid_rate: float = 100               # mL/min of pump B
     reactor_drain_time: float = 1             # minutes the reactor outlet stays open after transesterification
-    centrifuge_drain_time: float = 3          # minutes the centrifuge outlet stays open after separation
+    centrifuge_drain_time: float = 2          # minutes the centrifuge outlet stays open after separation
     centrifuge_spin_down_time: float = 30     # seconds to wait for the centrifuge to stop when there's no RPM reading
+    # With whole-number FFA, the first range 0-2% holds 0% and 1%: exactly the batches that skip esterification.
     ffa_range_boundaries: str = "0,2,4,5"
     proven_batch_count: int = 3
     proven_yield_tolerance: float = 2         # ± percentage points
@@ -83,6 +107,7 @@ class Settings(CamelModel):
     sulfuric_acid_price: float = 120          # ₱/L
     acetone_price: float = 100                # ₱/L
     bentonite_price: float = 80               # ₱/kg
+    magnesol_price: float = 250               # ₱/kg (placeholder: enter your supplier's price in Settings)
     electricity_price: float = 12             # ₱/kWh
     diesel_price: float = 55                  # ₱/L
     oil_molar_mass: float = 880               # g/mol; about 660 for coconut oil
@@ -94,11 +119,11 @@ class Settings(CamelModel):
     biodiesel_density: float = 0.88           # g/mL
     oil_minimum_volume_ml: float = 100
     oil_maximum_volume_ml: float = 1000
-    ffa_threshold: float = 4                  # esterification when FFA is above this
+    ffa_threshold: float = 1                  # esterification when FFA is above this (FFA <= 1%: straight to transesterification)
     ffa_target: float = 1                     # FFA to reach before transesterification
     catalyst_loading: float = 0.01            # fraction of oil weight
     acetone_fraction: float = 0.10            # fraction of oil volume
-    bentonite_fraction: float = 0.02          # g per mL of oil, for the cost estimate
+    bentonite_fraction: float = 0.02          # old records only (mesh bed); the dry wash uses bentonite_dose
     methanol_ratio: Limit = Field(default_factory=lambda: Limit(min=6, max=9, default=7))
     esterification: StageLimits = Field(default_factory=_esterification_limits)
     transesterification: StageLimits = Field(default_factory=_transesterification_limits)
@@ -139,7 +164,9 @@ class Settings(CamelModel):
         if not 30 <= self.max_drain_temperature <= 85:
             raise ValueError("maxDrainTemperature must be between 30 and 85 °C.")
         if not self.ffa_threshold < self.esterification_design_ffa <= 30:
-            raise ValueError("esterificationDesignFfa must be above the 4% threshold and at most 30%.")
+            raise ValueError(f"esterificationDesignFfa must be above the {self.ffa_threshold:g}% threshold and at most 30%.")
+        if not 0 < self.magnesol_dose <= 10 or not 0 < self.bentonite_dose <= 10:
+            raise ValueError("magnesolDose and bentoniteDose must be between 1 and 10% of the oil weight.")
         if self.pump_catalyst_rate <= 0 or self.pump_acid_rate <= 0:
             raise ValueError("Pump rates must be more than 0 mL/min.")
         if self.reactor_drain_time < 0 or self.centrifuge_drain_time < 0 or self.centrifuge_spin_down_time < 0:
@@ -165,12 +192,15 @@ class Materials(CamelModel):
     sulfuric_acid_l: float
     acetone_l: float
     bentonite_kg: float
+    magnesol_kg: float = 0
 
 
 class PurificationRecord(CamelModel):
-    target_temperature: float
-    highest_temperature: float
-    heating_time_seconds: float
+    # Every field has a default: a save must never fail because a purification value is missing
+    # (e.g. a run that stopped early, or a record from an older version).
+    target_temperature: float = 90
+    highest_temperature: Optional[float] = None
+    heating_time_seconds: float = 0
     hold_time_seconds: float = 0               # methanol removal at 90 °C
     flow_time_seconds: float = 0               # old records (mesh bed flow)
     drain_time_seconds: float = 0
@@ -187,7 +217,10 @@ class PurificationRecord(CamelModel):
     safety_stop_reason: Optional[str] = None
     output_weight_g: Optional[float] = None
     stirring_speed: Optional[float] = None    # dry wash stirrer RPM during heating and hold
-    magnesol_g: Optional[float] = None        # Magnesol for the dry wash: oil mL × 0.0092 (1% of the oil weight)
+    magnesol_g: Optional[float] = None        # adsorbent amount (g); name kept for older records (was Magnesol only)
+    adsorbent: Optional[Adsorbent] = None     # "Magnesol" or "Bentonite"
+    adsorbent_g: Optional[float] = None       # oil mL × 0.92 × dose% (Magnesol 1%, bentonite 2%)
+    heater_on_seconds: Optional[float] = None
 
 
 class EsterificationStage(CamelModel):
@@ -230,6 +263,7 @@ class Batch(CamelModel):
     esterification_current: Optional[float] = None
     biodiesel_output_ml: Optional[float] = None
     catalyst_type: Optional[Catalyst] = None
+    adsorbent: Optional[Adsorbent] = None       # dry wash adsorbent used in purification
     materials: Optional[Materials] = None
     purification: Optional[PurificationRecord] = None
     # backend extras (the website can ignore these)
@@ -248,10 +282,11 @@ class Batch(CamelModel):
 
 
 class BatchIn(Batch):
-    """What the website sends when it saves a batch. The backend fills in the ID, date and
-    anything it measured itself."""
+    """What the website sends when it saves a batch. The backend fills in the ID, date, the oil
+    volume (from oilMassG when missing) and anything it measured itself."""
     id: Optional[str] = None
     date: Optional[str] = None
+    oil_volume: Optional[float] = None
 
 
 class LabResultIn(CamelModel):
@@ -262,14 +297,15 @@ class LabResultIn(CamelModel):
 # ---------- requests ----------
 class CalculateRequest(CamelModel):
     oil_mass_g: float = Field(gt=0)
-    ffa: float = Field(ge=0, le=100)
+    ffa: WholeNumber = Field(ge=0, le=100)          # whole percent from the test strip
     methanol_ratio: Optional[float] = None
     catalyst: Catalyst = "NaOH"
+    adsorbent: Optional[Adsorbent] = None
 
 
 class AfterEsterificationRequest(CamelModel):
     oil_mass_g: float = Field(gt=0)
-    ffa_after: float = Field(ge=0, le=100)
+    ffa_after: WholeNumber = Field(ge=0, le=100)
     stage_done: int = Field(default=1, ge=1)
     methanol_ratio: Optional[float] = None
     catalyst: Catalyst = "NaOH"
@@ -278,17 +314,20 @@ class AfterEsterificationRequest(CamelModel):
 class StageStart(CamelModel):
     stage: StageName
     batch_id: Optional[str] = None
-    voltage: Optional[float] = None
-    time: Optional[float] = None       # minutes
-    stirring: Optional[float] = None   # RPM
-    current: Optional[float] = None    # A, the power supply's current limit
-    oil_mass_g: Optional[float] = None  # measured oil; sets the Magnesol amount and the low-output check
+    # operator settings: whole numbers only
+    voltage: Optional[WholeNumber] = None
+    time: Optional[WholeNumber] = None       # minutes
+    stirring: Optional[WholeNumber] = None   # RPM
+    current: Optional[WholeNumber] = None    # A, the power supply's current limit
+    oil_mass_g: Optional[float] = None  # measured oil; sets the adsorbent amount and the low-output check
+    adsorbent: Optional[Adsorbent] = None   # the batch's dry wash adsorbent (used when purification starts by itself)
 
 
 class PurificationStart(CamelModel):
     heater_submerged: bool = False   # operator confirmation; only needed when there's no level switch
     batch_id: Optional[str] = None
-    oil_volume_ml: Optional[float] = None   # sets the Magnesol amount; else the batch's measured oil
+    oil_volume_ml: Optional[float] = None   # sets the adsorbent amount; else the batch's measured oil
+    adsorbent: Optional[Adsorbent] = None   # else the one sent with the batch's stages, else defaultAdsorbent
 
 
 class DemoOilIn(CamelModel):

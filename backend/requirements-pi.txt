@@ -1,2 +1,5 @@
-# Only on the Raspberry Pi (gpiozero and lgpio come from apt: python3-gpiozero python3-lgpio)
-adafruit-circuitpython-tcs34725
+# Only on the Raspberry Pi (gpiozero and lgpio come from apt: python3-gpiozero python3-lgpio;
+# setup-pi.sh installs everything).
+adafruit-circuitpython-tcs34725   # FFA strip reader (TCS34725 color sensor)
+smbus2                            # INA226 / INA219 power monitor on I2C
+pyserial                          # power supply control over USB/serial ([power_supply] control = "serial")

@@ -25,6 +25,8 @@ export type DemoBatch = {
   esterificationCurrent?: number;
   biodieselOutputMl?: number;
   catalystType?: "NaOH" | "KOH";
+  /** Dry wash adsorbent used in purification. */
+  adsorbent?: "Magnesol" | "Bentonite";
   /** Oil weighed by the reactor load cell. */
   oilMassG?: number;
   catalystToWeighG?: number;
@@ -45,13 +47,14 @@ export type DemoBatch = {
     sulfuricAcidL: number;
     acetoneL: number;
     bentoniteKg: number;
+    magnesolKg?: number;
   };
   purification?: {
-    targetTemperature: number;
-    highestTemperature: number;
-    heatingTimeSeconds: number;
+    targetTemperature?: number;
+    highestTemperature?: number | null;
+    heatingTimeSeconds?: number;
     /** Methanol removal at 90 °C. */
-    holdTimeSeconds: number;
+    holdTimeSeconds?: number;
     /** Older records only (mesh bed flow). */
     flowTimeSeconds?: number;
     drainTimeSeconds?: number;
@@ -64,36 +67,47 @@ export type DemoBatch = {
     plannedFlowSeconds?: number;
     automatic?: boolean;
     warning?: string | null;
-    safetyStopOccurred: boolean;
+    safetyStopOccurred?: boolean;
     /** Dry wash stirrer RPM (fixed 200). */
     stirringSpeed?: number;
-    /** Magnesol for the dry wash (g): oil mL × 0.0092. */
+    /** Adsorbent for the dry wash (g); the name is from when it was Magnesol only. */
     magnesolG?: number | null;
+    adsorbent?: "Magnesol" | "Bentonite";
+    adsorbentG?: number | null;
     outputWeightG?: number | null;
   };
 };
 
+// FFA is a whole percent. FFA <= 1% goes straight to transesterification; higher is esterified first.
 export const demoBatches: DemoBatch[] = [
-  { id: "B-2026-024", date: "2026-10-18", oilVolume: 1000, ffa: 2.8, esterificationRun: false, yield: 88.4, duration: 132, energy: 1.84, status: "Completed", labResult: "Passed", temperature: 42, reactionTime: 58, stirringSpeed: 450 },
+  { id: "B-2026-024", date: "2026-10-18", oilVolume: 1000, ffa: 1, esterificationRun: false, yield: 88.4, duration: 132, energy: 1.84, status: "Completed", labResult: "Passed", temperature: 42, reactionTime: 58, stirringSpeed: 450 },
   { id: "B-2026-023", date: "2026-10-16", oilVolume: 1000, ffa: 5, ffaAboveStrip: true, esterificationRun: true, yield: 86.9, duration: 138, energy: 1.91, status: "Completed", labResult: "Pending", temperature: 41, reactionTime: 62, stirringSpeed: 440 },
-  { id: "B-2026-022", date: "2026-10-12", oilVolume: 1200, ffa: 3.4, esterificationRun: false, yield: 89.1, duration: 147, energy: 2.16, status: "Completed", labResult: "Passed", temperature: 43, reactionTime: 65, stirringSpeed: 470 },
+  { id: "B-2026-022", date: "2026-10-12", oilVolume: 1200, ffa: 1, esterificationRun: false, yield: 89.1, duration: 147, energy: 2.16, status: "Completed", labResult: "Passed", temperature: 43, reactionTime: 65, stirringSpeed: 470 },
   { id: "B-2026-021", date: "2026-10-09", oilVolume: 1000, ffa: 5, ffaAboveStrip: true, esterificationRun: true, yield: 0, duration: 51, energy: 0.82, status: "Failed", labResult: "Not tested", temperature: 40, reactionTime: 31, stirringSpeed: 430 },
-  { id: "B-2026-020", date: "2026-10-04", oilVolume: 800, ffa: 4.6, esterificationRun: true, yield: 85.7, duration: 121, energy: 1.52, status: "Completed", labResult: "Passed", temperature: 41, reactionTime: 54, stirringSpeed: 420 },
-  { id: "B-2026-019", date: "2026-09-29", oilVolume: 1000, ffa: 3.1, esterificationRun: false, yield: 87.6, duration: 135, energy: 1.88, status: "Completed", labResult: "Pending", temperature: 42, reactionTime: 60, stirringSpeed: 450 },
+  { id: "B-2026-020", date: "2026-10-04", oilVolume: 800, ffa: 4, esterificationRun: true, yield: 85.7, duration: 121, energy: 1.52, status: "Completed", labResult: "Passed", temperature: 41, reactionTime: 54, stirringSpeed: 420 },
+  { id: "B-2026-019", date: "2026-09-29", oilVolume: 1000, ffa: 1, esterificationRun: false, yield: 87.6, duration: 135, energy: 1.88, status: "Completed", labResult: "Pending", temperature: 42, reactionTime: 60, stirringSpeed: 450 },
 ];
 
 const STORAGE_KEY = "greenova_batches_v2";
 const LEGACY_SAMPLE_FFA: Record<string, number> = {
-  "B-2026-024": 2.8,
+  "B-2026-024": 1,
   "B-2026-023": 5,
-  "B-2026-022": 3.4,
+  "B-2026-022": 1,
   "B-2026-021": 5,
-  "B-2026-020": 4.6,
-  "B-2026-019": 3.1,
+  "B-2026-020": 4,
+  "B-2026-019": 1,
+};
+/** Sample FFA values saved by earlier versions (decimals, the old 4% rule): shown as the new ones. */
+const DECIMAL_SAMPLE_FFA: Record<string, [number, number]> = {
+  "B-2026-024": [2.8, 1],
+  "B-2026-022": [3.4, 1],
+  "B-2026-020": [4.6, 4],
+  "B-2026-019": [3.1, 1],
 };
 /** Sample values saved by older versions, before the strip's 5% limit. */
 const OLD_SAMPLE_FFA: Record<string, number> = { "B-2026-023": 5.6, "B-2026-021": 7.2 };
 
+// With whole-number FFA the ranges are 0–1% (no esterification), 2–3%, 4% and 5%+.
 export const DEFAULT_FFA_BOUNDARIES = "0,2,4,5";
 const OLD_DEFAULT_FFA_BOUNDARIES = "0,2,4,6,8,10";
 
@@ -118,9 +132,11 @@ export function esterificationDesignFfa(): number {
   }
 }
 
-/** "5.0%", or "≥ 5.0%" when the strip showed its darkest color. */
+/** "3%", or "≥ 5%" when the strip showed its darkest color. FFA is a whole percent; an older
+ * record with a decimal keeps it ("2.8%"). */
 export function formatFfa(batch: Pick<DemoBatch, "ffa" | "ffaAboveStrip">): string {
-  return `${batch.ffaAboveStrip ? "≥ " : ""}${batch.ffa.toFixed(1)}%`;
+  const value = Number.isInteger(batch.ffa) ? String(batch.ffa) : batch.ffa.toFixed(1);
+  return `${batch.ffaAboveStrip ? "≥ " : ""}${value}%`;
 }
 
 function hydrateAnalyticsData(batch: DemoBatch): DemoBatch {
@@ -160,12 +176,15 @@ export function getBatches(): DemoBatch[] {
     if (!stored) return demoBatches.map(hydrateAnalyticsData);
     return (JSON.parse(stored) as Array<Partial<DemoBatch> & { engineTest?: string }>).map((batch) => {
       const oldSample = batch.id !== undefined && batch.ffa === OLD_SAMPLE_FFA[batch.id];
-      const ffa = oldSample ? 5 : batch.ffa ?? LEGACY_SAMPLE_FFA[batch.id || ""] ?? 0;
+      const decimalSample = batch.id !== undefined ? DECIMAL_SAMPLE_FFA[batch.id] : undefined;
+      const ffa = oldSample ? 5
+        : decimalSample && batch.ffa === decimalSample[0] ? decimalSample[1]
+          : batch.ffa ?? LEGACY_SAMPLE_FFA[batch.id || ""] ?? 0;
       return {
         ...batch,
         ffa,
         ffaAboveStrip: oldSample ? true : batch.ffaAboveStrip,
-        esterificationRun: batch.esterificationRun ?? ffa > 4,
+        esterificationRun: batch.esterificationRun ?? ffa > 1,
         labResult:
           batch.labResult ??
           (batch.status === "Failed"

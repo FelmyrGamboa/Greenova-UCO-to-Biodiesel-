@@ -17,10 +17,12 @@ export const API_BASE = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "")
 
 // ---------- types (same field names as the backend's JSON) ----------
 export type Catalyst = "NaOH" | "KOH";
+/** Dry wash adsorbent for purification, chosen per batch. */
+export type Adsorbent = "Magnesol" | "Bentonite";
 export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-/** Dry wash with Magnesol: heating → methanol removal → add Magnesol (operator) → contact →
- * settling → cooling (only if needed) → drain → complete. */
+/** Dry wash with Magnesol or bentonite: heating → methanol removal → add the adsorbent (operator;
+ * the phase is still called "magnesol") → contact → settling → cooling (only if needed) → drain → complete. */
 export type PurificationPhase =
   | "ready" | "heating" | "methanol" | "magnesol" | "contact" | "settling" | "cooling" | "drain" | "complete" | "fault";
 export type TileState = "ready" | "checking" | "fault";
@@ -80,8 +82,13 @@ export type QuantityCards = {
   /** Pump A premix (methanol + NaOH/KOH). */
   transesterificationPremixMl: number;
   transesterificationPremixG: number;
-  /** Magnesol for the dry wash: oil mL × 0.0092 g (1% of the biodiesel). */
+  /** Magnesol for the dry wash: oil mL × 0.0092 g (1% of the oil weight). */
   magnesolG: number;
+  /** Bentonite for the dry wash: oil mL × 0.0184 g (2% of the oil weight). */
+  bentoniteG: number;
+  adsorbent: Adsorbent;
+  adsorbentG: number;
+  adsorbentDosePct: number;
   isEstimate: boolean;
   warnings: string[];
 };
@@ -192,8 +199,10 @@ export type PurificationStatus = {
   heatingTimeoutSeconds: number;
   methanolTotalSeconds: number;
   methanolRemainingSeconds: number;
-  /** Magnesol to add: oil mL × 0.0092 g. */
+  /** Adsorbent to add (g): Magnesol oil mL × 0.0092, bentonite oil mL × 0.0184. */
   magnesolG: number | null;
+  adsorbent?: Adsorbent;
+  adsorbentG?: number | null;
   magnesolAdded: boolean;
   magnesolWaitSeconds: number;
   contactTotalSeconds: number;
@@ -253,8 +262,13 @@ type StageLimits = { voltage: Limit; time: Limit; stirring: Limit; current: Limi
 /** Same structure as PROCESS_CONFIG in NewBatch.tsx. */
 export type ProcessConfig = {
   oil: { minimumVolumeMl: number; maximumVolumeMl: number; densityGPerMl: number; averageTriglycerideMolecularWeight: number };
+  /** FFA at or below this (1%) goes straight to transesterification. */
   ffaThreshold: number;
   ffaTarget: number;
+  /** Operator inputs are whole numbers only. */
+  wholeNumberInputs?: boolean;
+  /** After a drain the next stage starts by itself (the Pi starts the separation). */
+  autoAdvance?: boolean;
   methanol: { ratioDefault: number; ratioMin: number; ratioMax: number; molecularWeight: number; densityGPerMl: number; convention: string };
   catalyst: { loadingDefault: number; kohPurity: number; naohPurity: number };
   acetone: { volumeFractionDefault: number; provisional: boolean };
@@ -264,7 +278,8 @@ export type ProcessConfig = {
   purification: { holdTemperature: number; holdBand: number; maximumTemperature: number; heatingTimeoutMinutes: number;
     methanolRemovalMinutes: number; contactMinutes: number; settlingMinutes: number; maxDrainTemperature: number;
     stirringSpeedRpm: number; drainStableGrams: number; drainStableSeconds: number; drainMaximumMinutes: number;
-    lowOutputFraction: number; magnesolGramsPerMlOil: number; thermalFuseRating: number | null; automatic: boolean };
+    lowOutputFraction: number; magnesolGramsPerMlOil: number; bentoniteGramsPerMlOil?: number; adsorbents?: Adsorbent[];
+    defaultAdsorbent?: Adsorbent; magnesolDosePct?: number; bentoniteDosePct?: number; thermalFuseRating: number | null; automatic: boolean };
   /** currentControl: the Pi sets the power supply's current limit (otherwise the operator does). */
   powerSupply: { currentControl: boolean };
   pumps: { catalystRateMlPerMinute: number; acidRateMlPerMinute: number; noFlowSeconds: number };
@@ -301,6 +316,13 @@ export type Settings = Record<string, unknown> & {
   sulfuricAcidPrice: number;
   acetonePrice: number;
   bentonitePrice: number;
+  magnesolPrice: number;
+  /** Dry wash doses, % of the oil weight (Magnesol 1, bentonite 2). */
+  magnesolDose: number;
+  bentoniteDose: number;
+  defaultAdsorbent: Adsorbent;
+  /** After a drain, the next stage starts by itself. */
+  autoAdvance: boolean;
   electricityPrice: number;
   dieselPrice: number;
   oilMolarMass: number;
@@ -378,11 +400,18 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = body && typeof body === "object" && "detail" in body ? (body as { detail: unknown }).detail : null;
-    // FastAPI sends a list of problems when a request doesn't pass validation (422).
+    // FastAPI sends a list of problems when a request doesn't pass validation (422). Name the field
+    // in each one ("purification → heatingTimeSeconds: Field required"), not just "Field required".
+    const describe = (item: unknown) => {
+      if (!item || typeof item !== "object" || !("msg" in item)) return String(item);
+      const { msg, loc } = item as { msg: unknown; loc?: unknown };
+      const field = Array.isArray(loc) ? loc.filter((part) => part !== "body" && part !== "query").join(" → ") : "";
+      return field ? `${field}: ${String(msg)}` : String(msg);
+    };
     const message = typeof detail === "string"
       ? detail
       : Array.isArray(detail)
-        ? detail.map((item) => (item && typeof item === "object" && "msg" in item ? String((item as { msg: unknown }).msg) : String(item))).join("; ")
+        ? detail.map(describe).join("; ")
         : "";
     throw new ApiError(response.status, message || response.statusText || "Request failed");
   }
@@ -538,7 +567,7 @@ export const getLive = () => get<LiveData>("/api/live");
 export const clearAlarm = () => send<{ alarm: null }>("POST", "/api/alarm/clear");
 
 // ---------- calculator and FFA strip ----------
-export const calculateQuantities = (input: { oilMassG: number; ffa: number; methanolRatio?: number; catalyst: Catalyst }) =>
+export const calculateQuantities = (input: { oilMassG: number; ffa: number; methanolRatio?: number; catalyst: Catalyst; adsorbent?: Adsorbent }) =>
   send<QuantityCards>("POST", "/api/calculate", input);
 
 export const calculateAfterEsterification = (input: { oilMassG: number; ffaAfter: number; stageDone: number; methanolRatio?: number; catalyst: Catalyst }) =>
@@ -567,7 +596,7 @@ export const startDrain = (valve: DrainValve, batchId?: string) =>
 export const drainAction = (action: "stop" | "skip") => send<DrainStatus>("POST", `/api/process/drain/${action}`);
 
 // ---------- process stages ----------
-export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; current?: number; oilMassG?: number }) =>
+export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; current?: number; oilMassG?: number; adsorbent?: Adsorbent }) =>
   send<StageStatus>("POST", "/api/process/stage/start", input);
 
 export const stageAction = (action: "pause" | "resume" | "complete" | "emergency-stop" | "reset") =>
@@ -575,10 +604,10 @@ export const stageAction = (action: "pause" | "resume" | "complete" | "emergency
 
 /** Purification normally starts by itself after separation. Use this only when there's no level
  * switch (heaterSubmerged = the operator's confirmation) or to start again after a stop. */
-export const startPurification = (input: { heaterSubmerged?: boolean; batchId?: string; oilVolumeMl?: number }) =>
+export const startPurification = (input: { heaterSubmerged?: boolean; batchId?: string; oilVolumeMl?: number; adsorbent?: Adsorbent }) =>
   send<PurificationStatus>("POST", "/api/process/purification/start", input);
 
-/** "magnesol-added" = the operator's Confirm after adding the Magnesol. */
+/** "magnesol-added" = the operator's Confirm after adding the adsorbent (Magnesol or bentonite). */
 export const purificationAction = (action: "skip" | "abort" | "acknowledge" | "magnesol-added") =>
   send<PurificationStatus>("POST", `/api/process/purification/${action}`);
 

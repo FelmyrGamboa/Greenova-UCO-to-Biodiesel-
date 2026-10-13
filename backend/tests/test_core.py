@@ -33,11 +33,12 @@ def test_settings_use_the_website_keys():
 
 def test_purification_and_stage_defaults():
     assert (S.methanol_removal_time, S.contact_time, S.settling_time, S.max_drain_temperature) == (10, 15, 10, 50)
-    assert S.reactor_drain_time == 1
+    assert S.reactor_drain_time == 1 and S.centrifuge_drain_time == 2
+    assert S.ffa_threshold == 1 and S.auto_advance is True
     for limits in (S.esterification, S.transesterification):
         assert (limits.voltage.min, limits.voltage.max) == (10, 30)
         assert (limits.time.min, limits.time.max, limits.time.default) == (30, 180, 120)
-        assert (limits.current.min, limits.current.max, limits.current.default) == (0.5, 2, 1)
+        assert (limits.current.min, limits.current.max, limits.current.default) == (1, 2, 1)   # whole amperes
 
 
 def test_old_saved_settings_get_the_new_defaults(tmp_path):
@@ -48,10 +49,14 @@ def test_old_saved_settings_get_the_new_defaults(tmp_path):
     old.esterification.time.max = 120
     old.transesterification.voltage.min = 18
     old.reactor_drain_time = 3
+    old.centrifuge_drain_time = 3
+    old.ffa_threshold = 4
+    old.esterification.current.min = 0.5
     db.save_settings(old)
     s = db.get_settings()
     assert s.esterification.voltage.min == 10 and s.esterification.time.max == 180
     assert s.transesterification.voltage.min == 10 and s.reactor_drain_time == 1
+    assert s.centrifuge_drain_time == 2 and s.ffa_threshold == 1 and s.esterification.current.min == 1
 
 
 @pytest.mark.parametrize("bad", [{"ffaRangeBoundaries": "5"}, {"methanolRemovalTime": 4},
@@ -63,7 +68,7 @@ def test_settings_validation(bad):
 
 # ---------- calculations (same numbers as calculateQuantityCards on the website) ----------
 def test_calculator_with_esterification():
-    # The strip reads at most 5%, so every batch above 4% gets the uniform dose for 10% FFA
+    # The strip reads at most 5%, so every batch above 1% gets the uniform dose for 10% FFA
     q = calculations.quantity_cards(460, 6, 7, "NaOH", S)
     assert q["esterificationNeeded"] and q["isEstimate"] and q["uniformDose"] and q["doseFfa"] == 10
     assert approx(q["ffaMassG"], 46) and approx(q["esterificationMethanolMl"], 130.64)
@@ -75,7 +80,7 @@ def test_calculator_with_esterification():
     assert approx(q["esterificationPremixMl"], 131.88) and approx(q["esterificationPremixG"], 105.77)
     # pump A premix: 148.01 mL methanol (117.22 g) + 5.36 g NaOH
     assert approx(q["transesterificationPremixG"], 122.58)
-    same = calculations.quantity_cards(460, 4.5, 7, "NaOH", S)   # any FFA above 4%: the same dose
+    same = calculations.quantity_cards(460, 2, 7, "NaOH", S)     # any FFA above 1%: the same dose
     assert same["esterificationMethanolMl"] == q["esterificationMethanolMl"]
 
 
@@ -85,23 +90,40 @@ def test_magnesol_amount():
     assert calculations.quantity_cards(460, 3, 7, "NaOH", S)["magnesolG"] == 4.6
 
 
+def test_bentonite_amount_and_materials():
+    # bentonite: oil mL × 0.92 × 2% = oil mL × 0.0184 g
+    assert [calculations.adsorbent_g(ml, "Bentonite", S) for ml in (100, 500, 1000)] == [1.8, 9.2, 18.4]
+    q = calculations.quantity_cards(460, 1, 7, "NaOH", S, "Bentonite")
+    assert q["adsorbent"] == "Bentonite" and q["adsorbentG"] == 9.2 and q["bentoniteG"] == 9.2 and q["magnesolG"] == 4.6
+    assert calculations.quantity_cards(460, 1, 7, "NaOH", S)["adsorbent"] == "Magnesol"
+    assert calculations.adsorbent_g(500, "Bentonite", Settings(bentonite_dose=5)) == 23.0
+    m = calculations.materials(500, 1, False, 7, "NaOH", S, adsorbent="Bentonite")
+    assert m.bentonite_kg == 0.0092 and m.magnesol_kg == 0
+    m = calculations.materials(500, 1, False, 7, "NaOH", S)
+    assert m.magnesol_kg == 0.0046 and m.bentonite_kg == 0
+
+
 def test_design_ffa_setting():
     s = Settings(esterification_design_ffa=8)
     q = calculations.quantity_cards(460, 5, 7, "NaOH", s)
     assert q["doseFfa"] == 8 and approx(q["esterificationMethanolMl"], 104.51)
     with pytest.raises(ValueError):
-        Settings(esterification_design_ffa=3)     # must be above the 4% threshold
+        Settings(esterification_design_ffa=1)     # must be above the 1% threshold
 
 
 def test_calculator_without_esterification():
-    q = calculations.quantity_cards(460, 3, 7, "NaOH", S)
+    q = calculations.quantity_cards(460, 1, 7, "NaOH", S)
     assert not q["esterificationNeeded"] and not q["isEstimate"]
-    assert approx(q["catalystToWeighG"], 6.69)
+    assert approx(q["catalystToWeighG"], 5.36)
+    assert calculations.quantity_cards(460, 0, 7, "NaOH", S)["esterificationNeeded"] is False
 
 
-def test_exactly_4_percent_skips_esterification():
-    assert not calculations.needs_esterification(4.0, S)
-    assert calculations.needs_esterification(4.01, S)
+def test_ffa_1_percent_or_less_skips_esterification():
+    # FFA <= 1%: straight to transesterification; anything higher: esterification first
+    assert not calculations.needs_esterification(0, S)
+    assert not calculations.needs_esterification(1, S)
+    assert calculations.needs_esterification(2, S)
+    assert calculations.needs_esterification(3, S)
 
 
 def test_after_esterification():
@@ -136,33 +158,41 @@ def test_ffa_ranges_match_the_website():
 
 def test_range_rows_on_sample_data():
     rows = {r["range"]["key"]: r for r in analytics.range_rows(_samples(), S)}
-    r = rows["2-4"]
+    # with whole-number FFA, 0-2% holds the 0% and 1% batches: the ones without esterification
+    r = rows["0-2"]
     assert r["testedBatches"] == 2 and r["labPassRate"] == 100 and r["status"] == "Testing"
     assert r["recommendedBatchId"] == "B-2026-022" and approx(r["averageYield"], 88.75)
     assert r["minimumYield"] == 88.4 and r["maximumYield"] == 89.1
+    assert r["esterificationRun"] is False
     assert rows["4-5"]["recommendedParameters"]["esterificationVoltage"] == 20
     assert rows["5+"]["testedBatches"] == 0     # B-2026-023 is pending, B-2026-021 failed (not tested)
-    assert rows["0-2"]["status"] == "No data" and rows["0-2"]["recommendedParameters"] is None
+    assert rows["2-4"]["status"] == "No data" and rows["2-4"]["recommendedParameters"] is None
+
+
+def test_sample_batches_follow_the_rule():
+    for row in seed.DEMO_BATCHES:
+        assert float(row["ffa"]).is_integer()
+        assert row["esterificationRun"] == (row["ffa"] > S.ffa_threshold)
 
 
 def test_proven_status():
-    base = seed.hydrate(seed.DEMO_BATCHES[0])          # B-2026-024, 2.8% FFA, Passed, 88.4%
+    base = seed.hydrate(seed.DEMO_BATCHES[0])          # B-2026-024, 1% FFA, Passed, 88.4%
     batches = [base.model_copy(update={"id": f"B-{i}", "yield_": y}) for i, y in enumerate([88.4, 87.0, 89.0])]
     rows = {r["range"]["key"]: r for r in analytics.range_rows(batches, S)}
-    assert rows["2-4"]["status"] == "Proven"
+    assert rows["0-2"]["status"] == "Proven"
     batches.append(base.model_copy(update={"id": "B-x", "yield_": 70.0, "lab_result": "Failed"}))
     rows = {r["range"]["key"]: r for r in analytics.range_rows(batches, S)}
-    assert rows["2-4"]["status"] == "Testing"            # a failed batch with the same settings
+    assert rows["0-2"]["status"] == "Testing"            # a failed batch with the same settings
 
 
 def test_recommended_parameters():
     batches = _samples()
-    p = analytics.recommended_parameters(3.0, batches, S)
+    p = analytics.recommended_parameters(1, batches, S)
     assert p["transesterificationTime"] == 65 and p["transesterificationStirring"] == 470
     assert "esterificationVoltage" not in p
-    assert analytics.recommended_parameters(4.5, batches, S)["esterificationTime"] == 120
-    assert analytics.recommended_parameters(5.0, batches, S) is None   # "5% and above": nothing tested yet
-    assert analytics.recommended_parameters(1.0, batches, S) is None
+    assert analytics.recommended_parameters(4, batches, S)["esterificationTime"] == 120
+    assert analytics.recommended_parameters(5, batches, S) is None   # "5% and above": nothing tested yet
+    assert analytics.recommended_parameters(3, batches, S) is None   # 2-4%: no samples
 
 
 def test_summary_and_cost():
@@ -516,8 +546,8 @@ def test_pi_sets_the_current_limit_when_it_can(monkeypatch):
     runner = StageRunner(hw)
 
     async def scenario():
-        runner.start("Esterification", S, current=0.8)
-        assert runner.state["currentLimitSet"] is True and hw.supply_current_limit == 0.8
+        runner.start("Esterification", S, current=1)
+        assert runner.state["currentLimitSet"] is True and hw.supply_current_limit == 1
         await runner.emergency_stop()
     asyncio.run(scenario())
 

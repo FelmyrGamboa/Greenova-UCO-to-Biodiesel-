@@ -25,6 +25,7 @@ import {
   startPump,
   startPurification,
   startStage,
+  type Adsorbent,
   type BatchRecord,
   type DrainPhase,
   type DrainValve,
@@ -35,7 +36,7 @@ import {
   type StageStatus,
   type SystemStatus,
 } from "../lib/api";
-import { formatFfa } from "../lib/greenovaData";
+import { formatFfa, saveCompletedBatch as saveBatchInThisBrowser, type DemoBatch } from "../lib/greenovaData";
 import { useT, type TFunction } from "../lib/i18n";
 
 type DeviceState = "ready" | "checking" | "fault";
@@ -61,7 +62,8 @@ type EsterStageRecord = {
   acetoneMl: number;
 };
 
-const CURRENT_LIMITS = { min: 0.5, max: 2, default: 1 };
+// Whole amperes only (every operator input is a whole number): 1 or 2 A.
+const CURRENT_LIMITS = { min: 1, max: 2, default: 1 };
 
 export const PROCESS_CONFIG = {
   oil: {
@@ -70,7 +72,8 @@ export const PROCESS_CONFIG = {
     densityGPerMl: 0.92,
     averageTriglycerideMolecularWeight: 885,
   },
-  ffaThreshold: 4,
+  // FFA <= 1%: straight to transesterification. Anything higher is esterified first.
+  ffaThreshold: 1,
   methanol: {
     ratioDefault: 7,
     ratioMin: 6,
@@ -103,7 +106,7 @@ export const PROCESS_CONFIG = {
     timeMinutes: 10,
     speedRpm: 2600,
   },
-  // Purification (dry wash with Magnesol): fixed values, same as the backend's purification.py
+  // Purification (dry wash with Magnesol or bentonite): fixed values, same as the backend's purification.py
   purification: {
     holdTemperature: 90,
     holdBand: 2,
@@ -125,7 +128,7 @@ const SAFETY_GROUPS = [
       ["Sulfuric acid (H₂SO₄)", "Corrosive. Use appropriate chemical-resistant PPE and the approved dilution and handling procedure."],
       ["NaOH or KOH", "Corrosive alkaline catalysts. Handle according to the laboratory procedure."],
       ["Acetone", "Highly flammable. Keep away from ignition sources and use suitable ventilation."],
-      ["Magnesol", "Magnesol is a fine powder: wear a dust mask and avoid breathing the dust."],
+      ["Magnesol / bentonite", "Magnesol and bentonite are fine powders: wear a dust mask and avoid breathing the dust."],
       ["Chemical mixing", "Follow the validated order of addition. Do not mix incompatible chemicals or add chemicals without the approved procedure."],
       ["Containers", "Use compatible, closed, clearly labeled containers."],
     ],
@@ -152,19 +155,42 @@ const SAFETY_GROUPS = [
   },
 ];
 
-function decimalError(
+/** Every operator input is a whole number (no decimals): 3, not 3.5. */
+function wholeNumberError(
   t: TFunction,
   value: string,
   limits: { min: number; max: number },
   messages?: { empty?: string; min?: string; max?: string },
 ) {
-  if (!value.trim() || !/^(?:\d+\.?\d*|\.\d+)$/.test(value)) {
-    return messages?.empty ?? t("Enter a valid numeric value.");
-  }
+  if (/[.,]/.test(value)) return t("Use a whole number (no decimals).");
+  if (!value.trim() || !/^\d+$/.test(value.trim())) return messages?.empty ?? t("Enter a whole number.");
   const number = Number(value);
   if (number < limits.min) return messages?.min ?? t("Minimum value is {value}.", { value: limits.min });
   if (number > limits.max) return messages?.max ?? t("Maximum value is {value}.", { value: limits.max });
   return "";
+}
+
+/** onChange for a whole-number field: letters can't be typed. A decimal point can, so "2.5" is
+ * shown with "Use a whole number" and blocks Continue, instead of silently turning into 25. */
+function wholeInput(setValue: (value: string) => void) {
+  return (event: { target: { value: string } }) => {
+    if (/^[\d.,]*$/.test(event.target.value)) setValue(event.target.value);
+  };
+}
+
+/** A whole number from a stored value (older records and settings may have decimals). */
+function whole(value: number) {
+  return String(Math.round(value));
+}
+
+/** "3%": FFA is a whole percent (older decimal records still show their decimal). */
+function pct(value: number) {
+  return `${Number.isInteger(value) ? value : value.toFixed(1)}%`;
+}
+
+/** A finite number for the saved record, so nothing is ever missing or NaN. */
+function num(value: unknown, fallback = 0) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function errorText(t: TFunction, error: unknown) {
@@ -204,7 +230,7 @@ function getTransferSettings() {
   const settings = readSettings();
   return {
     reactorDrainMinutes: settingNumber(settings, "reactorDrainTime", 1),
-    centrifugeDrainMinutes: settingNumber(settings, "centrifugeDrainTime", 3),
+    centrifugeDrainMinutes: settingNumber(settings, "centrifugeDrainTime", 2),
   };
 }
 
@@ -221,6 +247,21 @@ function getPurificationSettings() {
 
 type PurificationSettings = ReturnType<typeof getPurificationSettings>;
 
+/** Dry wash adsorbent doses (Settings → Purification, % of the oil weight) and the default choice. */
+function getAdsorbentSettings() {
+  const settings = readSettings();
+  const preferred = settings.defaultAdsorbent === "Bentonite" ? "Bentonite" : "Magnesol";
+  return {
+    magnesolDose: settingNumber(settings, "magnesolDose", 1, Number.MIN_VALUE),
+    bentoniteDose: settingNumber(settings, "bentoniteDose", 2, Number.MIN_VALUE),
+    defaultAdsorbent: preferred as Adsorbent,
+    /** After a drain, the next stage starts by itself (Settings → Esterification and Dosing). */
+    autoAdvance: settings.autoAdvance !== false,
+  };
+}
+
+type AdsorbentSettings = ReturnType<typeof getAdsorbentSettings>;
+
 function formatMinutes(seconds: number) {
   const minutes = seconds / 60;
   return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} min`;
@@ -235,9 +276,15 @@ function formatTimer(totalSeconds: number) {
 const METHANOL_DENSITY = 0.792;
 const ACETONE_DENSITY = 0.784;
 
-/** Magnesol for the dry wash: oil mL × 0.92 × 1% = oil mL × 0.0092 g, rounded to 0.1 g. */
-function magnesolGrams(oilVolumeMl: number | null) {
-  return oilVolumeMl ? Math.round(oilVolumeMl * 0.0092 * 10 + 1e-9) / 10 : 0;
+function adsorbentDose(adsorbent: Adsorbent, doses: AdsorbentSettings) {
+  return adsorbent === "Bentonite" ? doses.bentoniteDose : doses.magnesolDose;
+}
+
+/** Dry wash adsorbent: oil mL × 0.92 × dose %, rounded to 0.1 g (same as the backend's adsorbent_g).
+ * Magnesol 1% → oil mL × 0.0092 (500 mL → 4.6 g). Bentonite 2% → oil mL × 0.0184 (500 mL → 9.2 g). */
+function adsorbentGrams(oilVolumeMl: number | null, adsorbent: Adsorbent, doses: AdsorbentSettings) {
+  const fraction = (PROCESS_CONFIG.oil.densityGPerMl * adsorbentDose(adsorbent, doses)) / 100;
+  return oilVolumeMl ? Math.round(oilVolumeMl * fraction * 10 + 1e-9) / 10 : 0;
 }
 
 /** One esterification stage (same rules as the backend's calculations.py). Stage 1 is the uniform
@@ -311,6 +358,8 @@ function calculateQuantityCards(
   ratio: number,
   catalyst: "NaOH" | "KOH",
   settings: ChemistrySettings,
+  adsorbent: Adsorbent,
+  doses: AdsorbentSettings,
 ) {
   const esterificationNeeded = ffa > PROCESS_CONFIG.ffaThreshold;
   const ester = esterificationDose(oilMassG, oilVolumeMl, ffa, 1, settings);
@@ -332,7 +381,8 @@ function calculateQuantityCards(
     catalystToWeighG: trans.catalystToWeighG,
     purity: trans.purity,
     transesterificationPremixG: trans.premixG,
-    magnesolG: magnesolGrams(oilVolumeMl),
+    adsorbentG: adsorbentGrams(oilVolumeMl, adsorbent, doses),
+    adsorbentDosePct: adsorbentDose(adsorbent, doses),
   };
 }
 
@@ -534,14 +584,15 @@ function ParameterField({
   limits: { min: number; max: number };
 }) {
   const t = useT();
-  const error = decimalError(t, value, limits);
+  const error = wholeNumberError(t, value, limits);
   return (
     <div>
       <Field
         label={t(label)}
-        inputMode="decimal"
+        inputMode="numeric"
+        pattern="[0-9]*"
         value={value}
-        onChange={(event) => setValue(event.target.value)}
+        onChange={wholeInput(setValue)}
         unit={unit}
         aria-invalid={Boolean(error)}
       />
@@ -753,7 +804,7 @@ function RecheckPanel({
   onContinue: () => void;
 }) {
   const t = useT();
-  const error = aboveStrip ? "" : decimalError(t, value, { min: 0, max: settings.stripMaxFfa }, {
+  const error = aboveStrip ? "" : wholeNumberError(t, value, { min: 0, max: settings.stripMaxFfa }, {
     empty: t("Enter the re-check FFA."),
     max: t("The strip reads up to {max}%. Tick the darkest color instead.", { max: settings.stripMaxFfa }),
   });
@@ -764,7 +815,7 @@ function RecheckPanel({
       <p className="text-sm text-gray-300">{t("Test a sample from the oil layer with a new strip. At or below {target}%, go on to transesterification; above it, run another esterification stage.", { target: settings.ffaTarget })}</p>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <div>
-          <Field label={t("FFA after esterification")} inputMode="decimal" value={aboveStrip ? String(settings.stripMaxFfa) : value} disabled={aboveStrip} onChange={(event) => setValue(event.target.value)} unit="%" aria-invalid={Boolean(error) && value !== ""} />
+          <Field label={t("FFA after esterification")} inputMode="numeric" pattern="[0-9]*" value={aboveStrip ? String(settings.stripMaxFfa) : value} disabled={aboveStrip} onChange={wholeInput(setValue)} unit="%" aria-invalid={Boolean(error) && value !== ""} />
           {error && value !== "" && <p className="mt-2 text-xs text-red-400">{error}</p>}
         </div>
         <label className="flex items-center gap-2 self-end pb-3 text-sm text-gray-300">
@@ -775,11 +826,11 @@ function RecheckPanel({
       {next && !error && (
         done ? (
           <div className="mt-4 rounded-xl border border-green-500/20 bg-green-500/[0.05] p-4 text-sm text-green-400">
-            {t("FFA {ffa}% is at or below {target}%. Transesterification uses the exact amount: {grams} g {catalyst}.", { ffa: next.ffa.toFixed(1), target: settings.ffaTarget, grams: next.trans.catalystToWeighG.toFixed(2), catalyst })}
+            {t("FFA {ffa}% is at or below {target}%. Transesterification uses the exact amount: {grams} g {catalyst}.", { ffa: next.ffa, target: settings.ffaTarget, grams: next.trans.catalystToWeighG.toFixed(2), catalyst })}
           </div>
         ) : (
           <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm text-amber-400">
-            {t("FFA is still above {target}%. Stage {stage}: {methanol} mL methanol (40:1) + {acid} mL H₂SO₄, dosed for {dose}% FFA. No more acetone.", { target: settings.ffaTarget, stage: stage + 1, methanol: next.ester.methanolMl.toFixed(1), acid: next.ester.sulfuricAcidMl.toFixed(2), dose: next.ester.doseFfa.toFixed(1) })}
+            {t("FFA is still above {target}%. Stage {stage}: {methanol} mL methanol (40:1) + {acid} mL H₂SO₄, dosed for {dose}% FFA. No more acetone.", { target: settings.ffaTarget, stage: stage + 1, methanol: next.ester.methanolMl.toFixed(1), acid: next.ester.sulfuricAcidMl.toFixed(2), dose: next.ester.doseFfa })}
             {aboveStrip && <span className="mt-1 block text-xs">{t("The oil may have more than {design}% FFA. Stage {stage} is dosed for {design}% again.", { design: settings.designFfa, stage: stage + 1 })}</span>}
             {stage >= 3 && <span className="mt-1 block text-xs">{t("Several stages haven't brought the FFA down. Consider checking the strip, the reaction time, or using a different feedstock.")}</span>}
           </div>
@@ -887,7 +938,7 @@ function ReactionStage({
             isEsterification
               ? esterStage > 1
                 ? t("FFA was still above 1% after the last stage: another acid stage, dosed for the re-check reading.")
-                : t("Acid pretreatment of high-FFA feedstock before transesterification. The dose is the same for every oil above 4% FFA.")
+                : t("Acid pretreatment of high-FFA feedstock before transesterification. The dose is the same for every oil above 1% FFA.")
               : t("Base-catalyzed conversion of the prepared oil into biodiesel.")
           }
         />
@@ -914,7 +965,7 @@ function ReactionStage({
               <Metric
                 label={t("Methanol")}
                 value={`${(isEsterification ? esterDose.methanolMl : transDose.methanolMl).toFixed(1)} mL`}
-                sub={isEsterification ? t("{ratio} methanol to FFA · dose for {dose}% FFA", { ratio: esterStage === 1 ? "20:1" : "40:1", dose: esterDose.doseFfa.toFixed(1) }) : t("{ratio}:1 molar ratio · calculated", { ratio })}
+                sub={isEsterification ? t("{ratio} methanol to FFA · dose for {dose}% FFA", { ratio: esterStage === 1 ? "20:1" : "40:1", dose: esterDose.doseFfa }) : t("{ratio}:1 molar ratio · calculated", { ratio })}
               />
             </Card>
             {isEsterification ? (
@@ -982,7 +1033,9 @@ type PurificationView = {
   stepRemaining: number | null;
   outputG: number;
   oilG: number | null;
+  /** Amount of the dry wash adsorbent (Magnesol or bentonite), g. */
   magnesolG: number | null;
+  adsorbent: Adsorbent;
   warning: string | null;
   stopReason: string | null;
   stopOccurred: boolean;
@@ -997,7 +1050,7 @@ type PurificationView = {
 
 const READY_PURIFICATION: PurificationView = {
   phase: "ready", temperature: null, highest: null, heaterOn: false, stirrerOn: false, stirrerRpm: null,
-  valveOpen: false, stepRemaining: null, outputG: 0, oilG: null, magnesolG: null, warning: null, stopReason: null,
+  valveOpen: false, stepRemaining: null, outputG: 0, oilG: null, magnesolG: null, adsorbent: "Magnesol", warning: null, stopReason: null,
   stopOccurred: false, automatic: true, heatingSeconds: 0, methanolSeconds: 0, contactSeconds: 0,
   settlingSeconds: 0, coolingSeconds: 0, drainSeconds: 0,
 };
@@ -1005,7 +1058,7 @@ const READY_PURIFICATION: PurificationView = {
 const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
   ["heating", "Heating"],
   ["methanol", "Methanol removal"],
-  ["magnesol", "Add Magnesol"],
+  ["magnesol", "Add adsorbent"],   // shown as "Add Magnesol" or "Add Bentonite"
   ["contact", "Contact"],
   ["settling", "Settling"],
   ["cooling", "Cooling"],
@@ -1044,6 +1097,9 @@ export default function NewBatch() {
   const [acetoneBase, setAcetoneBase] = useState<Record<string, number>>({});
   const transferSettings = useMemo(getTransferSettings, []);
   const purificationSettings = useMemo(getPurificationSettings, []);
+  const adsorbentSettings = useMemo(getAdsorbentSettings, []);
+  // Dry wash adsorbent for this batch: Magnesol or bentonite (Volume & Parameters → Purification)
+  const [adsorbent, setAdsorbent] = useState<Adsorbent>(adsorbentSettings.defaultAdsorbent);
   const [ratio, setRatio] = useState(7);
   const [catalyst, setCatalyst] = useState<"NaOH" | "KOH">("NaOH");
   const [esterVoltage, setEsterVoltage] = useState("20");
@@ -1063,12 +1119,16 @@ export default function NewBatch() {
   const autoStarted = useRef(false);
   const [heaterConfirmed, setHeaterConfirmed] = useState(false); // only used without a level switch
   const [saved, setSaved] = useState(false);
+  // The Pi refused the batch record: offer to retry, or to keep it in this browser and finish.
+  const [saveFailed, setSaveFailed] = useState(false);
   const { live, backend, mock } = useLiveData();
   const [actionError, setActionError] = useState<string | null>(null);
   const [savedBatch, setSavedBatch] = useState<BatchRecord | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [batchId, setBatchId] = useState(() => `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`);
   const [processConfigCurrentControl, setProcessConfigCurrentControl] = useState(false);
+  // The Pi starts the separation by itself once the reactor has drained (backend setting autoAdvance).
+  const [backendAutoAdvance, setBackendAutoAdvance] = useState(true);
 
   // Batch ID from the backend's naming format (local ID when offline).
   useEffect(() => {
@@ -1089,8 +1149,10 @@ export default function NewBatch() {
     let cancelled = false;
     fetch("/api/config")
       .then((response) => response.json())
-      .then((config: { powerSupply?: { currentControl?: boolean } }) => {
-        if (!cancelled) setProcessConfigCurrentControl(Boolean(config.powerSupply?.currentControl));
+      .then((config: { powerSupply?: { currentControl?: boolean }; autoAdvance?: boolean }) => {
+        if (cancelled) return;
+        setProcessConfigCurrentControl(Boolean(config.powerSupply?.currentControl));
+        setBackendAutoAdvance(config.autoAdvance !== false);
       })
       .catch(() => undefined);
     return () => {
@@ -1117,7 +1179,8 @@ export default function NewBatch() {
                 : null,
       outputG: sim.outputG,
       oilG: sim.oilG,
-      magnesolG: magnesolGrams(oilVolumeMl),
+      magnesolG: adsorbentGrams(oilVolumeMl, adsorbent, adsorbentSettings),
+      adsorbent,
       warning: sim.warning,
       stopReason: sim.stopReason,
       stopOccurred: Boolean(sim.stopReason),
@@ -1170,7 +1233,8 @@ export default function NewBatch() {
       stepRemaining: p.stepRemainingSeconds,
       outputG: p.outputWeightG ?? 0,
       oilG: p.oilWeightG,
-      magnesolG: p.magnesolG,
+      magnesolG: p.adsorbentG ?? p.magnesolG,
+      adsorbent: p.adsorbent ?? adsorbent,
       warning: p.warning,
       stopReason: p.safetyStopReason,
       stopOccurred: p.safetyStopOccurred,
@@ -1182,6 +1246,7 @@ export default function NewBatch() {
       coolingSeconds: p.coolingSeconds,
       drainSeconds: p.drainElapsedSeconds,
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backend, live, batchId]);
 
   // A pump run on the Pi has ended: add what it delivered to its dose (once).
@@ -1228,7 +1293,7 @@ export default function NewBatch() {
     PROCESS_CONFIG.oil.densityGPerMl > 0
       ? oilMassG / PROCESS_CONFIG.oil.densityGPerMl
       : null;
-  const targetError = decimalError(
+  const targetError = wholeNumberError(
     t,
     targetVolume,
     {
@@ -1240,7 +1305,7 @@ export default function NewBatch() {
       max: t("Maximum supported oil volume is 1000 mL."),
     },
   );
-  const ffaError = ffaAboveStrip ? "" : decimalError(t, ffa, { min: 0, max: 100 }, { empty: t("Enter a valid FFA percentage.") });
+  const ffaError = ffaAboveStrip ? "" : wholeNumberError(t, ffa, { min: 0, max: 100 }, { empty: t("Enter the FFA as a whole percent (for example 1 or 3).") });
   // Above the strip's range the batch is recorded at the strip's maximum (5%), marked "≥".
   const ffaNumber = ffaAboveStrip ? chemistrySettings.stripMaxFfa : Number(ffa);
   const requiresEsterification =
@@ -1254,16 +1319,16 @@ export default function NewBatch() {
           ? t("Maximum supported oil volume is 1000 mL.")
           : "";
   const esterErrors = [
-    decimalError(t, esterVoltage, PROCESS_CONFIG.esterification.voltage),
-    decimalError(t, esterTime, PROCESS_CONFIG.esterification.time),
-    decimalError(t, esterStirring, PROCESS_CONFIG.esterification.stirring),
-    decimalError(t, esterCurrent, PROCESS_CONFIG.esterification.current),
+    wholeNumberError(t, esterVoltage, PROCESS_CONFIG.esterification.voltage),
+    wholeNumberError(t, esterTime, PROCESS_CONFIG.esterification.time),
+    wholeNumberError(t, esterStirring, PROCESS_CONFIG.esterification.stirring),
+    wholeNumberError(t, esterCurrent, PROCESS_CONFIG.esterification.current),
   ];
   const transErrors = [
-    decimalError(t, transVoltage, PROCESS_CONFIG.transesterification.voltage),
-    decimalError(t, transTime, PROCESS_CONFIG.transesterification.time),
-    decimalError(t, transStirring, PROCESS_CONFIG.transesterification.stirring),
-    decimalError(t, transCurrent, PROCESS_CONFIG.transesterification.current),
+    wholeNumberError(t, transVoltage, PROCESS_CONFIG.transesterification.voltage),
+    wholeNumberError(t, transTime, PROCESS_CONFIG.transesterification.time),
+    wholeNumberError(t, transStirring, PROCESS_CONFIG.transesterification.stirring),
+    wholeNumberError(t, transCurrent, PROCESS_CONFIG.transesterification.current),
   ];
   const parametersValid =
     !targetError &&
@@ -1278,12 +1343,14 @@ export default function NewBatch() {
     ratio,
     catalyst,
     chemistrySettings,
+    adsorbent,
+    adsorbentSettings,
   );
   const calculatorReady = oilMassG > 0 && !ffaError;
 
   // ----- esterification stages and the FFA re-check -----
   const esterDoseNow = esterificationDose(oilMassG, oilVolumeMl, esterStage === 1 ? ffaNumber : nextDoseFfa ?? ffaNumber, esterStage, chemistrySettings);
-  const recheckError = recheckAbove ? "" : decimalError(t, recheckValue, { min: 0, max: chemistrySettings.stripMaxFfa });
+  const recheckError = recheckAbove ? "" : wholeNumberError(t, recheckValue, { min: 0, max: chemistrySettings.stripMaxFfa });
   const recheckFfa = recheckAbove ? chemistrySettings.stripMaxFfa : Number(recheckValue);
   const recheckNext = recheckError
     ? null
@@ -1302,7 +1369,8 @@ export default function NewBatch() {
     (requiresEsterification ? esterRecords.find((record) => record.stage === 1)?.acetoneMl ?? calculatorValues.acetoneMl ?? 0 : 0) +
     (transDoseNow.acetoneMl ?? 0);
   const esterAcidTotal = esterRecords.length ? esterRecords.reduce((sum, record) => sum + record.sulfuricAcidMl, 0) : requiresEsterification ? calculatorValues.sulfuricAcidMl : 0;
-  const magnesolG = purification.magnesolG ?? calculatorValues.magnesolG;
+  const magnesolG = purification.magnesolG ?? calculatorValues.adsorbentG;   // adsorbent amount (g)
+  const adsorbentName = purification.phase === "ready" ? adsorbent : purification.adsorbent;
   useEffect(() => {
     if (ffaError) return;
     let cancelled = false;
@@ -1310,18 +1378,19 @@ export default function NewBatch() {
     getRecommendedParametersForFfa(ffaNumber)
       .then((recommendation) => {
         if (cancelled || !recommendation) return;
+        // whole numbers only (older records may have decimals)
         if (recommendation.esterificationVoltage != null) {
-          setEsterVoltage(String(recommendation.esterificationVoltage));
+          setEsterVoltage(whole(recommendation.esterificationVoltage));
         }
         if (recommendation.esterificationTime != null) {
-          setEsterTime(String(recommendation.esterificationTime));
+          setEsterTime(whole(recommendation.esterificationTime));
         }
         if (recommendation.esterificationStirring != null) {
-          setEsterStirring(String(recommendation.esterificationStirring));
+          setEsterStirring(whole(recommendation.esterificationStirring));
         }
-        setTransVoltage(String(recommendation.transesterificationVoltage));
-        setTransTime(String(recommendation.transesterificationTime));
-        setTransStirring(String(recommendation.transesterificationStirring));
+        setTransVoltage(whole(recommendation.transesterificationVoltage));
+        setTransTime(whole(recommendation.transesterificationTime));
+        setTransStirring(whole(recommendation.transesterificationStirring));
         setRatio(recommendation.methanolRatio);
       })
       .catch(() => undefined);
@@ -1636,10 +1705,11 @@ export default function NewBatch() {
       if (nextState === "running" && current === "ready") {
         result = await startStage(
           kind === "Separation"
-            ? { stage: kind, batchId, oilMassG }
+            ? { stage: kind, batchId, oilMassG, adsorbent }
             : {
                 stage: kind,
                 batchId,
+                adsorbent,
                 voltage: Number(kind === "Esterification" ? esterVoltage : transVoltage),
                 time: Number(kind === "Esterification" ? esterTime : transTime),
                 stirring: Number(kind === "Esterification" ? esterStirring : transStirring),
@@ -1684,7 +1754,7 @@ export default function NewBatch() {
     setActionError(null);
     if (backend) {
       try {
-        await startPurification({ heaterSubmerged: heaterConfirmed, batchId, oilVolumeMl: oilVolumeMl ?? undefined });
+        await startPurification({ heaterSubmerged: heaterConfirmed, batchId, oilVolumeMl: oilVolumeMl ?? undefined, adsorbent });
       } catch (error) {
         setActionError(errorText(t, error));
       }
@@ -1791,6 +1861,62 @@ export default function NewBatch() {
     setHeaterConfirmed(false);
   }
 
+  // ----- going on by itself after each drain -----
+  // Transesterification done and the reactor outlet has closed again (the reactor has drained into
+  // the centrifuge): on to Separation. A drain time of 0 means the liquid is moved by hand: then
+  // the operator continues with the button.
+  const goToSeparation =
+    currentStage === "Transesterification" && transState === "complete" && reactorDrained && drainMinutes("reactor_outlet") > 0;
+  useEffect(() => {
+    if (!goToSeparation) return;
+    const timer = window.setTimeout(next, 1500);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [goToSeparation]);
+
+  // The separation then starts by itself. With the backend the Raspberry Pi starts it (so it goes on
+  // even if this page is closed); the local demonstration starts it here.
+  const autoSeparation = useRef(false);
+  const piStartsSeparation = backend && backendAutoAdvance && drainMinutes("reactor_outlet") > 0;
+  const startSeparationHere =
+    !backend && adsorbentSettings.autoAdvance && currentStage === "Separation" && separationState === "ready" &&
+    !reactorDraining && drainMinutes("reactor_outlet") > 0;
+  useEffect(() => {
+    if (!startSeparationHere || autoSeparation.current) return;
+    const timer = window.setTimeout(() => {
+      autoSeparation.current = true;
+      controlStage("Separation", "running", "ready", setSeparationState);
+    }, 1000);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startSeparationHere]);
+  // If the Pi hasn't started it a few seconds after the reactor closed (autoAdvance off on the Pi,
+  // or a problem), the Start button appears.
+  const [separationWaitOver, setSeparationWaitOver] = useState(false);
+  const waitingForPi = piStartsSeparation && currentStage === "Separation" && separationState === "ready" && !reactorDraining;
+  useEffect(() => {
+    if (!waitingForPi) return;
+    const timer = window.setTimeout(() => setSeparationWaitOver(true), 8000);
+    return () => window.clearTimeout(timer);
+  }, [waitingForPi]);
+  const separationStartsByItself =
+    separationState === "ready" && drainMinutes("reactor_outlet") > 0 &&
+    (backend ? piStartsSeparation && !separationWaitOver : adsorbentSettings.autoAdvance && !autoSeparation.current);
+
+  // Purification done (its outlet has closed after draining): the batch is saved and the process
+  // finishes by itself (Process Complete shows the result and any low-output warning).
+  const autoFinished = useRef(false);
+  const finishNow = currentStage === "Purification" && purification.phase === "complete" && !saved;
+  useEffect(() => {
+    if (!finishNow || autoFinished.current) return;
+    const timer = window.setTimeout(() => {
+      autoFinished.current = true;
+      completeBatch();
+    }, 1500);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finishNow]);
+
   // Separation complete: go on to Purification by itself.
   useEffect(() => {
     if (currentStage !== "Separation" || separationState !== "complete") return;
@@ -1815,64 +1941,75 @@ export default function NewBatch() {
   const showManualStart =
     purification.phase === "ready" && !purification.stopReason && !centrifugeDraining && (!backend || !autoStartPending || levelSwitch === null);
 
+  /** The batch record the website saves. The Pi adds what it measured itself (temperatures, energy,
+   * purification, output weight and yield). Every number goes through num(), so no field is ever
+   * missing or NaN (a missing value used to stop the save with "Field required"). */
+  function batchRecord(): Partial<DemoBatch> & { id: string } {
+    const totalReactionTime = num(Number(transTime)) + (requiresEsterification ? num(Number(esterTime)) * esterStagesRun : 0);
+    const oilVolume = Number(num(oilVolumeMl).toFixed(1));
+    // Offline the website works out the yield itself from the output load cell; the Pi does it on its own.
+    const localOutputMl = !backend && purification.outputG > 0 ? Number((purification.outputG / 0.88).toFixed(1)) : undefined;
+    return {
+      id: batchId,
+      date: new Date().toISOString().slice(0, 10),
+      oilVolume,
+      yield: localOutputMl && oilVolume ? Number(((localOutputMl / oilVolume) * 100).toFixed(1)) : 0,
+      biodieselOutputMl: localOutputMl,
+      duration: totalReactionTime + PROCESS_CONFIG.separation.timeMinutes,
+      energy: 0,
+      status: "Completed",
+      labResult: "Pending",
+      ffa: num(ffaNumber),
+      ffaAboveStrip,
+      oilMassG: Number(num(oilMassG).toFixed(1)),
+      catalystToWeighG: Number(num(transDoseNow.catalystToWeighG).toFixed(3)),
+      esterificationStages: esterRecords,
+      esterificationRun: requiresEsterification,
+      temperature: 27,
+      reactionTime: num(Number(transTime)),
+      stirringSpeed: num(Number(transStirring)),
+      voltage: num(Number(transVoltage)),
+      current: num(Number(transCurrent)),
+      methanolRatio: ratio,
+      esterificationVoltage: requiresEsterification ? num(Number(esterVoltage)) : undefined,
+      esterificationTime: requiresEsterification ? num(Number(esterTime)) : undefined,
+      esterificationStirring: requiresEsterification ? num(Number(esterStirring)) : undefined,
+      esterificationCurrent: requiresEsterification ? num(Number(esterCurrent)) : undefined,
+      catalystType: catalyst,
+      adsorbent: purification.adsorbent,
+      purification: {
+        targetTemperature: PROCESS_CONFIG.purification.holdTemperature,
+        highestTemperature: num(purification.highest),
+        heatingTimeSeconds: num(purification.heatingSeconds),
+        holdTimeSeconds: num(purification.methanolSeconds),
+        drainTimeSeconds: num(purification.drainSeconds),
+        contactTimeSeconds: num(purification.contactSeconds),
+        settlingTimeSeconds: num(purification.settlingSeconds),
+        coolingTimeSeconds: num(purification.coolingSeconds),
+        magnesolG: num(magnesolG),
+        adsorbent: purification.adsorbent,
+        adsorbentG: num(magnesolG),
+        magnesolAdded: true,
+        automatic: purification.automatic,
+        warning: purification.warning,
+        safetyStopOccurred: purification.stopOccurred,
+        stirringSpeed: PROCESS_CONFIG.purification.stirringSpeedRpm,
+        outputWeightG: purification.outputG || null,
+        oilWeightG: num(purification.oilG, Number(num(oilMassG).toFixed(1))),
+      },
+    };
+  }
+
   async function completeBatch() {
     if (!saved) {
       setActionError(null);
-      const totalReactionTime =
-        Number(transTime) + (requiresEsterification ? Number(esterTime) * esterStagesRun : 0);
-      const oilVolume = Number((oilVolumeMl ?? 0).toFixed(1));
-      // Offline the website works out the yield itself from the output load cell; the Pi does it on its own.
-      const localOutputMl = !backend && purification.outputG > 0 ? Number((purification.outputG / 0.88).toFixed(1)) : undefined;
+      setSaveFailed(false);
       let result: BatchRecord;
       try {
-        result = await saveCompletedBatch({
-          id: batchId,
-          date: new Date().toISOString().slice(0, 10),
-          oilVolume,
-          yield: localOutputMl && oilVolume ? Number(((localOutputMl / oilVolume) * 100).toFixed(1)) : 0,
-          biodieselOutputMl: localOutputMl,
-          duration: totalReactionTime + PROCESS_CONFIG.separation.timeMinutes,
-          energy: 0,
-          status: "Completed",
-          labResult: "Pending",
-          ffa: ffaNumber,
-          ffaAboveStrip,
-          oilMassG: Number(oilMassG.toFixed(1)),
-          catalystToWeighG: Number(transDoseNow.catalystToWeighG.toFixed(3)),
-          esterificationStages: esterRecords,
-          esterificationRun: requiresEsterification,
-          temperature: 27,
-          reactionTime: Number(transTime),
-          stirringSpeed: Number(transStirring),
-          voltage: Number(transVoltage),
-          current: Number(transCurrent),
-          methanolRatio: ratio,
-          esterificationVoltage: requiresEsterification ? Number(esterVoltage) : undefined,
-          esterificationTime: requiresEsterification ? Number(esterTime) : undefined,
-          esterificationStirring: requiresEsterification ? Number(esterStirring) : undefined,
-          esterificationCurrent: requiresEsterification ? Number(esterCurrent) : undefined,
-          catalystType: catalyst,
-          purification: {
-            targetTemperature: PROCESS_CONFIG.purification.holdTemperature,
-            highestTemperature: purification.highest ?? 0,
-            heatingTimeSeconds: purification.heatingSeconds,
-            holdTimeSeconds: purification.methanolSeconds,
-            drainTimeSeconds: purification.drainSeconds,
-            contactTimeSeconds: purification.contactSeconds,
-            settlingTimeSeconds: purification.settlingSeconds,
-            coolingTimeSeconds: purification.coolingSeconds,
-            magnesolG,
-            magnesolAdded: true,
-            automatic: purification.automatic,
-            warning: purification.warning,
-            safetyStopOccurred: purification.stopOccurred,
-            stirringSpeed: PROCESS_CONFIG.purification.stirringSpeedRpm,
-            outputWeightG: purification.outputG || null,
-            oilWeightG: purification.oilG ?? Number(oilMassG.toFixed(1)),
-          },
-        });
+        result = await saveCompletedBatch(batchRecord());
       } catch (error) {
         setActionError(errorText(t, error));
+        setSaveFailed(true);
         return;
       }
       setSavedBatch(result);
@@ -1881,10 +2018,22 @@ export default function NewBatch() {
     next();
   }
 
+  /** The Pi refused the record: keep it in this browser, so the operator is never stuck at the end. */
+  function finishInThisBrowser() {
+    const record = batchRecord();
+    saveBatchInThisBrowser(record as DemoBatch);
+    setSavedBatch(record as BatchRecord);
+    setSaved(true);
+    setSaveFailed(false);
+    setActionError(null);
+    next();
+  }
+
   const p = PROCESS_CONFIG.purification;
   const purifying = PURIFYING.includes(purification.phase);
   const purificationStepIndex = PURIFICATION_STEPS.findIndex(([phase]) => phase === purification.phase);
   const stepLabel = purificationStepIndex >= 0 ? PURIFICATION_STEPS[purificationStepIndex][1] : null;
+  const stepText = purification.phase === "magnesol" ? t("Add {adsorbent}", { adsorbent: t(adsorbentName) }) : stepLabel ? t(stepLabel) : "";
 
   return (
     <div className="space-y-6">
@@ -1984,7 +2133,7 @@ export default function NewBatch() {
                 <ReadOnlyTile label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} secondary={t("Configured density: {density} g/mL · assumed", { density: PROCESS_CONFIG.oil.densityGPerMl })} state={oilMassG > 0 ? "ready" : "checking"} />
               </div>
               <div className="mt-5">
-                <Field label={t("Target batch volume")} inputMode="decimal" value={targetVolume} onChange={(event) => { setTargetVolume(event.target.value); setConfirmedOilG(null); }} unit="mL" aria-invalid={Boolean(targetError)} />
+                <Field label={t("Target batch volume")} inputMode="numeric" pattern="[0-9]*" value={targetVolume} onChange={wholeInput((value) => { setTargetVolume(value); setConfirmedOilG(null); })} unit="mL" aria-invalid={Boolean(targetError)} />
                 <p className={`mt-2 text-xs ${targetError ? "text-red-400" : "text-gray-600"}`}>{targetError || t("Supported prototype capacity: 100–1,000 mL.")}</p>
               </div>
               <div className="mt-5 flex flex-wrap items-center gap-3">
@@ -1998,8 +2147,9 @@ export default function NewBatch() {
               <Heading as="h2" className="text-lg font-semibold">{t("2. FFA Measurement")}</Heading>
               <p className="mt-1 text-sm text-gray-500">{t("Measure the feedstock using the FFA test strips, then enter the observed result. The strip reads up to {max}%.", { max: chemistrySettings.stripMaxFfa })}</p>
               <div className="mt-6">
-                <Field label={t("FFA Percentage")} inputMode="decimal" value={ffaAboveStrip ? String(chemistrySettings.stripMaxFfa) : ffa} disabled={ffaAboveStrip} onChange={(event) => setFfa(event.target.value)} unit="%" aria-invalid={Boolean(ffaError)} />
+                <Field label={t("FFA Percentage")} inputMode="numeric" pattern="[0-9]*" value={ffaAboveStrip ? String(chemistrySettings.stripMaxFfa) : ffa} disabled={ffaAboveStrip} onChange={wholeInput(setFfa)} unit="%" aria-invalid={Boolean(ffaError)} />
                 {ffaError && <p className="mt-2 text-xs text-red-400">{ffaError}</p>}
+                {!ffaError && <p className="mt-2 text-xs text-gray-600">{t("Whole numbers only. {threshold}% or below goes straight to transesterification; higher goes to esterification first.", { threshold: PROCESS_CONFIG.ffaThreshold })}</p>}
                 {!ffaError && !ffaAboveStrip && ffaNumber > chemistrySettings.stripMaxFfa && (
                   <p className="mt-2 text-xs text-amber-400">{t("The strip reads only up to {max}%. If it shows its darkest color, tick the box below.", { max: chemistrySettings.stripMaxFfa })}</p>
                 )}
@@ -2010,13 +2160,13 @@ export default function NewBatch() {
               </div>
               {!ffaError && (
                 <div className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.025] p-4">
-                  <div className="gv-label">{t("Pathway decision · threshold {value}%", { value: PROCESS_CONFIG.ffaThreshold.toFixed(1) })}</div>
+                  <div className="gv-label">{t("Pathway decision · threshold {value}%", { value: PROCESS_CONFIG.ffaThreshold })}</div>
                   <p className="text-sm text-gray-300">
                     {ffaAboveStrip
                       ? t("FFA {max}% or more (recorded as ≥ {max}%). Esterification with the uniform dose for {design}% FFA, then an FFA re-check.", { max: chemistrySettings.stripMaxFfa, design: chemistrySettings.designFfa })
                       : requiresEsterification
                         ? t("Esterification required before transesterification: the uniform dose for {design}% FFA, then an FFA re-check.", { design: chemistrySettings.designFfa })
-                        : t("Proceed directly to transesterification.")}
+                        : t("FFA is {threshold}% or below: proceed directly to transesterification.", { threshold: PROCESS_CONFIG.ffaThreshold })}
                   </p>
                 </div>
               )}
@@ -2048,7 +2198,7 @@ export default function NewBatch() {
               </div>
               {calculatorReady && !requiresEsterification ? (
                 <div className="rounded-xl border border-white/[0.07] bg-white/[0.025] p-5 text-sm text-gray-500">
-                  {t("Esterification not needed — FFA is 4% or below.")}
+                  {t("Esterification not needed — FFA is 1% or below.")}
                 </div>
               ) : (
                 <>
@@ -2113,12 +2263,17 @@ export default function NewBatch() {
             <div className="mt-7 border-t border-white/[0.07] pt-7">
               <Heading as="h3" className="mb-3 text-base font-semibold">{t("Purification")}</Heading>
               <div className="grid gap-4 md:grid-cols-3">
+                <SelectField label={t("Dry wash adsorbent")} value={adsorbent} onChange={(event) => setAdsorbent(event.target.value as Adsorbent)}>
+                  <option value="Magnesol">Magnesol</option>
+                  <option value="Bentonite">{t("Bentonite")}</option>
+                </SelectField>
                 <ReadOnlyTile
-                  label="Magnesol (dry wash)"
-                  value={calculatorReady ? `${calculatorValues.magnesolG.toFixed(1)} g` : "—"}
-                  secondary={calculatorReady ? t("Oil volume × 0.0092 (1% of the biodiesel)") : undefined}
+                  label={adsorbent === "Bentonite" ? "Bentonite (dry wash)" : "Magnesol (dry wash)"}
+                  value={calculatorReady ? `${calculatorValues.adsorbentG.toFixed(1)} g` : "—"}
+                  secondary={calculatorReady ? t("Oil volume × {factor} ({dose}% of the oil weight)", { factor: ((PROCESS_CONFIG.oil.densityGPerMl * calculatorValues.adsorbentDosePct) / 100).toFixed(4), dose: calculatorValues.adsorbentDosePct }) : undefined}
                 />
               </div>
+              <p className="mt-3 text-xs leading-5 text-gray-500">{t("Same purification steps for both. The dose is set in Settings → Purification (default: Magnesol 1%, bentonite 2% of the oil weight).")}</p>
             </div>
           </Card>
 
@@ -2309,8 +2464,13 @@ export default function NewBatch() {
             footer={transState === "complete" ? (
               <>
                 <ValveIndicator valve="reactor_outlet" view={reactorView} />
-                {reactorDrained && (
+                {drainMinutes("reactor_outlet") <= 0 ? (
+                  // reactor outlet not used (drain time 0): the operator moves the liquid, then continues
                   <div className="mt-6"><Button onClick={next}>{t("Continue to Separation")} →</Button></div>
+                ) : (
+                  <p className={`mt-4 text-sm ${reactorDrained ? "text-green-400" : "text-gray-500"}`} data-testid="auto-next">
+                    {reactorDrained ? t("The reactor has drained into the centrifuge. Going on to separation…") : t("When the reactor outlet closes again, the process goes on to separation by itself.")}
+                  </p>
                 )}
               </>
             ) : null}
@@ -2342,7 +2502,12 @@ export default function NewBatch() {
           )}
           <p className="mt-4 text-xs leading-5 text-gray-500">{t("The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes and the centrifuge has stopped, its outlet valve opens by itself and the biodiesel flows to the purification tank; purification then starts by itself.")}</p>
           {separationState === "ready" && reactorDraining && <ValveIndicator valve="reactor_outlet" view={reactorView} />}
-          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? t("Start centrifuge") : t("Record centrifuge start")} onContinue={next} continueLabel={t("Continue to Purification")} onReset={() => resetStage(setSeparationState)} startBlocked={reactorDraining ? t("Wait for the reactor outlet to close: the reactor is still draining into the centrifuge.") : null} />
+          {separationStartsByItself && (
+            <p className="mt-6 text-sm text-blue-400" data-testid="separation-auto">
+              {reactorDraining ? t("The reactor is draining into the centrifuge. The centrifuge starts by itself when the outlet closes.") : t("Starting the centrifuge…")}
+            </p>
+          )}
+          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? t("Start centrifuge") : t("Record centrifuge start")} onContinue={next} continueLabel={t("Continue to Purification")} onReset={() => resetStage(setSeparationState)} startBlocked={reactorDraining ? t("Wait for the reactor outlet to close: the reactor is still draining into the centrifuge.") : null} hideStart={separationStartsByItself} />
         </Card>
       )}
 
@@ -2352,10 +2517,10 @@ export default function NewBatch() {
             <SectionHeader
               eyebrow={t("Batch {id}", { id: batchId })}
               title={t("Purification")}
-              description={t("Dry wash with Magnesol. It runs by itself: you only add the Magnesol when asked, then confirm at the end.")}
+              description={t("Dry wash with {adsorbent}. It runs by itself: you only add the {adsorbent} when asked. When it has drained, the batch is saved and the process finishes by itself.", { adsorbent: t(adsorbentName) })}
             />
             <Status tone={purification.phase === "complete" ? "green" : purification.phase === "fault" ? "red" : purifying ? "yellow" : "neutral"}>
-              {purification.phase === "ready" ? t("WAITING") : purification.phase === "fault" ? t("STOPPED") : t(stepLabel ?? "").toUpperCase()}
+              {purification.phase === "ready" ? t("WAITING") : purification.phase === "fault" ? t("STOPPED") : stepText.toUpperCase()}
             </Status>
           </div>
 
@@ -2368,7 +2533,7 @@ export default function NewBatch() {
                   <div key={phase} className="relative flex flex-1 flex-col items-center text-center">
                     {index < PURIFICATION_STEPS.length - 1 && <div className={`absolute left-1/2 top-3 h-px w-full ${index < purificationStepIndex ? "bg-green-500/60" : "bg-white/10"}`} />}
                     <div className={`relative z-10 h-6 w-6 rounded-full border ${done ? "border-green-500 bg-green-500" : active ? "border-green-400 bg-green-500/15" : "border-white/10 bg-gv-surface"}`} />
-                    <div className={`mt-2 text-[11px] leading-4 ${active ? "text-white" : done ? "text-green-400" : "text-gray-600"}`}>{t(label)}</div>
+                    <div className={`mt-2 text-[11px] leading-4 ${active ? "text-white" : done ? "text-green-400" : "text-gray-600"}`}>{phase === "magnesol" ? t("Add {adsorbent}", { adsorbent: t(adsorbentName) }) : t(label)}</div>
                   </div>
                 );
               })}
@@ -2380,12 +2545,12 @@ export default function NewBatch() {
           )}
 
           {(purification.phase === "heating" || purification.phase === "methanol") && (
-            <p className="mt-6 text-sm text-gray-400" data-testid="prepare-magnesol">{t("Prepare {grams} g Magnesol", { grams: magnesolG.toFixed(1) })}</p>
+            <p className="mt-6 text-sm text-gray-400" data-testid="prepare-magnesol">{t("Prepare {grams} g {adsorbent}", { grams: magnesolG.toFixed(1), adsorbent: t(adsorbentName) })}</p>
           )}
 
           {purification.phase === "magnesol" && (
             <div className="mt-6 rounded-xl border border-green-500/30 bg-green-500/[0.06] p-5" data-testid="add-magnesol">
-              <div className="font-display text-lg font-semibold text-green-400">{t("Add {grams} g Magnesol (1% of biodiesel)", { grams: magnesolG.toFixed(1) })}</div>
+              <div className="font-display text-lg font-semibold text-green-400">{t("Add {grams} g {adsorbent} ({dose}% of the oil weight)", { grams: magnesolG.toFixed(1), adsorbent: t(adsorbentName), dose: adsorbentDose(adsorbentName, adsorbentSettings) })}</div>
               <p className="mt-1 text-sm text-gray-400">{t("The heater is off and the stirrer keeps running. Wear a dust mask.")}</p>
               <Button className="mt-4" onClick={confirmMagnesol}>{t("Confirm")}</Button>
             </div>
@@ -2400,7 +2565,7 @@ export default function NewBatch() {
               {purification.phase === "drain" ? (
                 <Metric label={t("Collected")} value={`${purification.outputG.toFixed(1)} g`} sub={t("output load cell")} />
               ) : (
-                <Metric label={t("Step time left")} value={purification.stepRemaining === null ? "—" : formatTimer(purification.stepRemaining)} sub={stepLabel ? t(stepLabel) : undefined} />
+                <Metric label={t("Step time left")} value={purification.stepRemaining === null ? "—" : formatTimer(purification.stepRemaining)} sub={stepText || undefined} />
               )}
             </LiveReadings>
           )}
@@ -2427,9 +2592,13 @@ export default function NewBatch() {
           )}
 
           {purification.phase === "complete" && (
-            <div className="mt-6 rounded-xl border border-green-500/25 bg-green-500/[0.05] p-5">
+            <div className="mt-6 rounded-xl border border-green-500/25 bg-green-500/[0.05] p-5" data-testid="purification-complete">
               <div className="font-display font-semibold text-green-400">{t("Purification complete")}</div>
-              <p className="mt-1 text-sm text-gray-400">{t("The valve is closed. Check the collected biodiesel, then confirm that the process is finished.")}</p>
+              <p className="mt-1 text-sm text-gray-400">
+                {saveFailed
+                  ? t("The batch couldn't be saved on the Raspberry Pi (see the message above). Try again, or keep the record in this browser and finish.")
+                  : t("The valve is closed. Saving the batch and finishing…")}
+              </p>
             </div>
           )}
 
@@ -2457,7 +2626,12 @@ export default function NewBatch() {
             {purifying && purification.phase !== "magnesol" && !realHardware && (
               <Button variant="secondary" onClick={skipPurificationPhase}>{t("Skip timer (demo)")}</Button>
             )}
-            {purification.phase === "complete" && <Button onClick={completeBatch}>{t("Confirm process finished")} →</Button>}
+            {purification.phase === "complete" && saveFailed && (
+              <>
+                <Button onClick={completeBatch}>{t("Try saving again")}</Button>
+                <Button variant="secondary" onClick={finishInThisBrowser}>{t("Finish and keep the record in this browser")} →</Button>
+              </>
+            )}
           </div>
         </Card>
       )}
@@ -2469,6 +2643,7 @@ export default function NewBatch() {
             <Heading as="h1" className="mt-5 text-3xl font-bold">{t("Process Complete")}</Heading>
             <p className="mt-2 text-sm text-gray-500">{savedBatch?.createdAt ? t("The batch has been saved on the Raspberry Pi, together with the values it measured.") : t("The recorded batch information has been saved to local history.")}</p>
             <p className="mt-3 text-sm text-amber-400">{t("Lab result pending. Record it in Batch History when the lab certificate arrives.")}</p>
+            {purification.warning && <p className="mx-auto mt-3 max-w-xl rounded-lg border border-amber-400/25 bg-amber-400/[0.05] px-3 py-2 text-sm text-amber-400">{t(purification.warning)}</p>}
           </div>
           <div className="p-6 sm:p-8">
             <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
@@ -2480,7 +2655,7 @@ export default function NewBatch() {
               {requiresEsterification && (
                 <Metric
                   label={t("FFA re-checks")}
-                  value={esterRecords.length ? [formatFfa({ ffa: ffaNumber, ffaAboveStrip }), ...esterRecords.map((record) => `${(record.ffaAfter ?? 0).toFixed(1)}%`)].join(" → ") : t("Not recorded")}
+                  value={esterRecords.length ? [formatFfa({ ffa: ffaNumber, ffaAboveStrip }), ...esterRecords.map((record) => pct(record.ffaAfter ?? 0))].join(" → ") : t("Not recorded")}
                   sub={t("Stage 1 dosed for {design}% FFA (uniform)", { design: chemistrySettings.designFfa })}
                 />
               )}
@@ -2494,7 +2669,7 @@ export default function NewBatch() {
               <Metric label={t("Separation")} value={`${PROCESS_CONFIG.separation.timeMinutes} min · ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
               <Metric
                 label={t("Purification")}
-                value={purification.phase === "complete" || saved ? t("Magnesol {grams} g · {temp} °C", { grams: magnesolG.toFixed(1), temp: p.holdTemperature }) : t("Not recorded")}
+                value={purification.phase === "complete" || saved ? t("{adsorbent} {grams} g · {temp} °C", { adsorbent: t(adsorbentName), grams: magnesolG.toFixed(1), temp: p.holdTemperature }) : t("Not recorded")}
                 sub={t("{methanol} methanol removal · {contact} contact · {settling} settling · {drain} drain", { methanol: formatMinutes(purification.methanolSeconds), contact: formatMinutes(purification.contactSeconds), settling: formatMinutes(purification.settlingSeconds), drain: formatTimer(purification.drainSeconds) })}
               />
               <Metric label={t("Biodiesel output")} value={savedBatch?.biodieselOutputMl ? t("{ml} mL · {pct}% yield", { ml: savedBatch.biodieselOutputMl.toFixed(1), pct: savedBatch.yield }) : t("Not measured")} sub={savedBatch?.biodieselOutputMl ? `${t("Output load cell")}${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />

@@ -71,12 +71,27 @@ def _pending(app, batch_id: str) -> dict:
                                                    "purification": None})
 
 
+def _merge_purification(website: Optional[PurificationRecord], measured: Optional[dict]) -> Optional[PurificationRecord]:
+    """The Pi's own record of the dry wash wins; anything it doesn't have comes from the website.
+    Never raises: a save must not fail because of the purification record."""
+    if not measured:
+        return website
+    base = website.dump() if website else {}
+    merged = base | {k: v for k, v in measured.items() if v is not None}
+    try:
+        return PurificationRecord.model_validate(merged)
+    except ValidationError:
+        return website
+
+
 def _apply_pending(app, b: Batch, s: Settings) -> Batch:
     """Fill in what the Pi measured itself. Measured values replace the website's placeholders
     (temperature 27, yield 0, energy 0)."""
     rec = app.state.records.pop(b.id, None)
     if rec is None:
         return b
+    if b.adsorbent is None and rec.get("adsorbent"):
+        b.adsorbent = rec["adsorbent"]
     b.timeline = sorted(b.timeline + [TimelineEvent.model_validate(e) for e in rec["timeline"]],
                         key=lambda e: e.time)
     temps = rec["temperature"]
@@ -84,7 +99,7 @@ def _apply_pending(app, b: Batch, s: Settings) -> Batch:
     if measured_temp is not None:
         b.temperature = measured_temp
     if rec["purification"]:
-        b.purification = PurificationRecord.model_validate(rec["purification"])
+        b.purification = _merge_purification(b.purification, rec["purification"])
     heater_kwh = (rec["purification"] or {}).get("heaterOnSeconds", 0) * s.heater_power_watts / 3_600_000
     measured_kwh = sum(rec["energyKwh"].values()) + heater_kwh
     if measured_kwh > 0 and not b.energy:
@@ -102,13 +117,17 @@ def _fill_batch(b: Batch, s: Settings) -> Batch:
         b.yield_ = round(b.biodiesel_output_ml / b.oil_volume * 100, 1)
     catalyst = b.catalyst_type or "NaOH"
     ratio = b.methanol_ratio or s.methanol_ratio.default
+    if b.adsorbent is None and b.purification and b.purification.adsorbent:
+        b.adsorbent = b.purification.adsorbent
     if b.catalyst_to_weigh_g is None:
         last_ffa = next((st.ffa_after for st in reversed(b.esterification_stages) if st.ffa_after is not None), None)
         acid = last_ffa if last_ffa is not None else (s.ffa_target if b.esterification_run else b.ffa)
         b.catalyst_to_weigh_g = calculations.transesterification(b.oil_mass_g, acid, ratio, catalyst, s)["catalystToWeighG"]
     if b.materials is None:
+        used_g = (b.purification.adsorbent_g or b.purification.magnesol_g) if b.purification else None
         b.materials = calculations.materials(b.oil_volume, b.ffa, b.esterification_run, ratio, catalyst, s,
-                                             b.catalyst_to_weigh_g, b.esterification_stages)
+                                             b.catalyst_to_weigh_g, b.esterification_stages,
+                                             b.adsorbent, used_g)
     if not b.duration and len(b.timeline) >= 2:
         b.duration = round((b.timeline[-1].time - b.timeline[0].time).total_seconds() / 60)
     return b
@@ -129,6 +148,10 @@ def process_config(request: Request):
                 "densityGPerMl": s.oil_density, "averageTriglycerideMolecularWeight": s.oil_molar_mass},
         "ffaThreshold": s.ffa_threshold,
         "ffaTarget": s.ffa_target,
+        # operator inputs (FFA, volume, voltage, current, time, stirring) are whole numbers only
+        "wholeNumberInputs": True,
+        # after a drain the next stage starts by itself (reactor outlet closed -> separation starts)
+        "autoAdvance": s.auto_advance,
         "methanol": {"ratioDefault": s.methanol_ratio.default, "ratioMin": s.methanol_ratio.min,
                      "ratioMax": s.methanol_ratio.max, "molecularWeight": 32.04, "densityGPerMl": 0.792,
                      "convention": "Molar methanol-to-triglyceride-oil ratio"},
@@ -147,7 +170,11 @@ def process_config(request: Request):
                          "drainStableGrams": dry_wash.DRAIN_STABLE_G, "drainStableSeconds": dry_wash.DRAIN_STABLE_S,
                          "drainMaximumMinutes": dry_wash.DRAIN_MAXIMUM_S / 60,
                          "lowOutputFraction": dry_wash.LOW_OUTPUT_FRACTION,
-                         "magnesolGramsPerMlOil": round(s.oil_density * calculations.MAGNESOL_FRACTION, 4),
+                         "magnesolGramsPerMlOil": round(s.oil_density * s.magnesol_dose / 100, 4),
+                         "bentoniteGramsPerMlOil": round(s.oil_density * s.bentonite_dose / 100, 4),
+                         "adsorbents": list(calculations.ADSORBENTS),
+                         "defaultAdsorbent": s.default_adsorbent,
+                         "magnesolDosePct": s.magnesol_dose, "bentoniteDosePct": s.bentonite_dose,
                          "thermalFuseRating": s.thermal_fuse_rating, "automatic": s.purification_auto_start},
         "powerSupply": {"currentControl": config.POWER_SUPPLY_CURRENT_CONTROL},
         "pumps": {"catalystRateMlPerMinute": s.pump_catalyst_rate, "acidRateMlPerMinute": s.pump_acid_rate,
@@ -163,9 +190,22 @@ def get_settings(request: Request):
     return _settings(request).dump()
 
 
+# Settings page values the operator types: whole numbers only (no decimals).
+WHOLE_NUMBER_SETTINGS = (
+    "methanolRemovalTime", "contactTime", "settlingTime", "maxDrainTemperature", "esterificationDesignFfa",
+    "stripMaxFfa", "pumpCatalystRate", "pumpAcidRate", "reactorDrainTime", "centrifugeDrainTime",
+    "centrifugeSpinDownTime", "provenBatchCount", "provenYieldTolerance", "oilPrice", "methanolPrice", "kohPrice",
+    "naohPrice", "sulfuricAcidPrice", "acetonePrice", "bentonitePrice", "magnesolPrice", "electricityPrice",
+    "dieselPrice", "magnesolDose", "bentoniteDose", "oilMolarMass", "kohPurity", "naohPurity")
+
+
 @router.put("/settings")
 def put_settings(request: Request, updates: dict[str, Any] = Body(...)):
     """Accepts some or all of the website's settings keys and keeps the rest."""
+    for key in WHOLE_NUMBER_SETTINGS:
+        value = updates.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) != int(value):
+            raise HTTPException(400, f"{key} must be a whole number (no decimals).")
     current = _settings(request).dump()
     merged = current | {k: v for k, v in updates.items() if v is not None or k == "thermalFuseRating"}
     try:
@@ -246,7 +286,8 @@ def _ratio(value: Optional[float], s: Settings) -> float:
 def calculate(req: CalculateRequest, request: Request):
     """Same keys as calculateQuantityCards() on the website."""
     s = _settings(request)
-    return calculations.quantity_cards(req.oil_mass_g, req.ffa, _ratio(req.methanol_ratio, s), req.catalyst, s)
+    return calculations.quantity_cards(req.oil_mass_g, req.ffa, _ratio(req.methanol_ratio, s), req.catalyst, s,
+                                       req.adsorbent)
 
 
 @router.post("/calculate/after-esterification")
@@ -260,13 +301,13 @@ def calculate_after_esterification(req: AfterEsterificationRequest, request: Req
 async def read_strip():
     """Reads the FFA strip in the reader now (call it once the strip's wait time is over)."""
     if config.MOCK:
-        return {"ffa": round(random.uniform(2.0, 8.0), 1), "warnings": ["Demonstration reading."]}
+        return {"ffa": random.randint(0, 5), "warnings": ["Demonstration reading."]}
     try:
         from .strip_reader import measure_ffa
         ffa, warnings = await asyncio.to_thread(measure_ffa)
     except Exception as e:
         raise HTTPException(503, f"Strip reader error: {e}")
-    return {"ffa": round(ffa, 1), "warnings": warnings}
+    return {"ffa": int(round(ffa)), "warnings": warnings}     # whole percent, like the operator enters it
 
 
 # ---------- batches ----------
@@ -295,7 +336,11 @@ def save_batch(data: BatchIn, request: Request):
     existing = db.get_batch(batch_id)
     if existing is not None:
         return existing.dump()
+    oil_volume = data.oil_volume
+    if not oil_volume and data.oil_mass_g:
+        oil_volume = round(data.oil_mass_g / s.oil_density, 1)
     fields = data.model_dump(by_alias=True) | {"id": batch_id, "date": data.date or date.today().isoformat(),
+                                               "oilVolume": oil_volume or 0,
                                                "createdAt": datetime.now().isoformat()}
     b = Batch.model_validate(fields)
     b = _apply_pending(request.app, b, s)
@@ -382,6 +427,8 @@ def start_drain(app, valve: str, batch_id: Optional[str]) -> None:
             _event(app, batch_id, f"{label} closed ({st['elapsedSeconds']} s open)")
             if valve == "centrifuge_outlet":
                 _arm_purification(app, batch_id)
+            else:
+                _auto_start_separation(app, batch_id)
         else:
             _event(app, batch_id, f"{label} closed early ({st['faultReason']})")
             if st["phase"] == "fault":
@@ -392,6 +439,22 @@ def start_drain(app, valve: str, batch_id: Optional[str]) -> None:
                           wait_rpm="centrifugeRpm" if centrifuge else None,
                           spin_down_seconds=s.centrifuge_spin_down_time if centrifuge else 0,
                           on_open=lambda: _event(app, batch_id, f"{label} opened"))
+
+
+def _auto_start_separation(app, batch_id: Optional[str]) -> None:
+    """The reactor has drained into the centrifuge: go straight on to separation (Settings
+    autoAdvance). Runs on the Pi, so the batch moves on even if the website is closed. Any problem
+    becomes an alarm and the operator starts it on the website instead."""
+    s = app.state.settings
+    if not batch_id or not s.auto_advance:
+        return
+    runner = app.state.stage
+    if runner.active or runner.state["state"] == "fault" or app.state.pump.running or app.state.purification.running:
+        return
+    try:
+        runner.start("Separation", s, batch_id, on_event=_stage_event(app))
+    except (StageError, InterlockError) as e:
+        app.state.alarm = f"Separation did not start by itself: {e}"
 
 
 def _after_stage(app, valve: str, batch_id: Optional[str]) -> None:
@@ -448,7 +511,9 @@ async def start_stage(data: StageStart, request: Request):
     except (StageError, InterlockError) as e:
         raise HTTPException(409, str(e))
     if data.batch_id and data.oil_mass_g:
-        _pending(app, data.batch_id)["oilMassG"] = data.oil_mass_g   # for the Magnesol and the output check
+        _pending(app, data.batch_id)["oilMassG"] = data.oil_mass_g   # for the adsorbent and the output check
+    if data.batch_id and data.adsorbent:
+        _pending(app, data.batch_id)["adsorbent"] = data.adsorbent   # used when purification starts by itself
     return app.state.stage.state
 
 
@@ -578,9 +643,10 @@ def _oil_volume_ml(app, s: Settings, batch_id: Optional[str], oil_volume_ml: Opt
 
 
 def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: bool = False,
-                       oil_volume_ml: Optional[float] = None) -> None:
-    """Starts heating → methanol removal → Magnesol → contact → settling → cooling → drain.
-    Raises RuntimeError or InterlockError."""
+                       oil_volume_ml: Optional[float] = None, adsorbent: Optional[str] = None) -> None:
+    """Starts heating → methanol removal → add adsorbent → contact → settling → cooling → drain.
+    The adsorbent (Magnesol or bentonite) is the one given, else the one sent with the batch's
+    stages, else Settings defaultAdsorbent. Raises RuntimeError or InterlockError."""
     if app.state.drain.running and app.state.drain.state["valve"] == "centrifuge_outlet":
         raise RuntimeError("The centrifuge is still draining into the purification tank.")
     def save_record(record: dict) -> None:
@@ -598,9 +664,13 @@ def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: boo
                                     "time": datetime.now().isoformat()})
 
     volume = _oil_volume_ml(app, s, batch_id, oil_volume_ml)
+    chosen = adsorbent or (app.state.records.get(batch_id, {}).get("adsorbent") if batch_id else None) \
+        or s.default_adsorbent
+    if batch_id:
+        _pending(app, batch_id)["adsorbent"] = chosen
     app.state.purification.start(s, batch_id, save_record, oil_g=volume * s.oil_density if volume else None,
-                                 magnesol_g=calculations.magnesol_g(volume, s) if volume else None,
-                                 automatic=automatic)
+                                 magnesol_g=calculations.adsorbent_g(volume, chosen, s) if volume else None,
+                                 automatic=automatic, adsorbent=chosen)
     app.state.purification_armed = None
     if batch_id:
         _pending(app, batch_id)["timeline"].append(
@@ -639,7 +709,7 @@ async def start_purification(data: PurificationStart, request: Request):
     if app.state.stage.active:
         raise HTTPException(409, f"{app.state.stage.state['stage']} is still running.")
     try:
-        begin_purification(app, s, data.batch_id, oil_volume_ml=data.oil_volume_ml)
+        begin_purification(app, s, data.batch_id, oil_volume_ml=data.oil_volume_ml, adsorbent=data.adsorbent)
     except (RuntimeError, InterlockError) as e:
         raise HTTPException(409, str(e))
     return app.state.purification.state
@@ -647,14 +717,15 @@ async def start_purification(data: PurificationStart, request: Request):
 
 @router.post("/process/purification/magnesol-added")
 async def confirm_magnesol(request: Request):
-    """"Confirm" on the website: the operator has added the Magnesol."""
+    """"Confirm" on the website: the operator has added the adsorbent (Magnesol or bentonite)."""
     runner = request.app.state.purification
     try:
         runner.confirm_magnesol()
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     if runner.state["batchId"]:
-        _event(request.app, runner.state["batchId"], f"Magnesol added ({runner.state['magnesolG'] or '?'} g)")
+        _event(request.app, runner.state["batchId"],
+               f"{runner.state.get('adsorbent') or 'Magnesol'} added ({runner.state['magnesolG'] or '?'} g)")
     return runner.state
 
 

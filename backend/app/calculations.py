@@ -89,16 +89,29 @@ def transesterification(oil_g: float, acid_pct: float, ratio: float, catalyst: s
     }
 
 
-MAGNESOL_FRACTION = 0.01                     # 1% of the biodiesel (about the oil weight)
+MAGNESOL_FRACTION = 0.01                     # default Magnesol dose: 1% of the biodiesel (about the oil weight)
+ADSORBENTS = ("Magnesol", "Bentonite")
+
+
+def adsorbent_dose_pct(adsorbent: Optional[str], s: Settings) -> float:
+    """Dose in % of the oil weight: Settings magnesolDose (default 1) or bentoniteDose (default 2)."""
+    return s.bentonite_dose if adsorbent == "Bentonite" else s.magnesol_dose
+
+
+def adsorbent_g(oil_volume_ml: float, adsorbent: Optional[str], s: Settings) -> float:
+    """Dry wash adsorbent: oil mL × 0.92 g/mL × dose%, rounded to 0.1 g.
+    Magnesol 1% (Faccini et al.: best dose; Dallas Group patent: 0.5-4%) -> oil mL × 0.0092.
+    Bentonite 2% (studies: 1% for 10 min up to 10 wt% acid-activated) -> oil mL × 0.0184."""
+    return round(oil_volume_ml * s.oil_density * adsorbent_dose_pct(adsorbent, s) / 100 + 1e-9, 1)
 
 
 def magnesol_g(oil_volume_ml: float, s: Settings) -> float:
-    """Magnesol for the dry wash: oil mL × 0.92 × 1% = oil mL × 0.0092 g, rounded to 0.1 g.
-    (Faccini et al.: 1% was the best adsorbent dose; Dallas Group patent: 0.5-4%.)"""
-    return round(oil_volume_ml * s.oil_density * MAGNESOL_FRACTION + 1e-9, 1)
+    """Magnesol for the dry wash (kept for older callers): see adsorbent_g."""
+    return adsorbent_g(oil_volume_ml, "Magnesol", s)
 
 
-def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Settings) -> dict:
+def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Settings,
+                   adsorbent: Optional[str] = None) -> dict:
     """Everything the Chemical Quantity Calculator shows. With esterification, the catalyst is an
     "up to" amount (neutralizing the target FFA); without it, the amount is exact."""
     ester_needed = needs_esterification(ffa, s)
@@ -136,6 +149,10 @@ def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Set
         "transesterificationPremixMl": trans["transesterificationPremixMl"],
         "transesterificationPremixG": trans["transesterificationPremixG"],
         "magnesolG": magnesol_g(volume, s),
+        "bentoniteG": adsorbent_g(volume, "Bentonite", s),
+        "adsorbent": adsorbent or s.default_adsorbent,
+        "adsorbentG": adsorbent_g(volume, adsorbent or s.default_adsorbent, s),
+        "adsorbentDosePct": adsorbent_dose_pct(adsorbent or s.default_adsorbent, s),
         "isEstimate": ester_needed,
         "warnings": warnings,
     }
@@ -160,9 +177,11 @@ def fallback_neutralization_g(h2so4_g: float, oil_g: float, ffa_start: float, ca
 
 def materials(oil_volume: float, ffa: float, esterification_run: bool, ratio: float, catalyst: str,
               s: Settings, catalyst_to_weigh_g: Optional[float] = None,
-              esterification_stages: Optional[list] = None) -> Materials:
+              esterification_stages: Optional[list] = None, adsorbent: Optional[str] = None,
+              adsorbent_grams: Optional[float] = None) -> Materials:
     """Materials used by a batch, for the cost per liter. Uses the recorded esterification stages
-    when there are any; otherwise one stage at the starting FFA."""
+    when there are any; otherwise one stage at the starting FFA. The dry wash adsorbent goes in
+    magnesolKg or bentoniteKg (the amount measured in purification, else the calculated one)."""
     oil_g = oil_volume * s.oil_density
     trans = transesterification(oil_g, s.ffa_target if esterification_run else ffa, ratio, catalyst, s)
     stages = esterification_stages or []
@@ -174,11 +193,14 @@ def materials(oil_volume: float, ffa: float, esterification_run: bool, ratio: fl
         acid = sum(st.sulfuric_acid_ml for st in stages)
         ester_acetone = sum(st.acetone_ml for st in stages)
     catalyst_g = catalyst_to_weigh_g if catalyst_to_weigh_g is not None else trans["catalystToWeighG"]
+    adsorbent = adsorbent or s.default_adsorbent
+    dry_wash_kg = _r((adsorbent_grams if adsorbent_grams else adsorbent_g(oil_volume, adsorbent, s)) / 1000)
     return Materials(
         oil_l=_r(oil_volume / 1000),
         methanol_l=_r((ester_methanol + trans["transesterificationMethanolMl"]) / 1000),
         catalyst_kg=_r(catalyst_g / 1000),
         sulfuric_acid_l=_r(acid / 1000),
         acetone_l=_r((ester_acetone + trans["acetoneMl"]) / 1000),
-        bentonite_kg=_r(oil_volume * s.bentonite_fraction / 1000),
+        bentonite_kg=dry_wash_kg if adsorbent == "Bentonite" else 0.0,
+        magnesol_kg=dry_wash_kg if adsorbent == "Magnesol" else 0.0,
     )

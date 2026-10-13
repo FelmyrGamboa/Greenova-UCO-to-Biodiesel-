@@ -35,15 +35,17 @@ def test_health_and_config(client):
     cfg = client.get("/api/config").json()
     assert cfg["esterification"]["voltage"] == {"min": 10, "max": 30, "default": 20}
     assert cfg["transesterification"]["time"] == {"min": 30, "max": 180, "default": 120}
-    assert cfg["esterification"]["current"] == {"min": 0.5, "max": 2, "default": 1}
+    assert cfg["esterification"]["current"] == {"min": 1, "max": 2, "default": 1}
     assert cfg["powerSupply"]["currentControl"] is False
-    assert cfg["ffaThreshold"] == 4
+    assert cfg["ffaThreshold"] == 1 and cfg["wholeNumberInputs"] is True and cfg["autoAdvance"] is True
     assert cfg["esterification"]["designFfa"] == 10 and cfg["esterification"]["stripMaxFfa"] == 5
     assert cfg["pumps"]["acidRateMlPerMinute"] == 100 and cfg["drains"]["reactorMinutes"] == 1
+    assert cfg["drains"]["centrifugeMinutes"] == 2
     pur = cfg["purification"]
     assert (pur["holdTemperature"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 95, 200)
     assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settlingMinutes"], pur["maxDrainTemperature"]) == (10, 15, 10, 50)
-    assert pur["magnesolGramsPerMlOil"] == 0.0092
+    assert pur["magnesolGramsPerMlOil"] == 0.0092 and pur["bentoniteGramsPerMlOil"] == 0.0184
+    assert pur["adsorbents"] == ["Magnesol", "Bentonite"] and pur["defaultAdsorbent"] == "Magnesol"
 
 
 def test_settings_partial_update(client):
@@ -51,6 +53,8 @@ def test_settings_partial_update(client):
     assert s["methanolRemovalTime"] == 12 and s["methanolPrice"] == 70
     assert client.put("/api/settings", json={"methanolRemovalTime": 40}).status_code == 400   # 5-30 min
     assert client.put("/api/settings", json={"ffaRangeBoundaries": "5"}).status_code == 400
+    r = client.put("/api/settings", json={"contactTime": 12.5})                      # whole numbers only
+    assert r.status_code == 400 and "whole number" in r.json()["detail"]
 
 
 def test_calculate(client):
@@ -59,17 +63,21 @@ def test_calculate(client):
     assert q["uniformDose"] is True and q["doseFfa"] == 10
     assert q["magnesolG"] == 4.6                                        # 500 mL × 0.0092
     assert client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6, "methanolRatio": 12}).status_code == 400
+    r = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 2.5})            # FFA is a whole percent
+    assert r.status_code == 422 and r.json()["detail"] == "ffa: Use a whole number (no decimals)."
+    b = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 1, "adsorbent": "Bentonite"}).json()
+    assert b["esterificationNeeded"] is False and b["adsorbentG"] == 9.2
 
 
 def test_save_batch_and_lab_result(client):
-    b = client.post("/api/batches", json={"oilVolume": 500, "ffa": 3, "status": "Completed",
+    b = client.post("/api/batches", json={"oilVolume": 500, "ffa": 1, "status": "Completed",
                                           "biodieselOutputMl": 440, "reactionTime": 120, "stirringSpeed": 500}).json()
     assert b["id"].startswith("B-") and b["yield"] == 88.0 and b["labResult"] == "Pending"
     assert b["materials"]["oilL"] == 0.5
     r = client.post(f"/api/batches/{b['id']}/lab-result", json={"labResult": "Passed", "labReference": "L-1"})
     assert r.json()["labResult"] == "Passed"
     assert client.get("/api/analytics/summary").json()["labPassRate"] == 100
-    assert client.get("/api/analytics/recommended", params={"ffa": 3}).json()["transesterificationTime"] == 120
+    assert client.get("/api/analytics/recommended", params={"ffa": 1}).json()["transesterificationTime"] == 120
 
 
 def test_stage_controls(client):
@@ -82,8 +90,10 @@ def test_stage_controls(client):
     bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "voltage": 35})
     assert bad.status_code == 409
     client.post("/api/process/stage/reset")
-    bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "current": 2.5})
-    assert bad.status_code == 409 and "Current must be between 0.5 and 2" in bad.json()["detail"]
+    bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "current": 3})
+    assert bad.status_code == 409 and "Current must be between 1 and 2" in bad.json()["detail"]
+    bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "current": 1.5})
+    assert bad.status_code == 422 and "whole number" in bad.json()["detail"]
 
 
 def test_purification_rules(client):
@@ -163,8 +173,10 @@ def test_whole_batch_moves_through_the_machine(client):
     _wait_for(client, "/api/process/drain", "phase", ["done"])
     assert client.get("/api/live").json()["sensors"]["reactorValveOpen"] is False
 
-    # separation, then the centrifuge outlet opens and the biodiesel reaches the purification tank
-    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b})
+    # the reactor has drained: separation starts by itself (autoAdvance), then the centrifuge
+    # outlet opens and the biodiesel reaches the purification tank
+    st = _wait_for(client, "/api/process/stage", "state", ["running"])
+    assert st["stage"] == "Separation" and st["batchId"] == b
     client.post("/api/process/stage/complete")
     d = client.get("/api/process/drain").json()
     assert d["valve"] == "centrifuge_outlet" and d["phase"] in ("waiting", "draining")
@@ -185,7 +197,7 @@ def test_whole_batch_moves_through_the_machine(client):
                                               "esterificationRun": True}).json()
     labels = [e["label"] for e in saved["timeline"]]
     for expected in ("Pump B loaded 63.5 g for Esterification", "Pump A loaded 72 g for Transesterification",
-                     "Reactor outlet valve opened", "Centrifuge outlet valve opened",
+                     "Reactor outlet valve opened", "Separation started", "Centrifuge outlet valve opened",
                      "Purification started automatically"):
         assert expected in labels, labels
     assert any(label.startswith("Reactor outlet valve closed") for label in labels)
@@ -287,3 +299,66 @@ def test_heater_needs_the_stirrer(client):
     client.post("/api/control/motor", json={"name": "purification_stirrer", "duty": 0.33})
     assert client.post("/api/control/heater", json={"on": True}).json()["heaterOn"] is True
     client.post("/api/control/all-off")
+
+
+def test_auto_advance_can_be_turned_off(client):
+    """autoAdvance off: after the reactor drains, the operator starts the separation."""
+    client.put("/api/settings", json={"autoAdvance": False})
+    client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": "B-MAN-1"})
+    client.post("/api/process/stage/complete")
+    client.post("/api/process/drain/skip")
+    _wait_for(client, "/api/process/drain", "phase", ["done"])
+    time.sleep(0.3)
+    assert client.get("/api/process/stage").json()["stage"] == "Transesterification"
+
+
+def test_saving_a_batch_never_fails_on_the_purification_record(client):
+    """A partial purification record (a run that stopped early, an older website) still saves,
+    and a missing oil volume comes from the oil weight."""
+    r = client.post("/api/batches", json={"id": "B-SAVE-1", "oilMassG": 460, "ffa": 1,
+                                          "purification": {"safetyStopOccurred": False, "outputWeightG": 400}})
+    assert r.status_code == 201, r.json()
+    b = r.json()
+    assert b["oilVolume"] == 500 and b["purification"]["targetTemperature"] == 90
+    assert b["purification"]["highestTemperature"] is None and b["biodieselOutputMl"] == 454.5
+
+
+def test_whole_numbers_and_readable_errors(client):
+    r = client.post("/api/process/stage/start", json={"stage": "Transesterification", "voltage": 20.5})
+    assert r.status_code == 422 and r.json()["detail"] == "voltage: Use a whole number (no decimals)."
+    r = client.post("/api/process/pump/start", json={"pump": "acid", "volumeMl": 10})
+    assert r.status_code == 422 and r.json()["detail"] == "targetG: Field required"   # names the field
+    assert client.post("/api/strip/read").json()["ffa"] in range(0, 6)
+
+
+def test_bentonite_batch(client):
+    """The adsorbent sent with the stages is used when purification starts by itself, and the
+    saved batch's materials count bentonite instead of Magnesol."""
+    b = "B-BEN-1"
+    client.post("/api/demo/load-oil", json={"volumeMl": 500})
+    time.sleep(1.2)
+    client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 460,
+                                                   "adsorbent": "Bentonite"})
+    client.post("/api/process/stage/complete")
+    client.post("/api/process/drain/skip")
+    _wait_for(client, "/api/process/stage", "stage", ["Separation"])
+    client.post("/api/process/stage/complete")
+    _wait_for(client, "/api/process/drain", "phase", ["waiting", "draining", "done"])
+    client.post("/api/process/drain/skip")
+    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=4)
+    assert p["adsorbent"] == "Bentonite" and p["adsorbentG"] == 9.2 and p["magnesolG"] == 9.2
+    client.post("/api/process/purification/skip")
+    _wait_for(client, "/api/process/purification", "phase", ["methanol"])
+    client.post("/api/process/purification/skip")
+    _wait_for(client, "/api/process/purification", "phase", ["magnesol"])
+    client.post("/api/process/purification/magnesol-added")
+    for _ in range(60):                                     # contact, settling, cooling, drain
+        if client.get("/api/process/purification").json()["phase"] in ("complete", "fault"):
+            break
+        client.post("/api/process/purification/skip")
+        time.sleep(0.15)
+    p = _wait_for(client, "/api/process/purification", "phase", ["complete"], timeout=8)
+    saved = client.post("/api/batches", json={"id": b, "oilVolume": 500, "ffa": 1, "adsorbent": "Bentonite"}).json()
+    assert saved["adsorbent"] == "Bentonite" and saved["purification"]["adsorbent"] == "Bentonite"
+    assert saved["materials"]["bentoniteKg"] == 0.0092 and saved["materials"]["magnesolKg"] == 0
+    assert "Bentonite added (9.2 g)" in [e["label"] for e in saved["timeline"]]

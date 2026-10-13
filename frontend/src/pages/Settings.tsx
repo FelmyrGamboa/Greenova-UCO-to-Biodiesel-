@@ -16,6 +16,20 @@ function readSettings() {
 
 const DEFAULT_BATCH_FORMAT = "B-{YEAR}-{SEQ}";
 
+/** onChange for a number field: letters can't be typed; a decimal point can, and Save refuses it
+ * ("Use whole numbers only"), so 2.5 never silently becomes 25. */
+function wholeInput(setValue: (value: string) => void) {
+  return (event: { target: { value: string } }) => {
+    if (/^[\d.,]*$/.test(event.target.value)) setValue(event.target.value);
+  };
+}
+
+/** A stored setting as a whole number (older versions allowed decimals). */
+function whole(value: unknown, fallback: number) {
+  const number = Number(value);
+  return String(value !== undefined && value !== null && value !== "" && Number.isFinite(number) ? Math.round(number) : fallback);
+}
+
 export default function Settings() {
   const initialSettings = readSettings();
   const { theme, setTheme } = useTheme();
@@ -31,10 +45,7 @@ export default function Settings() {
   const [format, setFormat] = useState(
     initialSettings.format && initialSettings.format !== DEFAULT_BATCH_FORMAT ? String(initialSettings.format) : "",
   );
-  const numberSetting = (key: string, fallback: number) => {
-    const value = Number(initialSettings[key]);
-    return String(initialSettings[key] !== undefined && initialSettings[key] !== null && Number.isFinite(value) ? value : fallback);
-  };
+  const numberSetting = (key: string, fallback: number) => whole(initialSettings[key], fallback);
   // Purification: only these four are settings; the 90 °C hold, 95 °C cutoff and 200 RPM are fixed.
   const [methanolRemovalTime, setMethanolRemovalTime] = useState(numberSetting("methanolRemovalTime", 10));
   const [contactTime, setContactTime] = useState(numberSetting("contactTime", 15));
@@ -46,19 +57,25 @@ export default function Settings() {
   const [pumpCatalystRate, setPumpCatalystRate] = useState(numberSetting("pumpCatalystRate", 100));
   const [pumpAcidRate, setPumpAcidRate] = useState(numberSetting("pumpAcidRate", 100));
   const [reactorDrainTime, setReactorDrainTime] = useState(numberSetting("reactorDrainTime", 1));
-  const [centrifugeDrainTime, setCentrifugeDrainTime] = useState(numberSetting("centrifugeDrainTime", 3));
+  const [centrifugeDrainTime, setCentrifugeDrainTime] = useState(numberSetting("centrifugeDrainTime", 2));
   const [centrifugeSpinDownTime, setCentrifugeSpinDownTime] = useState(numberSetting("centrifugeSpinDownTime", 30));
-  const [provenBatchCount, setProvenBatchCount] = useState(String(initialSettings.provenBatchCount || 3));
-  const [provenYieldTolerance, setProvenYieldTolerance] = useState(String(initialSettings.provenYieldTolerance || 2));
-  const [oilPrice, setOilPrice] = useState(String(initialSettings.oilPrice || 45));
-  const [methanolPrice, setMethanolPrice] = useState(String(initialSettings.methanolPrice || 70));
-  const [kohPrice, setKohPrice] = useState(String(initialSettings.kohPrice || 180));
-  const [naohPrice, setNaohPrice] = useState(String(initialSettings.naohPrice || 160));
-  const [sulfuricAcidPrice, setSulfuricAcidPrice] = useState(String(initialSettings.sulfuricAcidPrice || 120));
-  const [acetonePrice, setAcetonePrice] = useState(String(initialSettings.acetonePrice || 100));
-  const [bentonitePrice, setBentonitePrice] = useState(String(initialSettings.bentonitePrice || 80));
-  const [electricityPrice, setElectricityPrice] = useState(String(initialSettings.electricityPrice || 12));
-  const [dieselPrice, setDieselPrice] = useState(String(initialSettings.dieselPrice || 55));
+  const [provenBatchCount, setProvenBatchCount] = useState(whole(initialSettings.provenBatchCount || 3, 3));
+  const [provenYieldTolerance, setProvenYieldTolerance] = useState(whole(initialSettings.provenYieldTolerance || 2, 2));
+  const [oilPrice, setOilPrice] = useState(whole(initialSettings.oilPrice || 45, 45));
+  const [methanolPrice, setMethanolPrice] = useState(whole(initialSettings.methanolPrice || 70, 70));
+  const [kohPrice, setKohPrice] = useState(whole(initialSettings.kohPrice || 180, 180));
+  const [naohPrice, setNaohPrice] = useState(whole(initialSettings.naohPrice || 160, 160));
+  const [sulfuricAcidPrice, setSulfuricAcidPrice] = useState(whole(initialSettings.sulfuricAcidPrice || 120, 120));
+  const [acetonePrice, setAcetonePrice] = useState(whole(initialSettings.acetonePrice || 100, 100));
+  const [bentonitePrice, setBentonitePrice] = useState(whole(initialSettings.bentonitePrice || 80, 80));
+  const [electricityPrice, setElectricityPrice] = useState(whole(initialSettings.electricityPrice || 12, 12));
+  const [dieselPrice, setDieselPrice] = useState(whole(initialSettings.dieselPrice || 55, 55));
+  const [magnesolPrice, setMagnesolPrice] = useState(whole(initialSettings.magnesolPrice || 250, 250));
+  // Dry wash adsorbent: doses in % of the oil weight, and which one a new batch starts with
+  const [magnesolDose, setMagnesolDose] = useState(numberSetting("magnesolDose", 1));
+  const [bentoniteDose, setBentoniteDose] = useState(numberSetting("bentoniteDose", 2));
+  const [defaultAdsorbent, setDefaultAdsorbent] = useState(initialSettings.defaultAdsorbent === "Bentonite" ? "Bentonite" : "Magnesol");
+  const [autoAdvance, setAutoAdvance] = useState(initialSettings.autoAdvance !== false);
 
   useEffect(() => {
     if (!backend) {
@@ -77,6 +94,24 @@ export default function Settings() {
 
   async function save() {
     setSaveError(null);
+    // Every number on this page is a whole number (no decimals).
+    const numbers: Array<[string, string]> = [
+      ["Methanol removal time", methanolRemovalTime], ["Contact time", contactTime], ["Settling time", settlingTime],
+      ["Max drain temperature", maxDrainTemperature], ["Design FFA for the dose", esterificationDesignFfa],
+      ["Strip maximum (darkest color)", stripMaxFfa], ["Pump A rate (NaOH/KOH + methanol)", pumpCatalystRate],
+      ["Pump B rate (H₂SO₄ + methanol)", pumpAcidRate], ["Reactor outlet open after transesterification", reactorDrainTime],
+      ["Centrifuge outlet open after separation", centrifugeDrainTime], ["Centrifuge spin-down wait", centrifugeSpinDownTime],
+      ["Batches required for Proven", provenBatchCount], ["Yield tolerance", provenYieldTolerance], ["Oil price", oilPrice],
+      ["Methanol price", methanolPrice], ["KOH price", kohPrice], ["NaOH price", naohPrice],
+      ["Sulfuric acid price", sulfuricAcidPrice], ["Acetone price", acetonePrice], ["Bentonite price", bentonitePrice],
+      ["Magnesol price", magnesolPrice], ["Electricity price", electricityPrice], ["Diesel price", dieselPrice],
+      ["Magnesol dose", magnesolDose], ["Bentonite dose", bentoniteDose],
+    ];
+    const notWhole = numbers.filter(([, value]) => !/^\d+$/.test(value.trim())).map(([label]) => t(label));
+    if (notWhole.length) {
+      setSaveError(t("Use whole numbers only (no decimals): {fields}.", { fields: notWhole.join(", ") }));
+      return;
+    }
     const changes = {
       systemName,
       operator,
@@ -105,6 +140,11 @@ export default function Settings() {
       bentonitePrice: Number(bentonitePrice),
       electricityPrice: Number(electricityPrice),
       dieselPrice: Number(dieselPrice),
+      magnesolPrice: Number(magnesolPrice),
+      magnesolDose: Number(magnesolDose),
+      bentoniteDose: Number(bentoniteDose),
+      defaultAdsorbent: defaultAdsorbent as "Magnesol" | "Bentonite",
+      autoAdvance,
     };
     try {
       // Saves to the Raspberry Pi and to this browser; offline, only to this browser.
@@ -150,19 +190,20 @@ export default function Settings() {
         <p className="mt-1 text-sm text-gray-500">{t("Configure FFA grouping, proof thresholds, and prototype costing.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           <Field label={t("FFA range boundaries")} value={ffaRangeBoundaries} onChange={(event) => setFfaRangeBoundaries(event.target.value)} placeholder={DEFAULT_FFA_BOUNDARIES} unit="%" />
-          <Field label={t("Batches required for Proven")} type="number" min="1" value={provenBatchCount} onChange={(event) => setProvenBatchCount(event.target.value)} />
-          <Field label={t("Yield tolerance")} type="number" min="0" value={provenYieldTolerance} onChange={(event) => setProvenYieldTolerance(event.target.value)} unit="± pp" />
-          <Field label={t("Oil price")} type="number" min="0" value={oilPrice} onChange={(event) => setOilPrice(event.target.value)} unit="₱/L" />
-          <Field label={t("Methanol price")} type="number" min="0" value={methanolPrice} onChange={(event) => setMethanolPrice(event.target.value)} unit="₱/L" />
-          <Field label={t("KOH price")} type="number" min="0" value={kohPrice} onChange={(event) => setKohPrice(event.target.value)} unit="₱/kg" />
-          <Field label={t("NaOH price")} type="number" min="0" value={naohPrice} onChange={(event) => setNaohPrice(event.target.value)} unit="₱/kg" />
-          <Field label={t("Sulfuric acid price")} type="number" min="0" value={sulfuricAcidPrice} onChange={(event) => setSulfuricAcidPrice(event.target.value)} unit="₱/L" />
-          <Field label={t("Acetone price")} type="number" min="0" value={acetonePrice} onChange={(event) => setAcetonePrice(event.target.value)} unit="₱/L" />
-          <Field label={t("Bentonite price")} type="number" min="0" value={bentonitePrice} onChange={(event) => setBentonitePrice(event.target.value)} unit="₱/kg" />
-          <Field label={t("Electricity price")} type="number" min="0" value={electricityPrice} onChange={(event) => setElectricityPrice(event.target.value)} unit="₱/kWh" />
-          <Field label={t("Diesel price")} type="number" min="0" value={dieselPrice} onChange={(event) => setDieselPrice(event.target.value)} unit="₱/L" />
+          <Field label={t("Batches required for Proven")} inputMode="numeric" pattern="[0-9]*" value={provenBatchCount} onChange={wholeInput(setProvenBatchCount)} />
+          <Field label={t("Yield tolerance")} inputMode="numeric" pattern="[0-9]*" value={provenYieldTolerance} onChange={wholeInput(setProvenYieldTolerance)} unit="± pp" />
+          <Field label={t("Oil price")} inputMode="numeric" pattern="[0-9]*" value={oilPrice} onChange={wholeInput(setOilPrice)} unit="₱/L" />
+          <Field label={t("Methanol price")} inputMode="numeric" pattern="[0-9]*" value={methanolPrice} onChange={wholeInput(setMethanolPrice)} unit="₱/L" />
+          <Field label={t("KOH price")} inputMode="numeric" pattern="[0-9]*" value={kohPrice} onChange={wholeInput(setKohPrice)} unit="₱/kg" />
+          <Field label={t("NaOH price")} inputMode="numeric" pattern="[0-9]*" value={naohPrice} onChange={wholeInput(setNaohPrice)} unit="₱/kg" />
+          <Field label={t("Sulfuric acid price")} inputMode="numeric" pattern="[0-9]*" value={sulfuricAcidPrice} onChange={wholeInput(setSulfuricAcidPrice)} unit="₱/L" />
+          <Field label={t("Acetone price")} inputMode="numeric" pattern="[0-9]*" value={acetonePrice} onChange={wholeInput(setAcetonePrice)} unit="₱/L" />
+          <Field label={t("Bentonite price")} inputMode="numeric" pattern="[0-9]*" value={bentonitePrice} onChange={wholeInput(setBentonitePrice)} unit="₱/kg" />
+          <Field label={t("Magnesol price")} inputMode="numeric" pattern="[0-9]*" value={magnesolPrice} onChange={wholeInput(setMagnesolPrice)} unit="₱/kg" />
+          <Field label={t("Electricity price")} inputMode="numeric" pattern="[0-9]*" value={electricityPrice} onChange={wholeInput(setElectricityPrice)} unit="₱/kWh" />
+          <Field label={t("Diesel price")} inputMode="numeric" pattern="[0-9]*" value={dieselPrice} onChange={wholeInput(setDieselPrice)} unit="₱/L" />
         </div>
-        <p className="mt-3 text-xs text-gray-600">{t("Default FFA ranges: 0–2%, 2–4%, 4–5%, and 5% and above (the strip's darkest color).")}</p>
+        <p className="mt-3 text-xs text-gray-600">{t("Default FFA ranges (FFA is a whole percent): 0–1% (no esterification), 2–3%, 4%, and 5% and above (the strip's darkest color). All values on this page are whole numbers.")}</p>
       </Card>
 
       <Card className="p-6">
@@ -178,15 +219,19 @@ export default function Settings() {
 
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Esterification and Dosing")}</Heading>
-        <p className="mt-1 text-sm text-gray-500">{t("The FFA strip reads only up to its darkest color, so every batch above 4% FFA gets one uniform esterification dose. A re-check after each stage decides the next step.")}</p>
+        <p className="mt-1 text-sm text-gray-500">{t("FFA of 1% or below goes straight to transesterification. The FFA strip reads only up to its darkest color, so every batch above 1% FFA gets one uniform esterification dose. A re-check after each stage decides the next step.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-          <Field label={t("Design FFA for the dose")} type="number" min="4.1" max="30" step="0.5" value={esterificationDesignFfa} onChange={(event) => setEsterificationDesignFfa(event.target.value)} unit="%" />
-          <Field label={t("Strip maximum (darkest color)")} type="number" min="1" step="0.5" value={stripMaxFfa} onChange={(event) => setStripMaxFfa(event.target.value)} unit="%" />
-          <Field label={t("Pump A rate (NaOH/KOH + methanol)")} type="number" min="1" value={pumpCatalystRate} onChange={(event) => setPumpCatalystRate(event.target.value)} unit="mL/min" />
-          <Field label={t("Pump B rate (H₂SO₄ + methanol)")} type="number" min="1" value={pumpAcidRate} onChange={(event) => setPumpAcidRate(event.target.value)} unit="mL/min" />
-          <Field label={t("Reactor outlet open after transesterification")} type="number" min="0" value={reactorDrainTime} onChange={(event) => setReactorDrainTime(event.target.value)} unit="min" />
-          <Field label={t("Centrifuge outlet open after separation")} type="number" min="0" value={centrifugeDrainTime} onChange={(event) => setCentrifugeDrainTime(event.target.value)} unit="min" />
-          <Field label={t("Centrifuge spin-down wait")} type="number" min="0" value={centrifugeSpinDownTime} onChange={(event) => setCentrifugeSpinDownTime(event.target.value)} unit="s" />
+          <Field label={t("Design FFA for the dose")} inputMode="numeric" pattern="[0-9]*" value={esterificationDesignFfa} onChange={wholeInput(setEsterificationDesignFfa)} unit="%" />
+          <Field label={t("Strip maximum (darkest color)")} inputMode="numeric" pattern="[0-9]*" value={stripMaxFfa} onChange={wholeInput(setStripMaxFfa)} unit="%" />
+          <Field label={t("Pump A rate (NaOH/KOH + methanol)")} inputMode="numeric" pattern="[0-9]*" value={pumpCatalystRate} onChange={wholeInput(setPumpCatalystRate)} unit="mL/min" />
+          <Field label={t("Pump B rate (H₂SO₄ + methanol)")} inputMode="numeric" pattern="[0-9]*" value={pumpAcidRate} onChange={wholeInput(setPumpAcidRate)} unit="mL/min" />
+          <Field label={t("Reactor outlet open after transesterification")} inputMode="numeric" pattern="[0-9]*" value={reactorDrainTime} onChange={wholeInput(setReactorDrainTime)} unit="min" />
+          <Field label={t("Centrifuge outlet open after separation")} inputMode="numeric" pattern="[0-9]*" value={centrifugeDrainTime} onChange={wholeInput(setCentrifugeDrainTime)} unit="min" />
+          <Field label={t("Centrifuge spin-down wait")} inputMode="numeric" pattern="[0-9]*" value={centrifugeSpinDownTime} onChange={wholeInput(setCentrifugeSpinDownTime)} unit="s" />
+          <SelectField label={t("After each drain")} value={autoAdvance ? "auto" : "wait"} onChange={(event) => setAutoAdvance(event.target.value === "auto")}>
+            <option value="auto">{t("Go on to the next stage by itself")}</option>
+            <option value="wait">{t("Wait for the operator's Start")}</option>
+          </SelectField>
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
           {t("Uniform dose per 100 mL of oil at {design}% design FFA: {methanol} mL methanol and {acid} mL H₂SO₄. The pumps stop when the reactor load cell has gained the dose's weight; their rate only sets the time limit (and the dose time if the load cell has no reading). An outlet time of 0 means you move the liquid by hand. The spin-down wait is used only when the centrifuge has no RPM reading.", { design: designFfa, methanol: ((92 * designFfa) / 100 * 2.84).toFixed(1), acid: ((92 * designFfa) / 100 * 0.027).toFixed(2) })}
@@ -195,15 +240,21 @@ export default function Settings() {
 
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Purification")}</Heading>
-        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol. It runs by itself after separation: heating, methanol removal, add Magnesol, contact, settling, cooling if needed, draining.")}</p>
+        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: heating, methanol removal, add the adsorbent, contact, settling, cooling if needed, draining.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-          <Field label={t("Methanol removal time")} type="number" min="5" max="30" value={methanolRemovalTime} onChange={(event) => setMethanolRemovalTime(event.target.value)} unit="min" />
-          <Field label={t("Contact time")} type="number" min="1" max="60" value={contactTime} onChange={(event) => setContactTime(event.target.value)} unit="min" />
-          <Field label={t("Settling time")} type="number" min="0" max="60" value={settlingTime} onChange={(event) => setSettlingTime(event.target.value)} unit="min" />
-          <Field label={t("Max drain temperature")} type="number" min="30" max="85" value={maxDrainTemperature} onChange={(event) => setMaxDrainTemperature(event.target.value)} unit="°C" />
+          <Field label={t("Methanol removal time")} inputMode="numeric" pattern="[0-9]*" value={methanolRemovalTime} onChange={wholeInput(setMethanolRemovalTime)} unit="min" />
+          <Field label={t("Contact time")} inputMode="numeric" pattern="[0-9]*" value={contactTime} onChange={wholeInput(setContactTime)} unit="min" />
+          <Field label={t("Settling time")} inputMode="numeric" pattern="[0-9]*" value={settlingTime} onChange={wholeInput(setSettlingTime)} unit="min" />
+          <Field label={t("Max drain temperature")} inputMode="numeric" pattern="[0-9]*" value={maxDrainTemperature} onChange={wholeInput(setMaxDrainTemperature)} unit="°C" />
+          <Field label={t("Magnesol dose")} inputMode="numeric" pattern="[0-9]*" value={magnesolDose} onChange={wholeInput(setMagnesolDose)} unit={t("% of oil")} />
+          <Field label={t("Bentonite dose")} inputMode="numeric" pattern="[0-9]*" value={bentoniteDose} onChange={wholeInput(setBentoniteDose)} unit={t("% of oil")} />
+          <SelectField label={t("Default adsorbent")} value={defaultAdsorbent} onChange={(event) => setDefaultAdsorbent(event.target.value)}>
+            <option value="Magnesol">Magnesol</option>
+            <option value="Bentonite">{t("Bentonite")}</option>
+          </SelectField>
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          {t("Methanol removal: 5–30 min. Fixed: hold at 90 °C (±2 °C), heater cutoff 95 °C, stirrer 200 RPM, Magnesol = oil volume × 0.0092 g. The outlet valve opens only at or below the max drain temperature (the water filter's limit).")}
+          {t("Methanol removal: 5–30 min. Doses: 1–10% of the oil weight (Magnesol 1% = oil volume × 0.0092 g; bentonite 2% = oil volume × 0.0184 g). Fixed: hold at 90 °C (±2 °C), heater cutoff 95 °C, stirrer 200 RPM. The outlet valve opens only at or below the max drain temperature (the water filter's limit).")}
         </p>
       </Card>
 

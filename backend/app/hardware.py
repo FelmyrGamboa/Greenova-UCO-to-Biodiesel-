@@ -9,7 +9,7 @@ The machine:
   Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H2SO4 in methanol.
 - Reactor outlet valve -> centrifuge (opens after transesterification).
 - Centrifuge, and its outlet valve -> purification tank (opens after separation).
-- Purification tank (dry wash with Magnesol): immersion heater, dry wash stirrer, level switch
+- Purification tank (dry wash with Magnesol or bentonite): immersion heater, dry wash stirrer, level switch
   at the heater; its outlet valve (named "mesh_bed" in the code) lets the biodiesel through the
   filter into the output container on the output load cell (the yield).
 
@@ -28,7 +28,6 @@ Readings use the website's names: oilMassG (input load cell under the reactor), 
 purificationStirrerRpm, heaterSubmerged (level switch: True = biodiesel covers the heater).
 Any reading is None when there's no valid value or no sensor.
 """
-import glob
 import random
 import threading
 import time
@@ -78,6 +77,11 @@ class Hardware:
     def set_current_limit(self, amps: float) -> None:
         if self.current_limit_control:
             self._write_current_limit(amps)
+
+    def set_supply_voltage(self, volts: float) -> None:
+        """Sets the power supply's voltage when the Pi controls the supply (otherwise the operator does)."""
+        if self.current_limit_control:
+            self._write_voltage(volts)
 
     def set_valve(self, name: str, is_open: bool) -> None:
         if name not in self.valves:
@@ -186,6 +190,9 @@ class Hardware:
 
     def _write_current_limit(self, amps: float) -> None:
         raise NotImplementedError
+
+    def _write_voltage(self, volts: float) -> None:
+        pass
 
     def close(self) -> None:
         pass
@@ -327,112 +334,230 @@ class MockHardware(Hardware):
     def _write_current_limit(self, amps: float) -> None:
         self.supply_current_limit = amps
 
+    def _write_voltage(self, volts: float) -> None:
+        self.supply_voltage = volts
+
+
+class _Sampler:
+    """Reads one slow sensor over and over in its own thread (a DS18B20 takes 0.75 s, an HX711
+    about 0.3 s), so the 1-second sensor loop never waits. A value older than max_age_s counts
+    as missing (None), so a sensor that stops answering trips the safety rules."""
+
+    def __init__(self, name: str, read, period_s: float = 0.2, max_age_s: float = 5.0):
+        self._read, self._period, self._max_age = read, period_s, max_age_s
+        self._value, self._at = None, 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name=f"greenova-{name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                value = self._read()
+            except Exception:
+                value = None
+            if value is not None:
+                self._value, self._at = value, time.monotonic()
+            self._stop.wait(self._period)
+
+    @property
+    def value(self):
+        return self._value if time.monotonic() - self._at <= self._max_age else None
+
+    def close(self) -> None:
+        self._stop.set()
+
 
 class PiHardware(Hardware):
-    """The real machine on the Raspberry Pi. Fill in the TODO readers for your sensors.
-    Every reader returns None when there is no valid reading; the safety rules treat a missing
-    temperature as a fault."""
+    """The real machine on the Raspberry Pi. Everything comes from hardware.toml (see
+    hardware.example.toml and docs/RASPBERRY_PI_SETUP.md): pins, relay type, valve and motor
+    types, which sensors are fitted, and their calibration. A sensor that is not enabled reads
+    None, and the backend works around it (e.g. the pumps dose by time without a load cell).
 
-    def __init__(self):
+    To use a sensor that isn't supported, replace the matching _read_... method below."""
+
+    def __init__(self, hw_config: Optional[dict] = None):
         super().__init__()
-        from gpiozero import OutputDevice, PWMOutputDevice  # only available on the Pi
+        from gpiozero import Button, OutputDevice, PWMOutputDevice  # apt: python3-gpiozero python3-lgpio
 
-        pins, active_high = config.PINS, config.RELAY_ACTIVE_HIGH
+        from . import drivers
+
+        cfg = hw_config or config.HARDWARE
+        problems = config.check_hardware(cfg)
+        if problems:
+            raise RuntimeError("hardware.toml: " + " ".join(problems))
+        self.cfg = cfg
+        active_high = cfg["relays"]["active_high"]
+        self._closables: list = []
 
         def relay(pin):
-            return OutputDevice(pin, active_high=active_high, initial_value=False)
+            device = OutputDevice(pin, active_high=active_high, initial_value=False)
+            self._closables.append(device)
+            return device
 
-        self._heater = relay(pins["heater_relay"])
-        self._electrodes = relay(pins["electrode_power_relay"])
-        # TODO: motorized valves differ (2-wire spring return, 3-wire, H-bridge). This assumes
-        # one relay per valve that opens it while ON. Change _write_valve if yours works differently.
-        self._valves = {"reactor_outlet": relay(pins["valve_reactor_outlet"]),
-                        "centrifuge_outlet": relay(pins["valve_centrifuge_outlet"]),
-                        "mesh_bed": relay(pins["valve_mesh_bed"])}
-        # The dosing pumps are switched by a relay or MOSFET each (ON = pumping).
-        self._pumps = {"catalyst": relay(pins["pump_catalyst"]), "acid": relay(pins["pump_acid"])}
-        self._motors = {"stirrer": PWMOutputDevice(pins["stirrer_pwm"], frequency=1000),
-                        "centrifuge": PWMOutputDevice(pins["centrifuge_pwm"], frequency=1000),
-                        "purification_stirrer": PWMOutputDevice(pins["purification_stirrer_pwm"], frequency=1000)}
+        self._heater = relay(cfg["relays"]["heater"])
+        self._electrodes = relay(cfg["relays"]["electrode_power"])
+        self._pumps = {name: relay(cfg["pumps"][name]) for name in PUMPS}
+
+        # Valves: "single" = one relay, ON = open (2-wire NC solenoid, spring return).
+        #         "dual"   = 3-wire motorized ball valve: one relay powers OPEN, the other CLOSE.
+        self._valves = {}
+        for name, key in (("reactor_outlet", "reactor_outlet"), ("centrifuge_outlet", "centrifuge_outlet"),
+                          ("mesh_bed", "purification_outlet")):
+            v = cfg["valves"][key]
+            if v.get("mode", "single") == "dual":
+                self._valves[name] = ("dual", relay(v["open_pin"]), relay(v["close_pin"]))
+            else:
+                self._valves[name] = ("single", relay(v["pin"]), None)
+
+        # Motors: "pwm" = duty 0-1 to a motor driver; "esc" = brushless ESC, 1.0-2.0 ms pulses at 50 Hz.
+        self._motors = {}
+        for name in MOTORS:
+            m = cfg["motors"][name]
+            if m.get("type", "pwm") == "esc":
+                device = PWMOutputDevice(m["pin"], frequency=50, initial_value=0.05)   # 1 ms = stopped (arms the ESC)
+            else:
+                device = PWMOutputDevice(m["pin"], frequency=m.get("frequency", 1000))
+            self._closables.append(device)
+            self._motors[name] = (m.get("type", "pwm"), device)
+
+        # Level switch (float switch at the heater's height): between the pin and GND.
         self._level = None
-        if pins.get("heater_level_switch") is not None:
-            from gpiozero import Button
-            # Wire the float switch between the pin and GND; closed (pressed) = liquid present.
-            self._level = Button(pins["heater_level_switch"], pull_up=True)
+        self._level_closed_is_liquid = cfg["level_switch"].get("closed_means_liquid", True)
+        if cfg["level_switch"].get("enabled"):
+            self._level = Button(cfg["level_switch"]["pin"], pull_up=True)
+            self._closables.append(self._level)
 
+        # Slow sensors, each read in its own thread
+        self._samplers: dict[str, _Sampler] = {}
+        t = cfg["temperature"]
+        if t.get("type", "ds18b20") == "ds18b20":
+            self._samplers["temperature"] = _Sampler("temperature", lambda: drivers.read_ds18b20(t.get("sensor_id", "")), 0.1)
+        elif t.get("type") not in ("none", "", None):
+            raise RuntimeError(f"hardware.toml: temperature type {t.get('type')!r} is not supported (ds18b20 or none).")
+
+        self._scales = {}
+        cells = {k: c for k, c in cfg["load_cells"].items() if c.get("enabled")}
+        if cells:
+            lgpio, chip = drivers.open_gpiochip(cfg.get("gpiochip"))
+            self._lgpio_chip = (lgpio, chip)
+            for key, c in cells.items():
+                scale = drivers.HX711Scale(lgpio, chip, c["data_pin"], c["clock_pin"], c.get("offset", 0),
+                                           c.get("scale", 1.0), c.get("samples", 3))
+                self._scales[key] = scale
+                self._samplers[f"weight_{key}"] = _Sampler(f"weight-{key}", scale.read_grams, 0.05)
+
+        self._power = None
+        pm = cfg["power_monitor"]
+        if pm.get("type", "none") not in ("none", "", None):
+            self._power = drivers.PowerMonitor(pm["type"], pm.get("i2c_bus", 1), pm.get("address", 0x40),
+                                               pm.get("shunt_ohms", 0.02))
+            self._samplers["power"] = _Sampler("power", self._power.read_or_none, 0.2)
+
+        self._rpm = {name: drivers.RpmCounter(r["pin"], r.get("pulses_per_rev", 1))
+                     for name, r in cfg["rpm"].items() if r.get("enabled")}
+
+        self._supply = None
+        ps = cfg["power_supply"]
+        if ps.get("control") == "serial":
+            self._supply = drivers.SerialSupply(ps["port"], ps.get("baudrate", 9600), ps.get("voltage_command", ""),
+                                                ps.get("current_command", ""), ps.get("output_on_command", ""),
+                                                ps.get("output_off_command", ""))
+
+    # ----- outputs -----
     def _write_heater(self, on: bool) -> None:
         self._heater.on() if on else self._heater.off()
 
     def _write_electrode_power(self, on: bool) -> None:
         self._electrodes.on() if on else self._electrodes.off()
+        if self._supply:
+            self._supply.output(on)
 
     def _write_valve(self, name: str, is_open: bool) -> None:
-        device = self._valves[name]
-        device.on() if is_open else device.off()
+        mode, first, second = self._valves[name]
+        if mode == "dual":                   # never power OPEN and CLOSE together
+            if is_open:
+                second.off()
+                first.on()
+            else:
+                first.off()
+                second.on()
+        else:
+            first.on() if is_open else first.off()
 
     def _write_pump(self, name: str, on: bool) -> None:
         device = self._pumps[name]
         device.on() if on else device.off()
 
     def _write_motor(self, name: str, duty: float) -> None:
-        self._motors[name].value = duty
+        kind, device = self._motors[name]
+        device.value = 0.05 + 0.05 * duty if kind == "esc" else duty   # ESC: 1 ms (stop) to 2 ms (full)
 
     def _write_current_limit(self, amps: float) -> None:
-        # TODO: only if your power supply has a control input (GREENOVA_PSU_CURRENT_CONTROL=1),
-        # e.g. send the current limit over its serial/USB port. Otherwise leave it: the website
-        # tells the operator to set the current on the supply.
-        raise NotImplementedError("Set the power supply's current limit by hand, or fill in _write_current_limit.")
+        if self._supply is None:
+            # GREENOVA_PSU_CURRENT_CONTROL=1 without [power_supply] control = "serial": put your own code here.
+            raise NotImplementedError("Set the power supply's current limit by hand, or set "
+                                      "[power_supply] control = \"serial\" in hardware.toml.")
+        self._supply.set_current(amps)
 
+    def _write_voltage(self, volts: float) -> None:
+        if self._supply is not None:
+            self._supply.set_voltage(volts)
+
+    # ----- sensors -----
     def _read_sensors(self) -> dict:
+        volts, amps = self._read_power()
         return {
             "oilMassG": self._read_input_weight(),
             "outputWeightG": self._read_output_weight(),
             "temperature": self._read_temperature(),
-            "voltage": self._read_electrode_voltage(),
-            "current": self._read_electrode_current(),
+            "voltage": volts,
+            "current": amps,
             "stirrerRpm": self._read_rpm("stirrer"),
             "centrifugeRpm": self._read_rpm("centrifuge"),
             "purificationStirrerRpm": self._read_rpm("purification_stirrer"),
-            "heaterSubmerged": None if self._level is None else bool(self._level.is_pressed),
+            "heaterSubmerged": self._read_level(),
         }
 
+    def _sampled(self, key: str):
+        sampler = self._samplers.get(key)
+        return sampler.value if sampler else None
+
     def _read_temperature(self) -> Optional[float]:
-        """Example for a waterproof DS18B20 probe (enable 1-Wire in raspi-config).
-        Replace this if you use a different temperature sensor."""
-        files = glob.glob("/sys/bus/w1/devices/28-*/w1_slave")
-        if not files:
-            return None
-        try:
-            with open(files[0]) as f:
-                lines = f.read().splitlines()
-            if len(lines) < 2 or not lines[0].endswith("YES"):
-                return None
-            return round(int(lines[1].split("t=")[1]) / 1000, 1)
-        except (OSError, ValueError, IndexError):
-            return None
+        return self._sampled("temperature")
 
     def _read_input_weight(self) -> Optional[float]:
-        # TODO: HX711 load cell under the main reactor (grams; tare it with the reactor empty).
-        # It weighs the oil and acetone poured in, and what the dosing pumps add.
-        return None
+        """HX711 under the main reactor (grams, tared with the empty reactor)."""
+        return self._sampled("weight_reactor")
 
     def _read_output_weight(self) -> Optional[float]:
-        return None  # TODO: HX711 load cell under the biodiesel output container (grams)
+        """HX711 under the biodiesel output container (grams)."""
+        return self._sampled("weight_output")
 
-    def _read_electrode_voltage(self) -> Optional[float]:
-        return None  # TODO: for example an ADS1115 ADC with a voltage divider
-
-    def _read_electrode_current(self) -> Optional[float]:
-        return None  # TODO: for example an INA219 or ACS712 current sensor
+    def _read_power(self) -> tuple[Optional[float], Optional[float]]:
+        value = self._sampled("power")
+        return value if value else (None, None)
 
     def _read_rpm(self, name: str) -> Optional[float]:
-        return None  # TODO: count pulses from the RPM sensor of "stirrer", "centrifuge" or "purification_stirrer"
+        counter = self._rpm.get(name)
+        return counter.rpm() if counter else None
+
+    def _read_level(self) -> Optional[bool]:
+        if self._level is None:
+            return None
+        closed = bool(self._level.is_pressed)
+        return closed if self._level_closed_is_liquid else not closed
 
     def close(self) -> None:
         self.all_off()
-        for device in [self._heater, self._electrodes, *self._valves.values(), *self._pumps.values(),
-                       *self._motors.values(), *([self._level] if self._level else [])]:
-            device.close()
+        for sampler in self._samplers.values():
+            sampler.close()
+        for item in [*self._scales.values(), *self._rpm.values(), *([self._power] if self._power else []),
+                     *([self._supply] if self._supply else []), *self._closables]:
+            try:
+                item.close()
+            except Exception:
+                pass
 
 
 def create_hardware() -> Hardware:

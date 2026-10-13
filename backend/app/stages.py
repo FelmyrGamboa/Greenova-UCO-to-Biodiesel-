@@ -73,6 +73,7 @@ class StageRunner:
                 self.hw.supply_voltage = voltage      # demo: the simulated supply follows the setting
                 self.hw.supply_current_limit = current  # demo: as if the operator set it on the supply
             self.hw.set_current_limit(current)       # only when the Pi controls the supply
+            self.hw.set_supply_voltage(voltage)      # likewise
         else:
             voltage, stirring, time_min, current = None, None, s.separation_time, None
         self._settings, self._on_event = s, on_event
