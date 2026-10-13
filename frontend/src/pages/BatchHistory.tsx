@@ -271,7 +271,35 @@ export default function BatchHistory() {
             <table className="gv-table min-w-[1080px]">
               <thead><tr><th>{t("Batch ID")}</th><th>{t("Date")}</th><th>{t("Oil Volume")}</th><th>{t("FFA %")}</th><th>{t("Biodiesel Yield")}</th><th>{t("Duration")}</th><th>{t("Energy Used")}</th><th>{t("Status")}</th><th>{t("Lab Test")}</th><th>{t("Details")}</th></tr></thead>
               <tbody>
-                {batches.map((batch) => (
+                {batches.length > 0 ? (
+                  batches.map((batch) => (
+                    <tr key={batch.id}>
+                      <td className="font-mono !text-green-400">{batch.id}</td>
+                      <td>{new Date(batch.date).toLocaleDateString()}</td>
+                      <td>{batch.oilVolume.toLocaleString()} mL</td>
+                      <td><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">{t("Esterified")}{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${t("{count} stages", { count: batch.esterificationStages.length })}` : ""}</div>}</td>
+                      <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
+                      <td>{batch.duration} min</td>
+                      <td>{batch.energy} kWh</td>
+                      <td><Status tone={batch.status === "Completed" ? "green" : batch.status === "In Progress" ? "blue" : batch.status === "Cancelled" ? "yellow" : "red"}>{t(batch.status)}</Status></td>
+                      <td><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></td>
+                      <td><Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">{t("View details")} →</Link></td>
+                    </tr>
+                  ))) : (
+                    <tr>
+                      <td colSpan={5} className="py-12 text-center">
+                        <div className="flex flex-col items-center gap-2">
+                          <p className="text-sm font-medium text-gray-400">
+                            {t("No batch records yet")}
+                          </p>
+                          <p className="text-xs text-gray-600">
+                            {t("Batch performance will appear here once records are available.")}
+                          </p>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                {/* {batches.map((batch) => (
                   <tr key={batch.id}>
                     <td className="font-mono !text-green-400">{batch.id}</td>
                     <td>{new Date(batch.date).toLocaleDateString()}</td>
@@ -284,7 +312,7 @@ export default function BatchHistory() {
                     <td><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></td>
                     <td><Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">{t("View details")} →</Link></td>
                   </tr>
-                ))}
+                ))} */}
               </tbody>
             </table>
           </div>
