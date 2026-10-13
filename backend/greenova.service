@@ -1,0 +1,26 @@
+# Greenova backend as a service: starts when the Pi boots, restarts if it stops.
+# setup-pi.sh fills in __USER__ and __BACKEND__ and installs it. By hand: replace them with your
+# username (e.g. pi) and the backend folder (e.g. /home/pi/Greenova-UCO-to-Biodiesel-/backend), then
+#     sudo cp greenova.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#     sudo systemctl enable --now greenova
+[Unit]
+Description=Greenova backend
+# The MySQL database must be up first when it runs on the Pi (MariaDB). Units that don't exist are ignored.
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__BACKEND__
+# Hardware mode (real pins). The wiring is in __BACKEND__/hardware.toml and the MySQL login
+# in __BACKEND__/.env (see database.md).
+Environment=GREENOVA_MOCK=0
+ExecStart=__BACKEND__/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Also restarts when MySQL wasn't reachable yet at boot.
+Restart=on-failure
+RestartSec=5
+# On stop the backend switches every output off first (heater, electrodes, pumps, valves, motors).
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
