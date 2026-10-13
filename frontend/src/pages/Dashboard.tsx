@@ -196,7 +196,30 @@ export default function Dashboard() {
           <table className="gv-table min-w-[700px]">
             <thead><tr><th>{t("Batch")}</th><th>{t("Yield")}</th><th>{t("Energy")}</th><th>{t("Duration")}</th><th>{t("Status")}</th></tr></thead>
             <tbody>
-              {recent.map((batch) => (
+              {recent.length > 0 ? (
+                recent.map((batch) => (
+                  <tr key={batch.id}>
+                    <td className="font-mono !text-green-400">{batch.id}</td>
+                    <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
+                    <td>{batch.energy} kWh</td>
+                    <td>{batch.duration} min</td>
+                    <td><Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status></td>
+                  </tr>
+                ))) : (
+                  <tr>
+                    <td colSpan={5} className="py-12 text-center">
+                      <div className="flex flex-col items-center gap-2">
+                        <p className="text-sm font-medium text-gray-400">
+                          {t("No batch records yet")}
+                        </p>
+                        <p className="text-xs text-gray-600">
+                          {t("Batch performance will appear here once records are available.")}
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              {/* {recent.map((batch) => (
                 <tr key={batch.id}>
                   <td className="font-mono !text-green-400">{batch.id}</td>
                   <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
@@ -204,7 +227,7 @@ export default function Dashboard() {
                   <td>{batch.duration} min</td>
                   <td><Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status></td>
                 </tr>
-              ))}
+              ))} */}
             </tbody>
           </table>
         </div>
