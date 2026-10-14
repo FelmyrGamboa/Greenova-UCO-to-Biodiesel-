@@ -105,7 +105,8 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
               role="dialog"
               aria-modal="true"
               aria-labelledby="phone-access-title"
-              className="glass fade-in-up w-full max-w-md rounded-2xl p-6"
+              // className="glass fade-in-up w-full max-w-md rounded-2xl p-6"
+              className="glass fade-in-up w-full max-w-md max-h-[90dvh] overflow-y-auto overscroll-contain rounded-2xl p-4 sm:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
