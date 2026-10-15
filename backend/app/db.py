@@ -5,7 +5,7 @@
     batch_materials        one row per material a batch used (oil, methanol, catalyst, ...)
     esterification_stages  one row per esterification stage (the stage's values as JSON)
     batch_timeline         one row per timeline event, in order (event_sequence 1, 2, 3, ...)
-    batch_lab_results      lab results of a batch; the newest row is the batch's lab result
+    batch_lab_results      0 or 1 row per batch (UNIQUE batch_id): its lab result, updated in place
     batch_progress         0 or 1 row per ongoing batch: where the website's Process page is
     settings               one row (id = 1), one column per setting (the website's keys)
 
@@ -325,6 +325,49 @@ def init_db() -> None:
         if cur.fetchone() is None:
             _write_settings(cur, Settings())
             log.info("Saved the default settings (settings row id = 1)")
+    _one_lab_result_per_batch()
+
+
+# Columns of batch_lab_results that are merged when duplicate rows of a batch are joined.
+LAB_MERGE_COLUMNS = ("lab_reference", "test_name", "measured_value", "unit", "tested_at", "notes")
+
+
+def _one_lab_result_per_batch() -> None:
+    """Older tables kept one batch_lab_results row per change (Pending, then Passed ...). Joins each
+    batch's rows into its newest one, then adds UNIQUE (batch_id) so it can't happen again.
+    A value the newest row lacks (a NULL tested_at or reference) is taken from the older rows, so no
+    saved time is lost. Runs once: nothing to do when the unique key is there."""
+    with transaction() as cur:
+        cur.execute("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = 'batch_lab_results' AND NON_UNIQUE = 0 "
+                    "GROUP BY INDEX_NAME HAVING COUNT(*) = 1 AND MAX(COLUMN_NAME) = 'batch_id'")
+        if cur.fetchone():
+            return
+        cur.execute("SELECT * FROM batch_lab_results ORDER BY batch_id, lab_result_id FOR UPDATE")
+        by_batch: dict[str, list[dict]] = {}
+        for row in cur.fetchall():
+            by_batch.setdefault(row["batch_id"], []).append(row)
+        removed = 0
+        for rows in by_batch.values():
+            if len(rows) < 2:
+                continue
+            keep, older = rows[-1], rows[-2::-1]          # the newest row is the batch's lab result
+            fill = {}
+            for column in LAB_MERGE_COLUMNS:
+                if keep[column] in (None, ""):
+                    found = next((r[column] for r in older if r[column] not in (None, "")), None)
+                    if found is not None:
+                        fill[column] = found
+            if fill:
+                _update(cur, "batch_lab_results", fill, "lab_result_id = %s", (keep["lab_result_id"],))
+            ids = [r["lab_result_id"] for r in older]
+            cur.execute(f"DELETE FROM batch_lab_results WHERE lab_result_id IN ({', '.join(['%s'] * len(ids))})", ids)
+            removed += len(ids)
+        if removed:
+            log.info("batch_lab_results: joined %d duplicate rows into their batch's newest row", removed)
+    with transaction() as cur:
+        cur.execute("ALTER TABLE batch_lab_results ADD UNIQUE KEY uq_lab_batch (batch_id)")
+    log.info("batch_lab_results: one lab result per batch now (UNIQUE batch_id)")
 
 
 def _settings_column_set(cur) -> set:
@@ -643,20 +686,35 @@ def _save_batch(cur, b: Batch) -> None:
                         "VALUES (%s, %s, %s, %s)", new_events)
     cur.execute("DELETE FROM batch_timeline WHERE batch_id = %s AND event_sequence > %s", (b.id, len(b.timeline)))
 
-    # batch_lab_results: a new row only when the lab result (or its reference) changes, so the
-    # table keeps the history: Pending -> Passed, with tested_at when it was recorded. An ongoing
-    # batch has no lab result yet: its first row is written when it is completed (or cancelled).
+    # An ongoing batch has no lab result yet: its row is written when it is completed (or cancelled).
     if b.status != IN_PROGRESS:
-        cur.execute("SELECT result_status, lab_reference FROM batch_lab_results WHERE batch_id = %s "
-                    "ORDER BY lab_result_id DESC LIMIT 1", (b.id,))
-        latest = cur.fetchone()
-        current = (b.lab_result, b.lab_reference or None)
-        if latest is None or (_choice(latest["result_status"], LAB_RESULTS), latest["lab_reference"] or None) != current:
-            _insert(cur, "batch_lab_results", {
-                "batch_id": b.id, "result_status": b.lab_result, "lab_reference": b.lab_reference or None,
-                "tested_at": datetime.now() if b.lab_result in TESTED_RESULTS else None})
+        _write_lab_result(cur, b)
         # finished (completed, failed or cancelled): nothing left to continue on the Process page
         cur.execute("DELETE FROM batch_progress WHERE batch_id = %s", (b.id,))
+
+
+def _write_lab_result(cur, b: Batch) -> None:
+    """batch_lab_results: ONE row per batch (UNIQUE batch_id), found by batch_id and updated in
+    place when the result changes (Pending -> Passed), never a second row.
+    tested_at = when the result was recorded: b.lab_tested_at when given, else the time already
+    saved, else now for a Passed/Failed result. A saved time is never replaced by NULL.
+    Columns the app doesn't use (test_name, measured_value, unit, notes) are left as they are."""
+    cur.execute("SELECT lab_result_id, result_status, lab_reference, tested_at FROM batch_lab_results "
+                "WHERE batch_id = %s ORDER BY lab_result_id DESC LIMIT 1 FOR UPDATE", (b.id,))
+    row = cur.fetchone()
+    tested_at = _local(b.lab_tested_at) or (row["tested_at"] if row else None)
+    # if tested_at is None and b.lab_result in TESTED_RESULTS:
+    if tested_at is None:
+        tested_at = datetime.now()
+    values = {"result_status": b.lab_result, "lab_reference": b.lab_reference or None, "tested_at": tested_at}
+    if row is None:
+        _insert(cur, "batch_lab_results", {"batch_id": b.id, **values})
+        return
+    if _choice(row["result_status"], LAB_RESULTS) == b.lab_result:
+        del values["result_status"]              # same result (maybe typed "passed" by hand): keep it as it is
+    changed = {k: v for k, v in values.items() if row[k] != v}
+    if changed:
+        _update(cur, "batch_lab_results", changed, "lab_result_id = %s", (row["lab_result_id"],))
 
 
 def save_batch(b: Batch) -> None:
@@ -716,7 +774,7 @@ def _load_children(cur, batch_id: Optional[str] = None) -> dict[str, dict]:
                 f"ORDER BY batch_id, event_sequence", args)
     for row in cur.fetchall():
         of(row)["timeline"].append(row)
-    cur.execute(f"SELECT batch_id, result_status, lab_reference FROM batch_lab_results {where} "
+    cur.execute(f"SELECT batch_id, result_status, lab_reference, tested_at FROM batch_lab_results {where} "
                 f"ORDER BY batch_id, lab_result_id", args)
     for row in cur.fetchall():
         of(row)["lab"] = row                     # the newest row wins
@@ -785,6 +843,7 @@ def _batch_from_rows(r: dict, children: Optional[dict]) -> Batch:
         "status": r["batch_status"],
         "labResult": _choice(lab["result_status"], LAB_RESULTS, "Pending") if lab else "Pending",
         "labReference": lab["lab_reference"] if lab else None,
+        "labTestedAt": lab["tested_at"] if lab else None,
         "ffa": _f(r["ffa_percent"]),
         "ffaAboveStrip": bool(r["ffa_above_strip"]),
         "esterificationRun": bool(r["esterification_run"]),

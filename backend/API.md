@@ -4,7 +4,7 @@ Base URL: `http://<pi-address>:8000` (or the same address as the website when th
 
 All JSON uses the website's names: the `DemoBatch` fields from `src/lib/greenovaData.ts`, the `greenova_settings` keys from the Settings page, and `PROCESS_CONFIG` from `NewBatch.tsx`. Errors return `{"detail": "message"}` with status 400 (bad input), 404 (not found), 409 (not allowed right now, e.g. a safety rule) or 500 (unexpected backend error, still JSON so the website shows the message). The website calls these through `src/lib/api.ts`.
 
-**Storage.** Batches and settings are stored in the MySQL database `greenova_db` (see `database.md`); the JSON is the same as before. A value too long for its column is refused with 422 and the field's name: a batch `id` over 50 characters, a `labReference` over 100, or (400) a Settings text such as `systemName` over 150. `date` must be `YYYY-MM-DD`. Each lab result is kept as a new row of `batch_lab_results`; the newest one is the batch's `labResult`. If MySQL can't be reached, the batch endpoints answer 500 with the reason.
+**Storage.** Batches and settings are stored in the MySQL database `greenova_db` (see `database.md`); the JSON is the same as before. A value too long for its column is refused with 422 and the field's name: a batch `id` over 50 characters, a `labReference` over 100, or (400) a Settings text such as `systemName` over 150. `date` must be `YYYY-MM-DD`. Each batch has one row in `batch_lab_results` (unique `batch_id`), updated in place when its lab result changes; `labTestedAt` is when it was recorded. If MySQL can't be reached, the batch endpoints answer 500 with the reason.
 
 ## Endpoints
 
@@ -31,7 +31,7 @@ All JSON uses the website's names: the `DemoBatch` fields from `src/lib/greenova
 | GET | `/api/batches/{id}` | | Batch Details |
 | POST | `/api/batches` | DemoBatch fields (`id` and `date` optional) | `saveCompletedBatch` (completes the batch in progress in its own row) |
 | PATCH | `/api/batches/{id}` | any batch fields | Correct a record (a finished batch can't be set back to In Progress) |
-| POST | `/api/batches/{id}/lab-result` | `{labResult: "Passed" or "Failed", labReference?}` | `updateBatchLabResult` |
+| POST | `/api/batches/{id}/lab-result` | `{labResult: "Passed" or "Failed", labReference?, testedAt?}` | `updateBatchLabResult`: records or changes the result in the batch's one lab row. `testedAt` (ISO time, the website sends its clock) defaults to now; an empty `labReference` keeps the saved one; the same result again keeps its first time |
 | POST | `/api/batches/{id}/esterification-stages` | `{stage, ffaBefore, ffaAfter?, doseFfa?, methanolMl, sulfuricAcidMl, acetoneMl}` | Record an esterification stage (the website sends them all with the batch) |
 | GET | `/api/analytics/summary` | | Summary cards |
 | GET | `/api/analytics/ranges` | | Best Parameters per FFA Range table |

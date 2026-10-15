@@ -149,7 +149,7 @@ If MySQL can't be reached, the batch can't be saved on the Pi. The machine and i
 
 ```
 production_batches (PK batch_id)
- ├──< batch_lab_results      (FK batch_id)          1 : many   lab result history
+ ├──o batch_lab_results      (FK batch_id, UNIQUE)  1 : 0..1   the lab result, updated in place
  ├──< batch_materials        (FK batch_id)          1 : many   one row per material
  ├──o batch_purification     (FK batch_id, UNIQUE)  1 : 0..1   dry wash record
  ├──< batch_timeline         (FK batch_id)          1 : many   events, event_sequence 1, 2, 3 …
@@ -179,10 +179,10 @@ Every foreign key is `ON DELETE CASCADE ON UPDATE CASCADE`. Deleting a batch in 
 | `esterificationVoltage`, `esterificationStirring`, `esterificationCurrent` | `esterification_voltage`, `esterification_stirring_rpm`, `esterification_current_a` | NULL when there was no esterification |
 | `biodieselOutputMl`, `catalystType`, `adsorbent`, `catalystToWeighG` | `biodiesel_output_ml`, `catalyst_type`, `adsorbent`, `catalyst_to_weigh_g` | |
 | `notes`, `createdAt` | `notes`, `created_at` | `created_at` = the first save if the batch has none |
-| `labResult`, `labReference` | → `batch_lab_results` | below |
+| `labResult`, `labReference`, `labTestedAt` | → `batch_lab_results` (`result_status`, `lab_reference`, `tested_at`) | below |
 | `materials`, `purification`, `esterificationStages`, `timeline` | → child tables | below |
 
-**`batch_lab_results`**: a new row is added only when the lab result or its reference changes, so the table keeps the history (`Pending`, then `Passed` with `LAB-…`). **The newest row (highest `lab_result_id`) is the batch's lab result.** `tested_at` is filled when a Passed/Failed result is recorded. `test_name`, `measured_value`, `unit` and `notes` are free for you, e.g. flash point results typed in HeidiSQL. The backend reads only `result_status` and `lab_reference`.
+**`batch_lab_results`**: **one row per batch** (`UNIQUE KEY uq_lab_batch (batch_id)`). The row is written when the batch is completed (`Pending`) or cancelled (`Not tested`); recording or changing the lab result **updates that same row**, found by `batch_id` (Pending → Passed → Failed), never a second one. `tested_at` is when the result was recorded: the time the website sends (the operator's device clock, stored in the backend's local time), else the backend's time. A saved `tested_at` is **never replaced by NULL**: saving the batch again, or a PATCH without a time, keeps it; sending the same result and reference again changes nothing. Each recording also adds a timeline event "Lab result recorded: Passed (LAB-…)". `test_name`, `measured_value`, `unit` and `notes` are free for you, e.g. flash point results typed in HeidiSQL: the backend never changes them. Older tables had one row per change: on its next start the backend joins each batch's rows into the newest one (a value the newest lacks, e.g. a NULL `tested_at`, is taken from the older rows), then adds the unique key.
 
 **`batch_materials`**: 7 rows per batch, `quantity` in the unit shown:
 
@@ -222,7 +222,9 @@ A row with another name (e.g. `Water`, typed in HeidiSQL) is kept but not shown 
 
 | | |
 |---|---|
-| `production_batches`, `batch_lab_results`, `batch_materials`, `batch_purification`, `batch_timeline`, `esterification_stages` | **Unchanged**: identical columns, types, keys, indexes, CHECK and foreign keys |
+| `production_batches`, `batch_materials`, `batch_purification`, `batch_timeline`, `esterification_stages` | **Unchanged**: identical columns, types, keys, indexes, CHECK and foreign keys |
+| `batch_lab_results` | Same columns; `KEY idx_lab_batch (batch_id)` became **`UNIQUE KEY uq_lab_batch (batch_id)`**: one lab result per batch (added by itself to an older table) |
+| `batch_progress` | **New** table: where the batch in progress is on the Process page |
 | `settings` | **+5 columns** for settings the app already had but the export didn't: `magnesolDose`, `bentoniteDose`, `defaultAdsorbent`, `autoAdvance`, `magnesolPrice` |
 | `settings` defaults | `ffaThreshold` 4 → **1**, `centrifugeDrainTime` 3 → **2**, `esterificationCurrentMin` and `transesterificationCurrentMin` 0.5 → **1** (the current rules). The backend always writes every column, so these only matter for a row you insert by hand. The backend also upgrades these old values when it reads them. |
 | `schema.sql` collation | No `COLLATE utf8mb4_0900_ai_ci`, so it also runs on MariaDB (the server's utf8mb4 default is used; on MySQL 8 that is the same `utf8mb4_0900_ai_ci`) |
@@ -314,10 +316,9 @@ Two existing tests time the simulated machine and sometimes fail on a busy compu
 ## 9. Useful queries and backups
 
 ```sql
--- Batch History with each batch's current lab result
+-- Batch History with each batch's lab result (one row per batch)
 SELECT b.batch_id, b.production_date, b.batch_status, b.yield_percent,
-       (SELECT l.result_status FROM batch_lab_results l
-         WHERE l.batch_id = b.batch_id ORDER BY l.lab_result_id DESC LIMIT 1) AS lab_result
+       (SELECT l.result_status FROM batch_lab_results l WHERE l.batch_id = b.batch_id) AS lab_result
 FROM production_batches b
 ORDER BY b.production_date DESC, b.batch_id DESC;
 

@@ -251,6 +251,7 @@ class Batch(CamelModel):
     status: BatchStatus = "Completed"
     lab_result: LabResult = "Pending"
     lab_reference: Optional[str] = Field(default=None, max_length=100)
+    lab_tested_at: Optional[datetime] = None   # when the lab result was recorded (batch_lab_results.tested_at)
     ffa: float = 0
     ffa_above_strip: bool = False              # the strip showed its darkest color: FFA is at least ffa
     esterification_run: bool = False
@@ -323,6 +324,8 @@ class ProgressIn(CamelModel):
 class LabResultIn(CamelModel):
     lab_result: Literal["Passed", "Failed"]
     lab_reference: Optional[str] = Field(default=None, max_length=100)   # batch_lab_results.lab_reference
+    # When the operator recorded it (the website sends its clock); missing = the Pi's time now.
+    tested_at: Optional[datetime] = None
 
 
 # ---------- requests ----------

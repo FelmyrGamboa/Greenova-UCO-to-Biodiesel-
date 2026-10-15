@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS `production_batches` (
   KEY `idx_batch_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Lab results of a batch (1 batch : many results). The newest row is the batch's lab result.
+-- Lab result of a batch (1 batch : 0 or 1 result). One row per batch_id (uq_lab_batch), updated
+-- in place when the result changes; tested_at is the time the result was recorded.
 CREATE TABLE IF NOT EXISTS `batch_lab_results` (
   `lab_result_id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `batch_id` varchar(50) NOT NULL,
@@ -66,8 +67,8 @@ CREATE TABLE IF NOT EXISTS `batch_lab_results` (
   `tested_at` datetime(6) DEFAULT NULL,
   `notes` text,
   PRIMARY KEY (`lab_result_id`),
+  UNIQUE KEY `uq_lab_batch` (`batch_id`),
   KEY `idx_lab_status` (`result_status`),
-  KEY `idx_lab_batch` (`batch_id`),
   KEY `idx_lab_reference` (`lab_reference`),
   CONSTRAINT `fk_lab_batch` FOREIGN KEY (`batch_id`) REFERENCES `production_batches` (`batch_id`) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

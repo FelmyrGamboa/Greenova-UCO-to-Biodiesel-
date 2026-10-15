@@ -786,6 +786,12 @@ export const FIL: Record<string, string> = {
   "Starting records the batch as In Progress in Batch History. Only one batch can be processed at a time.": "Kapag sinimulan, itatala ang batch bilang Isinasagawa sa Kasaysayan ng Batch. Isang batch lang ang maaaring iproseso sa bawat pagkakataon.",
   "Batch started": "Sinimulan ang batch",
   "Batch cancelled": "Kinansela ang batch",
+
+  // ---------- lab result: one record per batch ----------
+  "Recorded {time}": "Naitala noong {time}",
+  "Change lab result": "Palitan ang resulta ng lab",
+  "The batch's lab result is updated (it stays one record). Leave the reference empty to keep {reference}.": "Papalitan ang resulta ng lab ng batch (mananatili itong iisang tala). Iwanang blangko ang reference para panatilihin ang {reference}.",
+  "Cancel": "Kanselahin",
 };
 
 /** Backend messages that contain numbers: the English pattern and its Filipino text ($1 = the number). */
@@ -851,4 +857,6 @@ export const FIL_PATTERNS: Array<[RegExp, string]> = [
   [/^Stop the machine first: (.+)\.$/, "Ihinto muna ang makina: $1."],
   [/^Batch (\S+) is no longer in progress\.$/, "Hindi na isinasagawa ang batch $1."],
   [/^Batch (\S+) is (\w+): it can't be continued\.$/, "Hindi na maitutuloy ang batch $1 ($2)."],
+  [/^Lab result recorded: (Passed|Failed) \((.+)\)$/, "Naitala ang resulta ng lab: $1 ($2)"],
+  [/^Lab result recorded: (Passed|Failed)$/, "Naitala ang resulta ng lab: $1"],
 ];

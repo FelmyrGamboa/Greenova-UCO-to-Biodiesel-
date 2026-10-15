@@ -8,6 +8,8 @@ export type DemoBatch = {
   status: "Completed" | "Failed" | "In Progress" | "Cancelled";
   labResult: "Pending" | "Passed" | "Failed" | "Not tested";
   labReference?: string;
+  /** When the lab result was recorded (ISO time). */
+  labTestedAt?: string | null;
   ffa: number;
   /** The FFA strip showed its darkest color: FFA is at least `ffa` (the strip's maximum, 5%). */
   ffaAboveStrip?: boolean;
@@ -199,14 +201,20 @@ export function getBatches(): DemoBatch[] {
   }
 }
 
+/** Records or changes a batch's lab result in its own entry (same rules as the backend): an
+ * empty reference keeps the saved one, and the same result again keeps the time it was recorded. */
 export function updateBatchLabResult(
   id: string,
   labResult: "Passed" | "Failed",
   labReference?: string,
+  testedAt: string = new Date().toISOString(),
 ) {
-  const batches = getBatches().map((batch) =>
-    batch.id === id ? { ...batch, labResult, labReference: labReference?.trim() || undefined } : batch,
-  );
+  const batches = getBatches().map((batch) => {
+    if (batch.id !== id) return batch;
+    const reference = labReference?.trim() || batch.labReference;
+    const unchanged = batch.labResult === labResult && batch.labReference === reference && batch.labTestedAt;
+    return unchanged ? batch : { ...batch, labResult, labReference: reference, labTestedAt: testedAt };
+  });
   localStorage.setItem(STORAGE_KEY, JSON.stringify(batches));
   return batches.find((batch) => batch.id === id);
 }

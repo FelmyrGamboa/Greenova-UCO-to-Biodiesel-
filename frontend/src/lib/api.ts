@@ -475,10 +475,13 @@ export function saveCompletedBatch(batch: Partial<DemoBatch>): Promise<BatchReco
   );
 }
 
+/** Records or changes the batch's lab result (its one lab result row is updated). testedAt is
+ * when the operator recorded it: this device's clock, sent along so the time is never missing. */
 export function updateBatchLabResult(id: string, labResult: "Passed" | "Failed", labReference?: string): Promise<BatchRecord | undefined> {
+  const testedAt = new Date().toISOString();
   return withLocalFallback(
-    () => send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/lab-result`, { labResult, labReference }),
-    () => local.updateBatchLabResult(id, labResult, labReference),
+    () => send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/lab-result`, { labResult, labReference, testedAt }),
+    () => local.updateBatchLabResult(id, labResult, labReference, testedAt),
   );
 }
 

@@ -523,19 +523,29 @@ def update_batch(batch_id: str, request: Request, updates: dict[str, Any] = Body
     except ValidationError as e:
         raise HTTPException(400, _validation_message(e))
     db.save_batch(b)
-    return b.dump()
+    return _with_stage(db.get_batch(batch_id))   # as saved (e.g. a lab result time is never cleared)
 
 
 @router.post("/batches/{batch_id}/lab-result")
 def record_lab_result(batch_id: str, data: LabResultIn):
-    """The website's updateBatchLabResult."""
+    """The website's updateBatchLabResult: records or changes the batch's lab result. The batch's
+    one batch_lab_results row is updated (never a second row). tested_at is the time the website
+    sends (else now); sending the same result and reference again changes nothing, so the time
+    it was first recorded stays. An empty reference keeps the saved one."""
     b = _batch_or_404(batch_id)
     if b.status != "Completed":
         raise HTTPException(409, "Only completed batches can get a lab result.")
-    b.lab_result = data.lab_result
-    b.lab_reference = (data.lab_reference or "").strip() or None
+    reference = (data.lab_reference or "").strip() or b.lab_reference
+    if (b.lab_result, b.lab_reference) == (data.lab_result, reference) and b.lab_tested_at is not None:
+        return b.dump()
+    when = data.tested_at or datetime.now()
+    if when.tzinfo is not None:                  # the website's time (UTC) in the Pi's local time, like every DATETIME
+        when = when.astimezone().replace(tzinfo=None)
+    b.lab_result, b.lab_reference, b.lab_tested_at = data.lab_result, reference, when
+    b.timeline.append(TimelineEvent(label=f"Lab result recorded: {data.lab_result}"
+                                          + (f" ({reference})" if reference else ""), time=when))
     db.save_batch(b)
-    return b.dump()
+    return db.get_batch(batch_id).dump()
 
 
 @router.post("/batches/{batch_id}/esterification-stages")

@@ -481,3 +481,37 @@ def test_no_new_batch_while_the_machine_is_busy(client):
     assert r.status_code == 409 and "machine is still busy" in r.json()["detail"]
     client.post("/api/control/all-off")
     assert client.post("/api/batches/start").status_code == 201
+
+
+# ---------- lab results: one row per batch, its time kept ----------
+def test_lab_result_updates_one_row_and_keeps_its_time(client):
+    from datetime import datetime as dt
+
+    b = client.post("/api/batches", json={"oilVolume": 500, "ffa": 1, "status": "Completed"}).json()["id"]
+    lab_rows = lambda: _count("SELECT COUNT(*) AS n FROM batch_lab_results WHERE batch_id = %s", b)
+    assert lab_rows() == 1 and client.get(f"/api/batches/{b}").json()["labTestedAt"] is None   # Pending
+
+    # recorded on the website at 02:50:53 UTC: saved in the Pi's local time, in the same row
+    sent = "2026-10-15T02:50:53.250Z"
+    local = dt.fromisoformat("2026-10-15T02:50:53.250+00:00").astimezone().replace(tzinfo=None).isoformat()
+    r = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Passed", "labReference": "L-1", "testedAt": sent})
+    passed = r.json()
+    assert (passed["labResult"], passed["labReference"], passed["labTestedAt"]) == ("Passed", "L-1", local)
+    assert lab_rows() == 1
+    events = [e["label"] for e in passed["timeline"]]
+    assert events[-1] == "Lab result recorded: Passed (L-1)" and passed["timeline"][-1]["time"] == local
+
+    # the same result again: nothing changes, the first time stays
+    again = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Passed", "testedAt": "2026-10-16T00:00:00Z"}).json()
+    assert again["labTestedAt"] == local and len(again["timeline"]) == len(passed["timeline"])
+
+    # changed to Failed (no reference typed: the saved one stays), with a new time; still one row
+    failed = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Failed"}).json()
+    assert (failed["labResult"], failed["labReference"]) == ("Failed", "L-1") and failed["labTestedAt"] > local
+    assert lab_rows() == 1 and failed["timeline"][-1]["label"] == "Lab result recorded: Failed (L-1)"
+
+    # other saves of the batch never clear the time, even when asked to
+    for updates in ({"notes": "checked"}, {"labTestedAt": None}):
+        assert client.patch(f"/api/batches/{b}", json=updates).json()["labTestedAt"] == failed["labTestedAt"]
+    assert lab_rows() == 1
+    assert client.get("/api/batches").json()[0]["labTestedAt"] == failed["labTestedAt"]

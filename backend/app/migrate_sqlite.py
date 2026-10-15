@@ -56,6 +56,8 @@ def differences(before, after, path: str = "") -> list[str]:
         for key in before.keys() | after.keys():
             if key == "createdAt" and before.get(key) is None:
                 continue                             # MySQL needs a created_at: the copy time is used
+            if key == "labTestedAt" and before.get(key) is None:
+                continue                             # a Passed/Failed result without a time gets the copy time
             out += differences(before.get(key), after.get(key), f"{path}.{key}" if path else key)
         return out
     if isinstance(before, list) and isinstance(after, list):

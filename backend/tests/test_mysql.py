@@ -118,16 +118,61 @@ def test_missing_values_in_not_null_columns_come_back_missing():
     assert float(p["voltage_v"]) == 0 and p["catalyst_type"] == "" and p["adsorbent"] == ""
 
 
-def test_lab_results_keep_their_history():
+def test_one_lab_result_row_updated_in_place():
     b = full_batch()
     db.save_batch(b)
-    db.save_batch(b)                                     # unchanged: no new row
+    db.save_batch(b)                                     # unchanged: still one row
+    first = rows("SELECT lab_result_id, result_status, tested_at FROM batch_lab_results")
+    assert [(r["result_status"], r["tested_at"]) for r in first] == [("Pending", None)]
     b.lab_result, b.lab_reference = "Passed", "LAB-2026-77"
     db.save_batch(b)
-    history = rows("SELECT result_status, lab_reference, tested_at FROM batch_lab_results ORDER BY lab_result_id")
-    assert [(r["result_status"], r["lab_reference"]) for r in history] == [("Pending", None), ("Passed", "LAB-2026-77")]
-    assert history[0]["tested_at"] is None and history[1]["tested_at"] is not None
-    assert db.get_batch(b.id).lab_result == "Passed" and db.get_batch(b.id).lab_reference == "LAB-2026-77"
+    lab = rows("SELECT lab_result_id, result_status, lab_reference, tested_at FROM batch_lab_results")
+    assert len(lab) == 1 and lab[0]["lab_result_id"] == first[0]["lab_result_id"]      # the same row
+    assert (lab[0]["result_status"], lab[0]["lab_reference"]) == ("Passed", "LAB-2026-77")
+    tested_at = lab[0]["tested_at"]
+    assert tested_at is not None
+    got = db.get_batch(b.id)
+    assert (got.lab_result, got.lab_reference, got.lab_tested_at) == ("Passed", "LAB-2026-77", tested_at)
+    # saving the batch again without the time (e.g. a Batch built without it) never clears it
+    db.save_batch(got.model_copy(update={"lab_tested_at": None, "notes": "re-saved"}))
+    assert rows("SELECT tested_at FROM batch_lab_results")[0]["tested_at"] == tested_at
+    # a new result with its own time: still the same row
+    when = datetime(2026, 10, 20, 14, 5, 7, 123456)
+    db.save_batch(got.model_copy(update={"lab_result": "Failed", "lab_tested_at": when}))
+    lab = rows("SELECT lab_result_id, result_status, tested_at FROM batch_lab_results")
+    assert [(r["lab_result_id"], r["result_status"], r["tested_at"]) for r in lab] == [(first[0]["lab_result_id"], "Failed", when)]
+
+
+def test_lab_results_unique_per_batch():
+    db.save_batch(full_batch())
+    with pytest.raises(Exception) as error:              # MySQL itself refuses a second row
+        with db.transaction() as cur:
+            cur.execute("INSERT INTO batch_lab_results (batch_id, result_status) VALUES ('B-2026-101', 'Passed')")
+    assert error.value.args[0] == 1062
+
+
+def test_old_duplicate_lab_rows_are_joined_once():
+    """A table from the old version (one row per change, no unique key): the newest row is kept,
+    with the values it lacks taken from the older rows, then UNIQUE (batch_id) is added."""
+    db.save_batch(full_batch())
+    db.save_batch(full_batch("B-2026-102"))
+    plain_index = rows("SELECT COUNT(*) AS n FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+                       "AND TABLE_NAME = 'batch_lab_results' AND INDEX_NAME = 'idx_lab_batch'")[0]["n"]
+    with db.transaction() as cur:                        # back to the old table: no unique key
+        cur.execute("ALTER TABLE batch_lab_results DROP INDEX uq_lab_batch"
+                    + ("" if plain_index else ", ADD KEY idx_lab_batch (batch_id)"))
+        cur.execute("INSERT INTO batch_lab_results (batch_id, result_status, lab_reference, tested_at, test_name) VALUES "
+                    "('B-2026-101', 'Passed', 'L-9', '2026-10-15 10:50:53', 'Flash point'), "
+                    "('B-2026-101', 'Passed', NULL, NULL, NULL)")
+    db.init_db()
+    lab = rows("SELECT batch_id, result_status, lab_reference, tested_at, test_name FROM batch_lab_results ORDER BY batch_id")
+    assert [(r["batch_id"], r["result_status"], r["lab_reference"], str(r["tested_at"]), r["test_name"]) for r in lab] == [
+        ("B-2026-101", "Passed", "L-9", "2026-10-15 10:50:53", "Flash point"), ("B-2026-102", "Pending", None, "None", None)]
+    unique = rows("SELECT NON_UNIQUE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+                  "AND TABLE_NAME = 'batch_lab_results' AND INDEX_NAME = 'uq_lab_batch'")
+    assert unique == [{"NON_UNIQUE": 0}]
+    db.init_db()                                         # again: nothing to do
+    assert db.get_batch("B-2026-101").lab_tested_at == datetime(2026, 10, 15, 10, 50, 53)
 
 
 def test_updates_change_rows_in_place():

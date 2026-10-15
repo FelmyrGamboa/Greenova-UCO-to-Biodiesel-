@@ -25,6 +25,9 @@ export default function BatchDetails() {
   const [fromBackend, setFromBackend] = useState(false);
   const [labReference, setLabReference] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // A recorded result (Passed or Failed) can be changed: the same lab result is updated.
+  const [changingLab, setChangingLab] = useState(false);
+  const [savingLab, setSavingLab] = useState(false);
 
   useEffect(() => {
     if (!batchId) return;
@@ -43,13 +46,21 @@ export default function BatchDetails() {
 
   async function recordLabResult(result: "Passed" | "Failed") {
     setError(null);
+    setSavingLab(true);
     try {
       const updated = await updateBatchLabResult(batch.id, result, labReference);
       if (updated) setBatch(updated);
+      setChangingLab(false);
+      setLabReference("");
     } catch (problem) {
       setError(isOffline(problem) ? t("Backend offline.") : t(problem instanceof Error ? problem.message : String(problem)));
+    } finally {
+      setSavingLab(false);
     }
   }
+
+  const tested = batch.labResult === "Passed" || batch.labResult === "Failed";
+  const showLabForm = batch.status === "Completed" && (batch.labResult === "Pending" || changingLab);
 
   const running = batch.status === "In Progress";
   const timeline: Array<[string, string]> = batch.timeline?.length
@@ -111,7 +122,16 @@ export default function BatchDetails() {
             {batch.biodieselOutputMl ? (
               <Metric label={t("Biodiesel output")} value={`${batch.biodieselOutputMl.toFixed(1)} mL`} sub={batch.purification?.outputWeightG ? t("{grams} g on the output load cell", { grams: batch.purification.outputWeightG.toFixed(1) }) : undefined} />
             ) : null}
-            <div><div className="gv-label">{t("Lab test")}</div><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></div>
+            <div>
+              <div className="gv-label">{t("Lab test")}</div>
+              <Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status>
+              {tested && batch.labTestedAt && (
+                <div className="mt-1 text-xs text-gray-500">{t("Recorded {time}", { time: new Date(batch.labTestedAt).toLocaleString() })}</div>
+              )}
+              {tested && batch.status === "Completed" && !changingLab && (
+                <button type="button" className="mt-2 block text-xs font-medium text-green-400 hover:text-green-300" onClick={() => setChangingLab(true)}>{t("Change lab result")}</button>
+              )}
+            </div>
             {batch.labReference && <Metric label={t("Lab reference no.")} value={batch.labReference} />}
           </div>
         </Card>
@@ -131,16 +151,21 @@ export default function BatchDetails() {
           </div>
         </Card>
       </div>
-      {batch.status === "Completed" && batch.labResult === "Pending" && (
+      {showLabForm && (
         <Card className="p-6">
-          <Heading as="h2" className="text-lg font-semibold">{t("Record lab result")}</Heading>
-          <p className="mt-1 text-sm text-gray-500">{t("Update this batch when the laboratory certificate arrives.")}</p>
+          <Heading as="h2" className="text-lg font-semibold">{changingLab ? t("Change lab result") : t("Record lab result")}</Heading>
+          <p className="mt-1 text-sm text-gray-500">
+            {changingLab
+              ? t("The batch's lab result is updated (it stays one record). Leave the reference empty to keep {reference}.", { reference: batch.labReference || "—" })
+              : t("Update this batch when the laboratory certificate arrives.")}
+          </p>
           <div className="mt-5 max-w-md">
             <Field label={t("Lab reference no. (optional)")} value={labReference} onChange={(event) => setLabReference(event.target.value)} />
           </div>
           <div className="mt-5 flex flex-wrap gap-3">
-            <Button onClick={() => recordLabResult("Passed")}>{t("Passed")}</Button>
-            <Button variant="danger" onClick={() => recordLabResult("Failed")}>{t("Failed")}</Button>
+            <Button disabled={savingLab} onClick={() => recordLabResult("Passed")}>{t("Passed")}</Button>
+            <Button variant="danger" disabled={savingLab} onClick={() => recordLabResult("Failed")}>{t("Failed")}</Button>
+            {changingLab && <Button variant="ghost" onClick={() => { setChangingLab(false); setError(null); }}>{t("Cancel")}</Button>}
           </div>
           {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
         </Card>
