@@ -1183,6 +1183,9 @@ export default function NewBatch() {
   const navigate = useNavigate();
   const [actionError, setActionError] = useState<string | null>(null);
   const [savedBatch, setSavedBatch] = useState<BatchRecord | null>(null);
+  // When the process was completed: captured once, when the batch is saved, and only shown after
+  // (never the current time, which would keep changing as the page updates).
+  const [completedAt, setCompletedAt] = useState<Date | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [batchId, setBatchId] = useState(() => `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`);
   const [processConfigCurrentControl, setProcessConfigCurrentControl] = useState(false);
@@ -2112,6 +2115,7 @@ export default function NewBatch() {
         return;
       }
       setSavedBatch(result);
+      setCompletedAt((current) => current ?? new Date());
       setSaved(true);
     }
     next();
@@ -2124,6 +2128,7 @@ export default function NewBatch() {
     // the Pi's row must not stay "In Progress" (it would block the next batch)
     if (backend) markBatchCompleted(batchId).catch(() => undefined);
     setSavedBatch(record as BatchRecord);
+    setCompletedAt((current) => current ?? new Date());
     setSaved(true);
     setSaveFailed(false);
     setActionError(null);
@@ -3010,7 +3015,7 @@ export default function NewBatch() {
               <Metric label={t("Biodiesel output")} value={savedBatch?.biodieselOutputMl ? t("{ml} mL · {pct}% yield", { ml: savedBatch.biodieselOutputMl.toFixed(1), pct: savedBatch.yield }) : t("Not measured")} sub={savedBatch?.biodieselOutputMl ? `${t("Output load cell")}${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
               {savedBatch?.createdAt && <Metric label={t("Average reaction temperature")} value={`${savedBatch.temperature} °C`} sub={t("Measured during transesterification")} />}
               {savedBatch?.createdAt && <Metric label={t("Energy used")} value={`${savedBatch.energy} kWh`} sub={t("Electrodes (plus heater, if configured)")} />}
-              <Metric label={t("Completion date")} value={new Date().toLocaleString()} />
+              <Metric label={t("Completion date")} value={completedAt ? completedAt.toLocaleString() : "—"} />
             </div>
             <div className="mt-7 flex flex-wrap gap-3">
               <Link to="/dashboard" className="btn-primary">{t("Return to Dashboard")}</Link>

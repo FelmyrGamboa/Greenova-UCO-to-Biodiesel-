@@ -240,7 +240,7 @@ export default function Dashboard() {
         </div>
         <div className="overflow-x-auto">
           <table className="gv-table min-w-[700px]">
-            <thead><tr><th>{t("Batch")}</th><th>{t("Yield")}</th><th>{t("Energy")}</th><th>{t("Duration")}</th><th>{t("Status")}</th></tr></thead>
+            <thead><tr><th>{t("Batch")}</th><th>{t("Date")}</th><th>{t("Yield")}</th><th>{t("Energy")}</th><th>{t("Duration")}</th><th>{t("Status")}</th></tr></thead>
             <tbody>
               {recent.length > 0 ? (
                 recent.map((batch) => {
@@ -248,6 +248,7 @@ export default function Dashboard() {
                   return (
                     <tr key={batch.id}>
                       <td className="font-mono !text-green-400">{running ? <Link to="/process">{batch.id}</Link> : batch.id}</td>
+                      <td>{new Date(batch.date).toLocaleDateString()}</td>
                       <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
                       <td>{running ? "—" : `${batch.energy} kWh`}</td>
                       <td>{running ? "—" : `${batch.duration} min`}</td>
