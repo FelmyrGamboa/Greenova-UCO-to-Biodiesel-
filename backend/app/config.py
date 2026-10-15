@@ -39,7 +39,7 @@ _load_env_file(ENV_FILE)
 # ---------- MySQL database ----------
 # The batches and settings are stored in MySQL. Put your MySQL login here, or in backend/.env
 # (a value in .env wins over the one here). The first time the backend starts, it creates the
-# database and its 7 tables by itself (schema.sql). Check the connection: python -m app.db
+# database and its 8 tables by itself (schema.sql). Check the connection: python -m app.db
 DB_HOST = os.getenv("DB_HOST", "localhost")      # the computer running MySQL
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "greenova")           # the MySQL user you log in with in HeidiSQL

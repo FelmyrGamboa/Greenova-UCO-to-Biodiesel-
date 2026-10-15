@@ -16,7 +16,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Card, Heading, Metric, SelectField, Status } from "../components/ui";
+import { batchTone, Card, Heading, Metric, SelectField, Status } from "../components/ui";
 import { ffaBoundaries, formatFfa, type DemoBatch } from "../lib/greenovaData";
 import { useBatches } from "../lib/api";
 import { useT, type TFunction } from "../lib/i18n";
@@ -218,7 +218,9 @@ export default function BatchHistory() {
   const { batches, source } = useBatches();
   const settings = useMemo(readAnalyticsSettings, []);
   const completed = batches.filter((batch) => batch.status === "Completed");
-  const completionRate = batches.length ? (completed.length / batches.length) * 100 : 0;
+  // the batch in progress isn't finished yet: it doesn't count against the completion rate
+  const finished = batches.filter((batch) => batch.status !== "In Progress");
+  const completionRate = finished.length ? (completed.length / finished.length) * 100 : 0;
   const tested = batches.filter((batch) => batch.labResult === "Passed" || batch.labResult === "Failed");
   const passed = tested.filter((batch) => batch.labResult === "Passed");
   const labPassRate = tested.length ? (passed.length / tested.length) * 100 : null;
@@ -256,7 +258,7 @@ export default function BatchHistory() {
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Card className="p-5"><Metric label={t("Total batches")} value={batches.length} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
-        <Card className="p-5"><Metric label={t("Completion rate")} value={`${completionRate.toFixed(1)}%`} sub={t("{done} of {total} completed", { done: completed.length, total: batches.length })} accent /></Card>
+        <Card className="p-5"><Metric label={t("Completion rate")} value={`${completionRate.toFixed(1)}%`} sub={t("{done} of {total} completed", { done: completed.length, total: finished.length })} accent /></Card>
         <Card className="p-5"><Metric label={t("Lab pass rate")} value={labPassRate === null ? "—" : `${labPassRate.toFixed(1)}%`} sub={tested.length ? t("{passed} of {tested} tested", { passed: passed.length, tested: tested.length }) : t("No lab results yet")} accent={labPassRate !== null} /></Card>
         <Card className="p-5"><Metric label={t("Average yield")} value={`${(completed.reduce((sum, item) => sum + item.yield, 0) / Math.max(completed.length, 1)).toFixed(1)}%`} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
       </div>
@@ -272,20 +274,32 @@ export default function BatchHistory() {
               <thead><tr><th>{t("Batch ID")}</th><th>{t("Date")}</th><th>{t("Oil Volume")}</th><th>{t("FFA %")}</th><th>{t("Biodiesel Yield")}</th><th>{t("Duration")}</th><th>{t("Energy Used")}</th><th>{t("Status")}</th><th>{t("Lab Test")}</th><th>{t("Details")}</th></tr></thead>
               <tbody>
                 {batches.length > 0 ? (
-                  batches.map((batch) => (
-                    <tr key={batch.id}>
-                      <td className="font-mono !text-green-400">{batch.id}</td>
-                      <td>{new Date(batch.date).toLocaleDateString()}</td>
-                      <td>{batch.oilVolume.toLocaleString()} mL</td>
-                      <td><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">{t("Esterified")}{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${t("{count} stages", { count: batch.esterificationStages.length })}` : ""}</div>}</td>
-                      <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
-                      <td>{batch.duration} min</td>
-                      <td>{batch.energy} kWh</td>
-                      <td><Status tone={batch.status === "Completed" ? "green" : batch.status === "In Progress" ? "blue" : batch.status === "Cancelled" ? "yellow" : "red"}>{t(batch.status)}</Status></td>
-                      <td><Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status></td>
-                      <td><Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">{t("View details")} →</Link></td>
-                    </tr>
-                  ))) : (
+                  batches.map((batch) => {
+                    // the batch in progress: no results yet, and it is continued on the Process page
+                    const running = batch.status === "In Progress";
+                    return (
+                      <tr key={batch.id}>
+                        <td className="font-mono !text-green-400">{batch.id}</td>
+                        <td>{new Date(batch.date).toLocaleDateString()}</td>
+                        <td>{batch.oilVolume ? `${batch.oilVolume.toLocaleString()} mL` : "—"}</td>
+                        <td>{running && !batch.oilVolume ? "—" : <><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">{t("Esterified")}{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${t("{count} stages", { count: batch.esterificationStages.length })}` : ""}</div>}</>}</td>
+                        <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
+                        <td>{running ? "—" : `${batch.duration} min`}</td>
+                        <td>{running ? "—" : `${batch.energy} kWh`}</td>
+                        <td>
+                          <Status tone={batchTone(batch.status)}>{t(batch.status)}</Status>
+                          {running && <div className="mt-1 text-[10px] text-gray-600">{batch.currentStage ? t(batch.currentStage) : t("Starting")}</div>}
+                        </td>
+                        <td>{running ? "—" : <Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status>}</td>
+                        <td>
+                          <div className="flex flex-col gap-1">
+                            {running && <Link to="/process" className="font-medium text-blue-400 hover:text-blue-300">{t("Continue Process")} →</Link>}
+                            <Link to={`/batches/${batch.id}`} className="font-medium text-green-400 hover:text-green-300">{t("View details")} →</Link>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })) : (
                     <tr>
                       <td colSpan={10} className="py-12 text-center">
                         <div className="flex flex-col items-center gap-2">

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
-import { Button, Card, Field, Heading, Metric, Status } from "../components/ui";
+import { batchTone, Button, Card, Field, Heading, Metric, Status } from "../components/ui";
 import { formatFfa, getBatches } from "../lib/greenovaData";
 import { getBatch, isOffline, updateBatchLabResult, type BatchRecord } from "../lib/api";
 import { useT } from "../lib/i18n";
@@ -51,6 +51,7 @@ export default function BatchDetails() {
     }
   }
 
+  const running = batch.status === "In Progress";
   const timeline: Array<[string, string]> = batch.timeline?.length
     ? batch.timeline.map((event) => [t(event.label), new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })])
     : demoTimeline.map(([label, time]) => [t(label), time]);
@@ -63,11 +64,20 @@ export default function BatchDetails() {
           <div>
             <div className="section-kicker">{t("Batch record")}</div>
             <Heading as="h1" className="mt-2 text-3xl font-bold">{batch.id}</Heading>
-            <p className="mt-2 text-sm text-gray-500">{t("Completed {date}", { date: new Date(batch.date).toLocaleDateString() })} · {fromBackend ? t("Raspberry Pi record") : t("Prototype record")}</p>
+            <p className="mt-2 text-sm text-gray-500">{t(running ? "Started {date}" : "Completed {date}", { date: new Date(batch.date).toLocaleDateString() })} · {fromBackend ? t("Raspberry Pi record") : t("Prototype record")}</p>
           </div>
-          <Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status>
+          <Status tone={batchTone(batch.status)}>{t(batch.status)}{running && batch.currentStage ? ` · ${t(batch.currentStage)}` : ""}</Status>
         </div>
       </div>
+      {running && (
+        <Card className="flex flex-col gap-4 border-blue-500/20 p-6 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <Heading as="h2" className="text-lg font-semibold">{t("This batch is in progress")}</Heading>
+            <p className="mt-1 text-sm text-gray-500">{t("Its results are recorded when it is completed. Only one batch can be processed at a time.")}</p>
+          </div>
+          <Link to="/process" className="btn-primary">{t("Continue Process")} →</Link>
+        </Card>
+      )}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card className="p-5"><Metric label={t("Oil volume")} value={`${batch.oilVolume.toLocaleString()} mL`} /></Card>
         <Card className="p-5"><Metric label={t("Biodiesel yield")} value={batch.yield ? `${batch.yield}%` : "—"} accent /></Card>
@@ -121,7 +131,7 @@ export default function BatchDetails() {
           </div>
         </Card>
       </div>
-      {batch.labResult === "Pending" && (
+      {batch.status === "Completed" && batch.labResult === "Pending" && (
         <Card className="p-6">
           <Heading as="h2" className="text-lg font-semibold">{t("Record lab result")}</Heading>
           <p className="mt-1 text-sm text-gray-500">{t("Update this batch when the laboratory certificate arrives.")}</p>

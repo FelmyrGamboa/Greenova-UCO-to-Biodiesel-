@@ -4,7 +4,7 @@ Text lengths follow the MySQL columns (schema.sql), e.g. a batch ID is at most 5
 import re
 from datetime import date as _date
 from datetime import datetime
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -303,6 +303,21 @@ class BatchIn(Batch):
     id: Optional[str] = Field(default=None, max_length=50)
     date: Optional[str] = None
     oil_volume: Optional[float] = None
+
+
+class BatchStartIn(CamelModel):
+    """"Start batch" on the website's Process page. The ID is the one the page shows (from
+    /api/batches/next-id); the backend takes the next free one if it's taken or missing."""
+    id: Optional[str] = Field(default=None, max_length=50)
+
+
+class ProgressIn(CamelModel):
+    """Where the ongoing batch is on the Process page, so it can be continued later or on
+    another device. state is the page's own data (stored as it is); batch holds the batch's
+    setup so far (oil, FFA, parameters), in the same fields as a saved batch."""
+    stage: str = Field(min_length=1, max_length=50)
+    state: dict[str, Any] = Field(default_factory=dict)
+    batch: Optional[dict[str, Any]] = None
 
 
 class LabResultIn(CamelModel):

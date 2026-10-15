@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import {
   Button,
   Card,
+  Dialog,
   Field,
   Heading,
   Metric,
@@ -12,19 +13,26 @@ import {
 } from "../components/ui";
 import { useLiveData } from "../contexts/LiveContext";
 import {
+  ApiError,
+  cancelBatch,
   demoAdd,
+  getActiveBatch,
   getNextBatchId,
   getRecommendedParametersForFfa,
   getSystemStatus,
   isOffline,
   loadDemoOil,
+  markBatchCompleted,
   pumpAction,
   purificationAction,
+  saveBatchProgress,
   saveCompletedBatch,
   stageAction,
+  startBatch,
   startPump,
   startPurification,
   startStage,
+  type ActiveBatch,
   type Adsorbent,
   type BatchRecord,
   type DrainPhase,
@@ -1066,6 +1074,56 @@ const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
   ["complete", "Done"],
 ];
 
+/** Everything this page knows about the batch in progress. It is saved while the batch runs
+ * (on the Raspberry Pi, or in this browser offline), so the batch is continued where it was after
+ * leaving the page, a reload, or on another device, instead of being started again. */
+type ProcessSnapshot = {
+  version: 1;
+  step: number;
+  stage: string;
+  reactorG: number;
+  confirmedOilG: number | null;
+  targetVolume: string;
+  ffa: string;
+  ffaAboveStrip: boolean;
+  esterStage: number;
+  esterRecords: EsterStageRecord[];
+  nextDoseFfa: number | null;
+  recheckValue: string;
+  recheckAbove: boolean;
+  finalFfa: number | null;
+  loads: Record<string, DoseLoad>;
+  acetoneBase: Record<string, number>;
+  adsorbent: Adsorbent;
+  ratio: number;
+  catalyst: "NaOH" | "KOH";
+  esterVoltage: string;
+  esterTime: string;
+  esterStirring: string;
+  esterCurrent: string;
+  transVoltage: string;
+  transTime: string;
+  transStirring: string;
+  transCurrent: string;
+  esterState: StageState;
+  transState: StageState;
+  separationState: StageState;
+  transCompletedAt: number | null;
+  separationWaitOver: boolean;
+  purification: PurificationView;
+  heaterConfirmed: boolean;
+  // what already happened by itself, so it isn't done twice (a pump run counted, a dose loaded, ...)
+  accountedRuns: string[];
+  autoPumped: string[];
+  autoStageStarted: string[];
+  autoStarted: boolean;
+  autoSeparation: boolean;
+  // the local demonstration (no backend)
+  localPump: LocalPump | null;
+  localDrain: LocalDrain | null;
+  localPurification: LocalPurification | null;
+};
+
 export default function NewBatch() {
   const t = useT();
   const [step, setStep] = useState(0);
@@ -1121,7 +1179,8 @@ export default function NewBatch() {
   const [saved, setSaved] = useState(false);
   // The Pi refused the batch record: offer to retry, or to keep it in this browser and finish.
   const [saveFailed, setSaveFailed] = useState(false);
-  const { live, backend, mock } = useLiveData();
+  const { live, backend, mock, connecting } = useLiveData();
+  const navigate = useNavigate();
   const [actionError, setActionError] = useState<string | null>(null);
   const [savedBatch, setSavedBatch] = useState<BatchRecord | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
@@ -1129,14 +1188,43 @@ export default function NewBatch() {
   const [processConfigCurrentControl, setProcessConfigCurrentControl] = useState(false);
   // The Pi starts the separation by itself once the reactor has drained (backend setting autoAdvance).
   const [backendAutoAdvance, setBackendAutoAdvance] = useState(true);
+  // ----- one batch at a time -----
+  // The batch in progress when the page opened (null: none; undefined: still checking).
+  const [ongoing, setOngoing] = useState<ActiveBatch | null | undefined>(undefined);
+  // True once that batch has been continued here (or there was none): the page can be used.
+  const [restored, setRestored] = useState(false);
+  // "Start Batch" recorded this batch as In Progress (or it was continued): its progress is saved.
+  const [batchStarted, setBatchStarted] = useState(false);
+  const [resumed, setResumed] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  // The batch was finished or cancelled elsewhere (another device): nothing more is saved for it.
+  const [batchClosed, setBatchClosed] = useState(false);
+  // While continuing a batch, its saved parameters are kept (not replaced by the recommended ones).
+  const restoring = useRef(false);
+  const [restoreCount, setRestoreCount] = useState(0);
 
-  // Batch ID from the backend's naming format (local ID when offline).
+  // The batch in progress, if there is one: this page continues it instead of starting another.
+  // Otherwise the next batch ID from the backend's naming format (local ID when offline).
   useEffect(() => {
     let cancelled = false;
-    getNextBatchId().then((id) => { if (!cancelled) setBatchId(id); }).catch(() => undefined);
+    getActiveBatch()
+      .then(async (active) => {
+        if (!active) {
+          const id = await getNextBatchId().catch(() => null);
+          if (!cancelled && id) setBatchId(id);
+        }
+        if (!cancelled) setOngoing(active);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setActionError(errorText(t, error));
+        setOngoing(null);
+      });
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const chemistrySettings = useMemo(getChemistrySettings, []);
 
@@ -1373,6 +1461,11 @@ export default function NewBatch() {
   const adsorbentName = purification.phase === "ready" ? adsorbent : purification.adsorbent;
   useEffect(() => {
     if (ffaError) return;
+    // A continued batch keeps the parameters it was set up with.
+    if (restoring.current) {
+      restoring.current = false;
+      return;
+    }
     let cancelled = false;
     // Best parameters for this FFA range, from the Raspberry Pi's batch records (local records offline).
     getRecommendedParametersForFfa(ffaNumber)
@@ -1398,6 +1491,10 @@ export default function NewBatch() {
       cancelled = true;
     };
   }, [ffaError, ffaNumber]);
+  // (runs after the effect above: the guard covers only the render that continued the batch)
+  useEffect(() => {
+    restoring.current = false;
+  }, [restoreCount]);
 
   const targetReached =
     !targetError &&
@@ -2004,10 +2101,12 @@ export default function NewBatch() {
     if (!saved) {
       setActionError(null);
       setSaveFailed(false);
+      closedRef.current = true;   // no more progress saves: the batch is being completed
       let result: BatchRecord;
       try {
         result = await saveCompletedBatch(batchRecord());
       } catch (error) {
+        closedRef.current = false;   // still in progress
         setActionError(errorText(t, error));
         setSaveFailed(true);
         return;
@@ -2022,6 +2121,8 @@ export default function NewBatch() {
   function finishInThisBrowser() {
     const record = batchRecord();
     saveBatchInThisBrowser(record as DemoBatch);
+    // the Pi's row must not stay "In Progress" (it would block the next batch)
+    if (backend) markBatchCompleted(batchId).catch(() => undefined);
     setSavedBatch(record as BatchRecord);
     setSaved(true);
     setSaveFailed(false);
@@ -2029,11 +2130,204 @@ export default function NewBatch() {
     next();
   }
 
+  // ----- one batch at a time: continue the batch in progress, save where it is -----
+  /** Puts the page back where the batch in progress was (its saved snapshot). */
+  function applySnapshot(active: ActiveBatch) {
+    setBatchId(active.id);
+    setBatchStarted(true);
+    setResumed(true);
+    const s = active.progress?.state as Partial<ProcessSnapshot> | null | undefined;
+    if (!s || s.version !== 1) {
+      setStep(1);   // started, but nothing saved yet: Volume & Parameters
+      return;
+    }
+    restoring.current = true;
+    setRestoreCount((count) => count + 1);
+    setReactorG(s.reactorG ?? 0);
+    setConfirmedOilG(s.confirmedOilG ?? null);
+    setTargetVolume(s.targetVolume ?? "500");
+    setFfa(s.ffa ?? "");
+    setFfaAboveStrip(s.ffaAboveStrip ?? false);
+    setEsterStage(s.esterStage ?? 1);
+    setEsterRecords(s.esterRecords ?? []);
+    setNextDoseFfa(s.nextDoseFfa ?? null);
+    setRecheckValue(s.recheckValue ?? "");
+    setRecheckAbove(s.recheckAbove ?? false);
+    setFinalFfa(s.finalFfa ?? null);
+    setLoads(s.loads ?? {});
+    setAcetoneBase(s.acetoneBase ?? {});
+    if (s.adsorbent) setAdsorbent(s.adsorbent);
+    if (s.ratio) setRatio(s.ratio);
+    if (s.catalyst) setCatalyst(s.catalyst);
+    if (s.esterVoltage) setEsterVoltage(s.esterVoltage);
+    if (s.esterTime) setEsterTime(s.esterTime);
+    if (s.esterStirring) setEsterStirring(s.esterStirring);
+    if (s.esterCurrent) setEsterCurrent(s.esterCurrent);
+    if (s.transVoltage) setTransVoltage(s.transVoltage);
+    if (s.transTime) setTransTime(s.transTime);
+    if (s.transStirring) setTransStirring(s.transStirring);
+    if (s.transCurrent) setTransCurrent(s.transCurrent);
+    setEsterState(s.esterState ?? "ready");
+    setTransState(s.transState ?? "ready");
+    setSeparationState(s.separationState ?? "ready");
+    setTransCompletedAt(s.transCompletedAt ?? null);
+    setSeparationWaitOver(s.separationWaitOver ?? false);
+    setPurification(s.purification ?? READY_PURIFICATION);
+    setHeaterConfirmed(s.heaterConfirmed ?? false);
+    accountedRuns.current = new Set(s.accountedRuns ?? []);
+    autoPumped.current = new Set(s.autoPumped ?? []);
+    autoStageStarted.current = new Set(s.autoStageStarted ?? []);
+    autoStarted.current = s.autoStarted ?? false;
+    autoSeparation.current = s.autoSeparation ?? false;
+    setLocalPump(s.localPump ?? null);
+    setLocalDrain(s.localDrain ?? null);
+    localPurification.current = s.localPurification ?? null;
+    setStep(Math.max(s.step ?? 1, 1));
+  }
+
+  // Continue the batch in progress once the connection to the backend is known, so the page never
+  // starts a local demonstration of a step the Raspberry Pi is running.
+  useEffect(() => {
+    if (ongoing === undefined || connecting || restored) return;
+    if (ongoing) applySnapshot(ongoing);
+    setRestored(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ongoing, connecting, restored]);
+
+  // A saved step that no longer exists (e.g. the FFA path changed): the last step there is.
+  useEffect(() => {
+    if (step > steps.length - 1) setStep(steps.length - 1);
+  }, [step, steps.length]);
+
+  // The Raspberry Pi goes on by itself while this page is closed (separation once the reactor has
+  // drained, purification after separation): catch up with it when the batch is continued.
+  useEffect(() => {
+    if (!backend || !live || !restored || !batchStarted || saved) return;
+    const separationStep = steps.indexOf("Separation");
+    const purificationStep = steps.indexOf("Purification");
+    const purificationHere =
+      (live.purification.batchId === batchId && live.purification.phase !== "ready") || live.purificationAutoStart === batchId;
+    if (purificationHere && step < purificationStep) {
+      setTransState("complete");
+      setSeparationState("complete");
+      setStep(purificationStep);
+    } else if (live.stage.batchId === batchId && live.stage.stage === "Separation" && step < separationStep) {
+      setTransState("complete");
+      setStep(separationStep);
+    }
+  }, [backend, live, restored, batchStarted, saved, batchId, step, steps]);
+
+  /** "Start Batch": records the batch as In Progress. Refused while another batch is in progress
+   * (only one at a time): then that batch is continued here instead. */
+  async function beginBatch() {
+    setActionError(null);
+    setStarting(true);
+    try {
+      const started = await startBatch(batchId);
+      setBatchId(started.id);
+      setBatchStarted(true);
+      next();
+    } catch (error) {
+      const active = error instanceof ApiError && error.status === 409 ? await getActiveBatch().catch(() => null) : null;
+      if (active) applySnapshot(active);   // started on another device meanwhile
+      else setActionError(errorText(t, error));
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  // The machine is working for this batch: it can't be cancelled until that step is stopped.
+  const machineBusy = backend
+    ? live !== null && (
+      live.stage.state === "running" || live.stage.state === "paused" || live.pump.phase === "pumping" ||
+      live.drain.phase === "waiting" || live.drain.phase === "draining" || PURIFYING.includes(live.purification.phase))
+    : localPump?.phase === "pumping" || localDrain?.phase === "draining" || PURIFYING.includes(purification.phase) ||
+      [esterState, transState, separationState].some((state) => state === "running" || state === "paused");
+  const canCancel = batchStarted && !saved && !batchClosed && currentStage !== "Process Complete";
+
+  /** Cancels the batch in progress (it stays in Batch History as Cancelled); a new one can start. */
+  async function cancelThisBatch() {
+    setConfirmCancel(false);
+    setActionError(null);
+    closedRef.current = true;   // no more progress saves for it
+    try {
+      await cancelBatch(batchId);
+    } catch (error) {
+      closedRef.current = false;
+      setActionError(errorText(t, error));
+      return;
+    }
+    navigate("/dashboard");
+  }
+
+  // Where the batch is, saved every few seconds when something changed, at each new step and when
+  // leaving the page. Live readings that change every second (the load cell, the purification
+  // tank) aren't a reason to save on the Pi: it has them itself when the batch is continued.
+  const persisting = batchStarted && restored && !saved && !batchClosed;
+  const snapshot: ProcessSnapshot = {
+    version: 1, step, stage: currentStage, reactorG, confirmedOilG, targetVolume, ffa, ffaAboveStrip, esterStage,
+    esterRecords, nextDoseFfa, recheckValue, recheckAbove, finalFfa, loads, acetoneBase, adsorbent, ratio, catalyst,
+    esterVoltage, esterTime, esterStirring, esterCurrent, transVoltage, transTime, transStirring, transCurrent,
+    esterState, transState, separationState, transCompletedAt, separationWaitOver, purification, heaterConfirmed,
+    accountedRuns: [...accountedRuns.current], autoPumped: [...autoPumped.current],
+    autoStageStarted: [...autoStageStarted.current], autoStarted: autoStarted.current,
+    autoSeparation: autoSeparation.current, localPump, localDrain, localPurification: localPurification.current,
+  };
+  const changeKey = JSON.stringify(backend ? { ...snapshot, reactorG: 0, purification: purification.phase } : snapshot);
+  const latest = useRef({ batchId, stage: currentStage, snapshot, changeKey, record: {} as Partial<DemoBatch> });
+  latest.current = { batchId, stage: currentStage, snapshot, changeKey, record: batchRecord() };
+  const persistingRef = useRef(false);
+  persistingRef.current = persisting;
+  const closedRef = useRef(false);
+  const lastSaved = useRef("");
+  const saving = useRef<Promise<void>>(Promise.resolve());
+
+  function flushProgress() {
+    const current = latest.current;
+    if (!persistingRef.current || closedRef.current || current.changeKey === lastSaved.current) return;
+    lastSaved.current = current.changeKey;
+    // one save at a time, in order, so an older save never lands after a newer one
+    saving.current = saving.current.then(() =>
+      saveBatchProgress(current.batchId, current.stage, current.snapshot, current.record).catch((error) => {
+        lastSaved.current = "";   // try again at the next save
+        if (isOffline(error) || closedRef.current) return;   // completed or cancelled here meanwhile
+        if (error instanceof ApiError && (error.status === 404 || error.status === 409)) setBatchClosed(true);
+        setActionError(errorText(t, error));
+      }),
+    );
+  }
+
+  useEffect(() => {
+    if (!persisting) return;
+    const timer = window.setInterval(flushProgress, 2000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persisting]);
+  useEffect(() => {
+    flushProgress();   // a new step (or the first one) is saved at once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, persisting]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => flushProgress(), []);   // leaving the page
+
   const p = PROCESS_CONFIG.purification;
   const purifying = PURIFYING.includes(purification.phase);
   const purificationStepIndex = PURIFICATION_STEPS.findIndex(([phase]) => phase === purification.phase);
   const stepLabel = purificationStepIndex >= 0 ? PURIFICATION_STEPS[purificationStepIndex][1] : null;
   const stepText = purification.phase === "magnesol" ? t("Add {adsorbent}", { adsorbent: t(adsorbentName) }) : stepLabel ? t(stepLabel) : "";
+
+  // Nothing can be done before it is known whether a batch is already in progress.
+  if (!restored) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <div className="section-kicker">{t("Production workflow")}</div>
+          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Process")}</Heading>
+        </div>
+        <Card className="p-8 text-center text-sm text-gray-500">{t("Checking for a batch in progress…")}</Card>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -2043,11 +2337,45 @@ export default function NewBatch() {
           <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Process")}</Heading>
           <p className="mt-2 text-sm text-gray-500">{t("Guided electrochemical biodiesel production workflow.")}</p>
         </div>
-        <Status tone={currentStage === "Process Complete" ? "green" : "blue"}>
-          {currentStage === "Process Complete" ? t("Completed") : t(currentStage)}
-        </Status>
+        <div className="flex flex-wrap items-center gap-3">
+          {canCancel && (
+            <Button
+              variant="ghost"
+              className="!py-1.5 text-xs text-red-400"
+              disabled={machineBusy}
+              title={machineBusy ? t("Stop the running step first.") : undefined}
+              onClick={() => setConfirmCancel(true)}
+            >
+              {t("Cancel batch")}
+            </Button>
+          )}
+          <Status tone={currentStage === "Process Complete" ? "green" : "blue"}>
+            {currentStage === "Process Complete" ? t("Completed") : t(currentStage)}
+          </Status>
+        </div>
       </div>
       <Stepper steps={steps} step={step} />
+
+      {resumed && !saved && !batchClosed && (
+        <div className="rounded-xl border border-blue-500/20 bg-blue-500/[0.05] p-4 text-sm text-blue-300" data-testid="resumed">
+          {t("Continuing batch {id}. Only one batch can be processed at a time: finish this one, or cancel it, before starting a new one.", { id: batchId })}
+        </div>
+      )}
+
+      {confirmCancel && (
+        <Dialog
+          title={t("Cancel batch {id}?", { id: batchId })}
+          onClose={() => setConfirmCancel(false)}
+          actions={
+            <>
+              <Button variant="ghost" onClick={() => setConfirmCancel(false)}>{t("Keep the batch")}</Button>
+              <Button variant="danger" onClick={cancelThisBatch}>{t("Cancel batch")}</Button>
+            </>
+          }
+        >
+          {t("The batch stays in Batch History as Cancelled, and a new batch can be started. This can't be undone.")}
+        </Dialog>
+      )}
 
       {actionError && (
         <div role="alert" className="flex items-start justify-between gap-4 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-4 text-sm text-red-300">
@@ -2112,7 +2440,14 @@ export default function NewBatch() {
           </Card>
           <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
             <Link to="/dashboard" className="btn-ghost justify-center">{t("Back to Dashboard")}</Link>
-            <Button onClick={next}>{t("Continue")} →</Button>
+            <div className="flex flex-col items-stretch gap-2 sm:items-end">
+              <Button disabled={starting} onClick={batchStarted ? next : beginBatch}>
+                {batchStarted ? t("Continue") : starting ? t("Starting…") : t("Start Batch")} →
+              </Button>
+              {!batchStarted && (
+                <p className="max-w-sm text-xs text-gray-600 sm:text-right">{t("Starting records the batch as In Progress in Batch History. Only one batch can be processed at a time.")}</p>
+              )}
+            </div>
           </div>
         </div>
       )}

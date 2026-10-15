@@ -3,7 +3,7 @@
 The backend now keeps every batch and the settings in a **MySQL database (`greenova_db`)** instead of the SQLite file `backend/greenova.db`. It uses the tables, keys and relationships of `greenova_db.sql` (your HeidiSQL export). The website did not change: it gets exactly the same data from the API as before.
 
 ```
- Website (browser) ──/api──► FastAPI backend (backend/) ──PyMySQL──► MySQL, database greenova_db (7 tables)
+ Website (browser) ──/api──► FastAPI backend (backend/) ──PyMySQL──► MySQL, database greenova_db (8 tables)
                                app/config.py + backend/.env: your MySQL login
 ```
 
@@ -25,7 +25,7 @@ DB_NAME=greenova_db
 
 (Or skip `.env` and type the password in `backend\app\config.py`, in the "MySQL database" lines near the top. Part 2 explains both.)
 
-**Step 3. Nothing else.** `start-backend.bat` installs the packages (PyMySQL, cryptography), connects, **creates the `greenova_db` database and its 7 tables by itself**, loads the sample batches, and starts the backend at http://localhost:8000. Start the website as before (`npm install` once, then `npm run dev` in `frontend`).
+**Step 3. Nothing else.** `start-backend.bat` installs the packages (PyMySQL, cryptography), connects, **creates the `greenova_db` database and its 8 tables by itself**, loads the sample batches, and starts the backend at http://localhost:8000. Start the website as before (`npm install` once, then `npm run dev` in `frontend`).
 
 If you already made `greenova_db` in HeidiSQL from `greenova_db.sql`, the backend uses those tables. It only adds the 5 settings columns that the export is missing (part 5).
 
@@ -153,7 +153,8 @@ production_batches (PK batch_id)
  ├──< batch_materials        (FK batch_id)          1 : many   one row per material
  ├──o batch_purification     (FK batch_id, UNIQUE)  1 : 0..1   dry wash record
  ├──< batch_timeline         (FK batch_id)          1 : many   events, event_sequence 1, 2, 3 …
- └──< esterification_stages  (FK batch_id)          1 : many   one row per stage number
+ ├──< esterification_stages  (FK batch_id)          1 : many   one row per stage number
+ └──o batch_progress         (FK batch_id, PK)      1 : 0..1   where the batch in progress is on the Process page
 
 settings (PK id = 1)   one row, no relationship
 ```
@@ -203,6 +204,8 @@ A row with another name (e.g. `Water`, typed in HeidiSQL) is kept but not shown 
 
 **`batch_timeline`**: one row per event, `event_sequence` = its place in the timeline (1, 2, 3 …), `event_label` (at most 500 characters; longer texts are cut), `event_time` with microseconds. New events are added as new rows, and the existing rows keep their `event_id`.
 
+**The batch in progress** (only one at a time). "Start Batch" on the Process page inserts its `production_batches` row at once with `batch_status = 'In Progress'`, so Batch History shows it. Every later save of that batch **updates the same row**; completing it never adds a second row with the same `batch_id`. While it runs, the pumps, valves and stages add their events to `batch_timeline` one by one, and the Pi's dry wash record goes into `batch_purification`. It gets no `batch_lab_results` row until it is completed (`Pending`) or cancelled (`Not tested`). **`batch_progress`** holds where the website is: `current_stage` ("Transesterification"), `state_data` (the Process page's own data, JSON) and `updated_at`. It has one row for the batch in progress, updated in place and deleted when the batch is completed or cancelled. The backend creates this table by itself on its next start. Find the ongoing batch with `SELECT batch_id FROM production_batches WHERE batch_status = 'In Progress';`.
+
 **`settings`**: one row, `id = 1`, created with the defaults on the first start. The column names are the website's setting keys (`methanolRemovalTime`, `oilPrice` …). The nested limits are flattened: `methanolRatio.min → methanolRatioMin`, `esterification.voltage.default → esterificationVoltageDefault`, `transesterification.current.max → transesterificationCurrentMax`. Changing a value in HeidiSQL takes effect when the backend restarts; the Settings page saves at once.
 
 ### Rules worth knowing
@@ -248,7 +251,7 @@ Update the ERD or data dictionary in the paper with these 5 columns. The other 6
 | `backend/app/db.py` | **Rewritten for MySQL.** Was: 2 SQLite tables, each batch and the settings stored as one JSON text. Now it uses PyMySQL with a small connection pool and saves each batch in one transaction, spread over the 6 batch tables: child rows are updated in place, and lab results are added as history. Settings are spread over the `settings` columns. On start, `init_db()` creates the database and any missing table from `schema.sql`, adds missing settings columns, checks the columns, and saves the default settings row. Connection problems come back as clear messages (`DatabaseError`). `python -m app.db` checks the connection. |
 | `backend/app/config.py` | **The MySQL login**: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, read from `backend/.env` (a small reader, no extra package) or the defaults. `DB_PATH` replaced by `LEGACY_SQLITE_PATH` (used only by the migration) |
 | `backend/.env.example` | **New.** Template for `backend/.env` (your MySQL login) |
-| `backend/schema.sql` | **New.** The 7 tables (part 5), parents first, runs on MySQL 8 and MariaDB |
+| `backend/schema.sql` | **New.** The 8 tables (part 5), parents first, runs on MySQL 8 and MariaDB |
 | `backend/app/migrate_sqlite.py` | **New.** One-time copy of `greenova.db` into MySQL, with a read-back check |
 | `backend/app/models.py` | Lengths that fit the columns: batch `id` ≤ 50, `labReference` ≤ 100, `systemName` ≤ 150, `operator` ≤ 100, `units` ≤ 20, `format` ≤ 50, `ffaRangeBoundaries` ≤ 100. `date` must be `YYYY-MM-DD` |
 | `backend/app/main.py` | On start: a clear message if MySQL can't be used (the backend then doesn't start). On stop: closes the MySQL connections |

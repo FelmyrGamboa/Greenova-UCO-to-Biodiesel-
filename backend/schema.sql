@@ -1,4 +1,4 @@
--- Greenova MySQL database (greenova_db): the 7 tables the backend uses.
+-- Greenova MySQL database (greenova_db): the 8 tables the backend uses.
 --
 -- Same tables, columns, keys and relationships as greenova_db.sql (the HeidiSQL export), with
 -- three differences so it runs on both MySQL 8 (Windows laptop) and MariaDB 10.11+ (Raspberry Pi):
@@ -141,6 +141,17 @@ CREATE TABLE IF NOT EXISTS `esterification_stages` (
   PRIMARY KEY (`stage_id`),
   UNIQUE KEY `uq_batch_stage` (`batch_id`,`stage_number`),
   CONSTRAINT `fk_esterification_batch` FOREIGN KEY (`batch_id`) REFERENCES `production_batches` (`batch_id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Where an ongoing ("In Progress") batch is on the website's Process page (1 batch : 0 or 1 row),
+-- so the operator can continue it from any device. Removed when the batch is completed or cancelled.
+CREATE TABLE IF NOT EXISTS `batch_progress` (
+  `batch_id` varchar(50) NOT NULL,
+  `current_stage` varchar(50) NOT NULL,
+  `state_data` json NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`batch_id`),
+  CONSTRAINT `fk_progress_batch` FOREIGN KEY (`batch_id`) REFERENCES `production_batches` (`batch_id`) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- The Settings page and process constants: one row, id = 1. Column names are the website's keys.

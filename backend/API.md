@@ -22,11 +22,15 @@ All JSON uses the website's names: the `DemoBatch` fields from `src/lib/greenova
 | POST | `/api/calculate` | `{oilMassG, ffa, methanolRatio?, catalyst}` | Chemical Quantity Calculator (same keys as `calculateQuantityCards`). Above 4% FFA the esterification dose is the uniform dose for `esterificationDesignFfa` (default 10%), whatever the FFA |
 | POST | `/api/calculate/after-esterification` | `{oilMassG, ffaAfter, stageDone, methanolRatio?, catalyst}` | FFA re-check: another stage dosed for `ffaAfter` (40:1), or the exact transesterification amounts |
 | POST | `/api/strip/read` | | FFA strip reader: `{ffa, warnings}` |
-| GET | `/api/batches` | | Batch History (newest first) |
+| GET | `/api/batches` | | Batch History (newest first; the batch in progress has `currentStage`) |
 | GET | `/api/batches/next-id` | | `{id}` from the batch naming format |
+| GET | `/api/batches/active` | | The batch in progress with its `progress` (`{stage, state, updatedAt}`), or `null` |
+| POST | `/api/batches/start` | `{id?}` | "Start Batch": records an In Progress batch. **409** while another batch is in progress or the machine is busy |
+| PUT | `/api/batches/{id}/progress` | `{stage, state, batch?}` | Where the Process page is, so the batch can be continued. **409** when it isn't in progress |
+| POST | `/api/batches/{id}/cancel` | | Cancel the batch in progress (stays in history as Cancelled). **409** while the machine works |
 | GET | `/api/batches/{id}` | | Batch Details |
-| POST | `/api/batches` | DemoBatch fields (`id` and `date` optional) | `saveCompletedBatch` |
-| PATCH | `/api/batches/{id}` | any batch fields | Correct a record |
+| POST | `/api/batches` | DemoBatch fields (`id` and `date` optional) | `saveCompletedBatch` (completes the batch in progress in its own row) |
+| PATCH | `/api/batches/{id}` | any batch fields | Correct a record (a finished batch can't be set back to In Progress) |
 | POST | `/api/batches/{id}/lab-result` | `{labResult: "Passed" or "Failed", labReference?}` | `updateBatchLabResult` |
 | POST | `/api/batches/{id}/esterification-stages` | `{stage, ffaBefore, ffaAfter?, doseFfa?, methanolMl, sulfuricAcidMl, acetoneMl}` | Record an esterification stage (the website sends them all with the batch) |
 | GET | `/api/analytics/summary` | | Summary cards |
@@ -68,6 +72,14 @@ The website saves the batch once, when the operator clicks "Confirm process fini
 The website also sends `ffa` and `ffaAboveStrip` (true = the strip showed its darkest color, so `ffa` is the strip's maximum and the batch counts in the "5% and above" range), `esterificationStages` (each stage's dose and its FFA re-check), `oilMassG` (recorded at oil loading) and the exact `catalystToWeighG`.
 
 Saving the same ID twice returns the saved batch unchanged.
+
+## One batch at a time
+
+Only one batch can be processed at a time:
+
+1. **Start.** "Start Batch" on the Process page calls `POST /api/batches/start`. The batch is saved at once with status `In Progress` (so Batch History shows it), with a "Batch started" timeline event. While it is in progress, `POST /api/batches/start` (and `POST /api/batches` with `status: "In Progress"`) answers **409** "Batch B-2026-004 is still in progress…". It also answers 409 while the machine is still busy (a stage, pump, valve or purification running). MySQL checks this too (a locked read in `db.start_batch`), so two starts at the same moment can't both get in.
+2. **Continue.** The Process page saves where it is (`PUT /api/batches/{id}/progress`) every few seconds and at each new step: its own state, plus the batch's setup so far (oil, FFA, parameters). The Dashboard, Batch History and the Process page read `GET /api/batches/active`, so the batch is continued, from any device, instead of started again. Stages, pumps, valves and purification refuse another `batchId` (409) while a batch is in progress, and what they do is added to the ongoing batch's timeline as it happens.
+3. **Complete or cancel.** `POST /api/batches` with the ongoing batch's ID completes it **in its own row**: it keeps its start time, its timeline and the Pi's purification record, and its progress row is removed. `POST /api/batches/{id}/cancel` marks it `Cancelled` (lab result `Not tested`). Either way a new batch can be started.
 
 ## Example responses
 

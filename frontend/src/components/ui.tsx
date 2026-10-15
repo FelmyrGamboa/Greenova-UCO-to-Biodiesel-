@@ -94,6 +94,11 @@ export function Status({
   );
 }
 
+/** Badge color of a batch status: Completed green, In Progress blue, Cancelled yellow, Failed red. */
+export function batchTone(status: string): "green" | "blue" | "yellow" | "red" {
+  return status === "Completed" ? "green" : status === "In Progress" ? "blue" : status === "Cancelled" ? "yellow" : "red";
+}
+
 export function Metric({
   label,
   value,
@@ -112,6 +117,36 @@ export function Metric({
         {value}
       </div>
       {sub && <div className="mt-1 text-xs text-gray-500">{sub}</div>}
+    </div>
+  );
+}
+
+/** A message on top of the page, with its own buttons (actions). */
+export function Dialog({
+  title,
+  children,
+  actions,
+  onClose,
+}: {
+  title: string;
+  children: ReactNode;
+  actions: ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}
+      onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}
+    >
+      <div className="glass w-full max-w-md rounded-2xl bg-gv-surface p-6">
+        <Heading as="h2" className="text-lg font-semibold">{title}</Heading>
+        <div className="mt-2 text-sm leading-6 text-gray-400">{children}</div>
+        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">{actions}</div>
+      </div>
     </div>
   );
 }

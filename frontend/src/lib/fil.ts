@@ -762,6 +762,30 @@ export const FIL: Record<string, string> = {
   "The centrifuge can't start while its outlet valve is open.": "Hindi maaaring magsimula ang centrifuge habang bukas ang outlet valve nito.",
   "The centrifuge outlet can't open while the centrifuge is spinning.": "Hindi maaaring bumukas ang centrifuge outlet habang umiikot ang centrifuge.",
   "The reactor outlet can't open while a dosing pump is running.": "Hindi maaaring bumukas ang reactor outlet habang tumatakbo ang dosing pump.",
+
+  // ---------- one batch at a time: continue, cancel ----------
+  "A batch is already in progress": "May batch pang isinasagawa",
+  "Continue Process": "Ituloy ang Proseso",
+  "Batch {id} is still being processed ({stage}). Only one batch can be processed at a time: continue it, or cancel it on the Process page, before starting a new one.": "Pinoproseso pa ang batch {id} ({stage}). Isang batch lang ang maaaring iproseso sa bawat pagkakataon: ituloy ito, o kanselahin ito sa pahina ng Proseso, bago magsimula ng bago.",
+  "Waiting for the operator": "Naghihintay sa operator",
+  "{batch} is in progress.": "Isinasagawa ang {batch}.",
+  "The batch is waiting for its next step. Continue it on the Process page: a new batch can't be started until this one is finished or cancelled.": "Naghihintay ang batch sa susunod nitong hakbang. Ituloy ito sa pahina ng Proseso: hindi makapagsisimula ng bagong batch hangga't hindi ito natatapos o nakakansela.",
+  "Starting": "Nagsisimula",
+  "Started {date}": "Sinimulan noong {date}",
+  "This batch is in progress": "Isinasagawa pa ang batch na ito",
+  "Its results are recorded when it is completed. Only one batch can be processed at a time.": "Itatala ang mga resulta nito kapag natapos na. Isang batch lang ang maaaring iproseso sa bawat pagkakataon.",
+  "Production workflow": "Daloy ng produksyon",
+  "Checking for a batch in progress…": "Tinitingnan kung may batch na isinasagawa…",
+  "Stop the running step first.": "Ihinto muna ang tumatakbong hakbang.",
+  "Cancel batch": "Kanselahin ang batch",
+  "Cancel batch {id}?": "Kanselahin ang batch {id}?",
+  "Keep the batch": "Panatilihin ang batch",
+  "The batch stays in Batch History as Cancelled, and a new batch can be started. This can't be undone.": "Mananatili ang batch sa Kasaysayan ng Batch bilang Kinansela, at maaari nang magsimula ng bagong batch. Hindi na ito maibabalik.",
+  "Continuing batch {id}. Only one batch can be processed at a time: finish this one, or cancel it, before starting a new one.": "Itinutuloy ang batch {id}. Isang batch lang ang maaaring iproseso sa bawat pagkakataon: tapusin ito, o kanselahin, bago magsimula ng bago.",
+  "Start Batch": "Simulan ang Batch",
+  "Starting records the batch as In Progress in Batch History. Only one batch can be processed at a time.": "Kapag sinimulan, itatala ang batch bilang Isinasagawa sa Kasaysayan ng Batch. Isang batch lang ang maaaring iproseso sa bawat pagkakataon.",
+  "Batch started": "Sinimulan ang batch",
+  "Batch cancelled": "Kinansela ang batch",
 };
 
 /** Backend messages that contain numbers: the English pattern and its Filipino text ($1 = the number). */
@@ -820,4 +844,11 @@ export const FIL_PATTERNS: Array<[RegExp, string]> = [
   [/^(.+): Use a whole number \(no decimals\)\.$/, "$1: Gumamit ng buong numero (walang decimal)."],
   [/^(.+) must be a whole number \(no decimals\)\.$/, "Dapat buong numero ang $1 (walang decimal)."],
   [/^Separation did not start by itself: (.+)$/, "Hindi kusang nagsimula ang separation: $1"],
+  // one batch at a time
+  [/^Batch (\S+) is still in progress\. Only one batch can be processed at a time: continue it, or cancel it, before starting a new one\.$/, "Isinasagawa pa ang batch $1. Isang batch lang ang maaaring iproseso sa bawat pagkakataon: ituloy ito, o kanselahin, bago magsimula ng bago."],
+  [/^Batch (\S+) is in progress: the machine can only run that batch\. Continue it, or cancel it, first\.$/, "Isinasagawa ang batch $1: iyon lang ang maaaring patakbuhin ng makina. Ituloy ito, o kanselahin muna."],
+  [/^The machine is still busy: (.+)\. Wait for it to finish, or stop it, before starting a new batch\.$/, "Abala pa ang makina: $1. Hintaying matapos ito, o ihinto, bago magsimula ng bagong batch."],
+  [/^Stop the machine first: (.+)\.$/, "Ihinto muna ang makina: $1."],
+  [/^Batch (\S+) is no longer in progress\.$/, "Hindi na isinasagawa ang batch $1."],
+  [/^Batch (\S+) is (\w+): it can't be continued\.$/, "Hindi na maitutuloy ang batch $1 ($2)."],
 ];

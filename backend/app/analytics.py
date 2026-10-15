@@ -149,12 +149,13 @@ def cost_report(batches: list[Batch], s: Settings) -> dict:
 
 def summary(batches: list[Batch]) -> dict:
     completed = [b for b in batches if b.status == "Completed"]
+    finished = [b for b in batches if b.status != "In Progress"]   # the ongoing batch isn't a failure
     tested = [b for b in batches if is_tested(b)]
     passed = [b for b in tested if b.lab_result == "Passed"]
     return {
         "totalBatches": len(batches),
         "completed": len(completed),
-        "completionRate": len(completed) / len(batches) * 100 if batches else 0,
+        "completionRate": len(completed) / len(finished) * 100 if finished else 0,
         "tested": len(tested),
         "passed": len(passed),
         "labPassRate": len(passed) / len(tested) * 100 if tested else None,

@@ -6,11 +6,15 @@
     esterification_stages  one row per esterification stage (the stage's values as JSON)
     batch_timeline         one row per timeline event, in order (event_sequence 1, 2, 3, ...)
     batch_lab_results      lab results of a batch; the newest row is the batch's lab result
+    batch_progress         0 or 1 row per ongoing batch: where the website's Process page is
     settings               one row (id = 1), one column per setting (the website's keys)
 
 The rest of the backend still works with the same Batch and Settings objects (models.py) and
 calls the same functions as before (init_db, get_settings, save_settings, list_batches,
 get_batch, save_batch, next_batch_id): this file turns those objects into rows and back.
+
+Only one batch is "In Progress" at a time: start_batch refuses a second one (ActiveBatchError),
+and every later save of that batch updates its row instead of adding another.
 
 Connection settings: DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME in backend/.env or
 app/config.py (config.DATABASE). Check them with:
@@ -41,9 +45,10 @@ log = logging.getLogger("greenova.db")
 SCHEMA_FILE = config.BASE_DIR / "schema.sql"
 
 BATCH_TABLES = ("production_batches", "batch_lab_results", "batch_materials", "batch_purification",
-                "batch_timeline", "esterification_stages")
+                "batch_timeline", "esterification_stages", "batch_progress")
 TABLES = BATCH_TABLES + ("settings",)
 SETTINGS_ID = 1
+IN_PROGRESS = "In Progress"                    # production_batches.batch_status of the ongoing batch
 
 # Model field -> (material_name, unit) in batch_materials.
 MATERIALS = {
@@ -69,6 +74,15 @@ class DatabaseError(RuntimeError):
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.code = code
+
+
+class ActiveBatchError(RuntimeError):
+    """Another batch is still in progress: only one batch can run at a time."""
+
+    def __init__(self, batch_id: str):
+        super().__init__(f"Batch {batch_id} is still in progress. Only one batch can be processed at a "
+                         "time: continue it, or cancel it, before starting a new one.")
+        self.batch_id = batch_id
 
 
 # ---------------------------------------------------------------- connections
@@ -543,14 +557,33 @@ def _update(cur, table: str, row: dict, where: str, args: tuple) -> None:
                 (*row.values(), *args))
 
 
+def _write_purification(cur, batch_id: str, p: Optional[PurificationRecord]) -> None:
+    """batch_purification: 0 or 1 row per batch (updated in place, never a second row)."""
+    if p is None:
+        cur.execute("DELETE FROM batch_purification WHERE batch_id = %s", (batch_id,))
+        return
+    p_row = _purification_row(p)
+    cur.execute("SELECT purification_id FROM batch_purification WHERE batch_id = %s", (batch_id,))
+    if cur.fetchone():
+        _update(cur, "batch_purification", p_row, "batch_id = %s", (batch_id,))
+    else:
+        _insert(cur, "batch_purification", {"batch_id": batch_id, **p_row})
+
+
+def _lock_batch(cur, batch_id: str) -> Optional[dict]:
+    """Locks the batch row until the transaction ends, so two saves of the same batch (e.g. a
+    timeline event and the purification record) run one after the other instead of mixing their
+    rows. Returns {"batch_status": ...}, or None when there's no such batch."""
+    cur.execute("SELECT batch_status FROM production_batches WHERE batch_id = %s FOR UPDATE", (batch_id,))
+    return cur.fetchone()
+
+
 def _save_batch(cur, b: Batch) -> None:
     if len(b.id) > BATCH_ID_MAX:
         raise ValueError(f"Batch ID {b.id!r} is longer than {BATCH_ID_MAX} characters.")
     row = _batch_row(b)
-    # Lock the batch row first: two saves of the same batch (e.g. a timeline event and the
-    # purification record) then run one after the other instead of mixing their child rows.
-    cur.execute("SELECT batch_id FROM production_batches WHERE batch_id = %s FOR UPDATE", (b.id,))
-    if cur.fetchone():
+    # One row per batch ID: an existing batch (e.g. the ongoing one being completed) is updated.
+    if _lock_batch(cur, b.id):
         if b.created_at is not None:
             row["created_at"] = _local(b.created_at)
         _update(cur, "production_batches", row, "batch_id = %s", (b.id,))
@@ -558,16 +591,7 @@ def _save_batch(cur, b: Batch) -> None:
         row["created_at"] = _local(b.created_at) or datetime.now()
         _insert(cur, "production_batches", {"batch_id": b.id, **row})
 
-    # batch_purification: 0 or 1 row
-    if b.purification is None:
-        cur.execute("DELETE FROM batch_purification WHERE batch_id = %s", (b.id,))
-    else:
-        p_row = _purification_row(b.purification)
-        cur.execute("SELECT purification_id FROM batch_purification WHERE batch_id = %s", (b.id,))
-        if cur.fetchone():
-            _update(cur, "batch_purification", p_row, "batch_id = %s", (b.id,))
-        else:
-            _insert(cur, "batch_purification", {"batch_id": b.id, **p_row})
+    _write_purification(cur, b.id, b.purification)
 
     # batch_materials: the 7 materials the app knows (rows with other names, added by hand, stay)
     names = [name for name, _ in MATERIALS.values()]
@@ -620,20 +644,51 @@ def _save_batch(cur, b: Batch) -> None:
     cur.execute("DELETE FROM batch_timeline WHERE batch_id = %s AND event_sequence > %s", (b.id, len(b.timeline)))
 
     # batch_lab_results: a new row only when the lab result (or its reference) changes, so the
-    # table keeps the history: Pending -> Passed, with tested_at when it was recorded.
-    cur.execute("SELECT result_status, lab_reference FROM batch_lab_results WHERE batch_id = %s "
-                "ORDER BY lab_result_id DESC LIMIT 1", (b.id,))
-    latest = cur.fetchone()
-    current = (b.lab_result, b.lab_reference or None)
-    if latest is None or (_choice(latest["result_status"], LAB_RESULTS), latest["lab_reference"] or None) != current:
-        _insert(cur, "batch_lab_results", {
-            "batch_id": b.id, "result_status": b.lab_result, "lab_reference": b.lab_reference or None,
-            "tested_at": datetime.now() if b.lab_result in TESTED_RESULTS else None})
+    # table keeps the history: Pending -> Passed, with tested_at when it was recorded. An ongoing
+    # batch has no lab result yet: its first row is written when it is completed (or cancelled).
+    if b.status != IN_PROGRESS:
+        cur.execute("SELECT result_status, lab_reference FROM batch_lab_results WHERE batch_id = %s "
+                    "ORDER BY lab_result_id DESC LIMIT 1", (b.id,))
+        latest = cur.fetchone()
+        current = (b.lab_result, b.lab_reference or None)
+        if latest is None or (_choice(latest["result_status"], LAB_RESULTS), latest["lab_reference"] or None) != current:
+            _insert(cur, "batch_lab_results", {
+                "batch_id": b.id, "result_status": b.lab_result, "lab_reference": b.lab_reference or None,
+                "tested_at": datetime.now() if b.lab_result in TESTED_RESULTS else None})
+        # finished (completed, failed or cancelled): nothing left to continue on the Process page
+        cur.execute("DELETE FROM batch_progress WHERE batch_id = %s", (b.id,))
 
 
 def save_batch(b: Batch) -> None:
     """Saves a batch and its child rows in one transaction (a new batch, or an update)."""
     _write(_save_batch, b)
+
+
+def _add_timeline_event(cur, batch_id: str, label: str, moment: datetime) -> bool:
+    if not _lock_batch(cur, batch_id):
+        return False
+    cur.execute("SELECT COALESCE(MAX(event_sequence), 0) AS n FROM batch_timeline WHERE batch_id = %s", (batch_id,))
+    _insert(cur, "batch_timeline", {"batch_id": batch_id, "event_sequence": int(cur.fetchone()["n"]) + 1,
+                                    "event_label": label[:EVENT_LABEL_MAX], "event_time": _local(moment)})
+    return True
+
+
+def add_timeline_event(batch_id: str, label: str, moment: Optional[datetime] = None) -> bool:
+    """Appends one event to a saved batch's timeline (one INSERT, so events added at the same time
+    by the pumps, valves and purification never overwrite each other). False: no such batch."""
+    return _write(_add_timeline_event, batch_id, label, moment or datetime.now())
+
+
+def _set_purification(cur, batch_id: str, p: PurificationRecord) -> bool:
+    if not _lock_batch(cur, batch_id):
+        return False
+    _write_purification(cur, batch_id, p)
+    return True
+
+
+def set_purification(batch_id: str, p: PurificationRecord) -> bool:
+    """Saves only the batch's purification record (its other rows stay as they are)."""
+    return _write(_set_purification, batch_id, p)
 
 
 # ---------------------------------------------------------------- batches: rows -> object
@@ -783,17 +838,107 @@ def get_batch(batch_id: str) -> Optional[Batch]:
     return _batch_from_rows(row, children.get(row["batch_id"]))
 
 
-def next_batch_id(batch_format: str, year: int) -> str:
-    """Next ID for a format like "B-{YEAR}-{SEQ}" (the website's batch naming format)."""
+def _next_batch_id(cur, batch_format: str, year: int) -> str:
     if "{SEQ}" not in batch_format:
         batch_format += "-{SEQ}"
     prefix_format = batch_format.replace("{YEAR}", str(year))
     pattern = re.compile("^" + re.escape(prefix_format).replace(re.escape("{SEQ}"), r"(\d+)") + "$")
-    with transaction() as cur:
-        cur.execute("SELECT batch_id FROM production_batches")
-        ids = [r["batch_id"] for r in cur.fetchall()]
+    cur.execute("SELECT batch_id FROM production_batches")
+    ids = [r["batch_id"] for r in cur.fetchall()]
     numbers = [int(m.group(1)) for i in ids if (m := pattern.match(i))]
     return prefix_format.replace("{SEQ}", f"{max(numbers, default=0) + 1:03d}")
+
+
+def next_batch_id(batch_format: str, year: int) -> str:
+    """Next ID for a format like "B-{YEAR}-{SEQ}" (the website's batch naming format)."""
+    with transaction() as cur:
+        return _next_batch_id(cur, batch_format, year)
+
+
+# ---------------------------------------------------------------- the ongoing batch
+def _active_batch_id(cur, lock: bool = False) -> Optional[str]:
+    cur.execute("SELECT batch_id FROM production_batches WHERE batch_status = %s ORDER BY created_at LIMIT 1"
+                + (" FOR UPDATE" if lock else ""), (IN_PROGRESS,))
+    row = cur.fetchone()
+    return row["batch_id"] if row else None
+
+
+def active_batch_id() -> Optional[str]:
+    """The batch that is "In Progress", or None."""
+    with transaction() as cur:
+        return _active_batch_id(cur)
+
+
+def _start_batch(cur, b: Batch, batch_format: str, year: int) -> Batch:
+    # FOR UPDATE also locks the place where a new "In Progress" row would go, so two batches
+    # started at the same moment can't both get in (the second waits, then sees the first).
+    active = _active_batch_id(cur, lock=True)
+    if active is not None:
+        raise ActiveBatchError(active)
+    cur.execute("SELECT batch_id FROM production_batches WHERE batch_id = %s", (b.id,))
+    if not b.id or cur.fetchone():               # ID already used (or none asked for): take the next one
+        b = b.model_copy(update={"id": _next_batch_id(cur, batch_format, year)})
+    _save_batch(cur, b)
+    return b
+
+
+def start_batch(b: Batch, batch_format: str, year: int) -> Batch:
+    """Saves a new "In Progress" batch, keeping b.id when it is still free (else the next ID).
+    Raises ActiveBatchError when another batch is in progress."""
+    if b.status != IN_PROGRESS:
+        raise ValueError("A started batch is In Progress.")
+    return _write(_start_batch, b, batch_format, year)
+
+
+# production_batches columns the website updates while a batch is in progress (oil, FFA, the
+# chosen parameters). Results (yield, energy, purification, timeline) are written when it ends.
+PROGRESS_COLUMNS = ("oil_volume_ml", "oil_mass_g", "ffa_percent", "ffa_above_strip",
+                    "esterification_run", "esterification_voltage", "esterification_time_seconds",
+                    "esterification_stirring_rpm", "esterification_current_a", "reaction_time_seconds",
+                    "stirring_speed_rpm", "voltage_v", "current_a", "methanol_ratio", "catalyst_type", "adsorbent",
+                    "catalyst_to_weigh_g")
+
+
+def _save_progress(cur, b: Batch, stage: str, state: dict) -> bool:
+    found = _lock_batch(cur, b.id)
+    if not found or found["batch_status"] != IN_PROGRESS:
+        return False                             # finished or cancelled meanwhile: nothing to save
+    row = _batch_row(b)
+    _update(cur, "production_batches", {k: row[k] for k in PROGRESS_COLUMNS}, "batch_id = %s", (b.id,))
+    values = {"current_stage": stage[:50], "state_data": json.dumps(state), "updated_at": datetime.now()}
+    cur.execute("SELECT batch_id FROM batch_progress WHERE batch_id = %s", (b.id,))
+    if cur.fetchone():
+        _update(cur, "batch_progress", values, "batch_id = %s", (b.id,))
+    else:
+        _insert(cur, "batch_progress", {"batch_id": b.id, **values})
+    return True
+
+
+def save_progress(b: Batch, stage: str, state: dict) -> bool:
+    """Saves where the ongoing batch is on the Process page (one row per batch, updated in place)
+    and its setup columns. Only the batch's own row and its batch_progress row change: the
+    timeline and the other rows stay as they are. False: the batch isn't in progress any more."""
+    return _write(_save_progress, b, stage, state)
+
+
+def _progress_from_row(row: dict) -> dict:
+    return {"stage": row["current_stage"], "state": _json(row["state_data"]),
+            "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None}
+
+
+def get_progress(batch_id: str) -> Optional[dict]:
+    """{"stage", "state", "updatedAt"} of an ongoing batch, or None."""
+    with transaction() as cur:
+        cur.execute("SELECT * FROM batch_progress WHERE batch_id = %s", (batch_id,))
+        row = cur.fetchone()
+    return _progress_from_row(row) if row else None
+
+
+def progress_stages() -> dict[str, str]:
+    """The Process page stage of every ongoing batch, by batch ID (for Batch History)."""
+    with transaction() as cur:
+        cur.execute("SELECT batch_id, current_stage FROM batch_progress")
+        return {r["batch_id"]: r["current_stage"] for r in cur.fetchall()}
 
 
 # ---------------------------------------------------------------- python -m app.db

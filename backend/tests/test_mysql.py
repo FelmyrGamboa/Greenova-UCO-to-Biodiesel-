@@ -274,3 +274,64 @@ def test_api_refuses_values_too_long_for_the_columns():
         assert r.status_code == 422 and "labReference" in r.json()["detail"]
         assert client.put("/api/settings", json={"systemName": "S" * 151}).status_code == 400
         assert json.loads(client.get(f"/api/batches/{saved['id']}").text)["id"] == saved["id"]
+
+
+# ---------- the ongoing batch ----------
+def ongoing(batch_id="B-2026-201") -> Batch:
+    return Batch.model_validate({"id": batch_id, "date": "2026-10-15", "oilVolume": 0, "status": "In Progress",
+                                 "timeline": [{"label": "Batch started", "time": "2026-10-15T09:00:00"}]})
+
+
+def test_only_one_batch_can_be_in_progress():
+    started = db.start_batch(ongoing(), "B-{YEAR}-{SEQ}", 2026)
+    assert started.id == "B-2026-201" and db.active_batch_id() == "B-2026-201"
+    with pytest.raises(db.ActiveBatchError) as error:
+        db.start_batch(ongoing("B-2026-202"), "B-{YEAR}-{SEQ}", 2026)
+    assert error.value.batch_id == "B-2026-201"
+    db.save_batch(started.model_copy(update={"status": "Completed"}))
+    # the ID is taken now: the next free one is used
+    assert db.start_batch(ongoing("B-2026-201"), "B-{YEAR}-{SEQ}", 2026).id == "B-2026-202"
+
+
+def test_two_batches_started_at_the_same_moment():
+    """Two starts at the same instant (no lock in the API): MySQL lets exactly one in."""
+    import threading
+
+    barrier, results = threading.Barrier(2), []
+
+    def start(batch_id):
+        barrier.wait()
+        try:
+            results.append(db.start_batch(ongoing(batch_id), "B-{YEAR}-{SEQ}", 2026).id)
+        except db.ActiveBatchError as e:
+            results.append(e)
+
+    threads = [threading.Thread(target=start, args=(f"B-2026-30{i}",)) for i in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sum(isinstance(r, str) for r in results) == 1, results
+    assert rows("SELECT COUNT(*) AS n FROM production_batches WHERE batch_status = 'In Progress'")[0]["n"] == 1
+
+
+def test_timeline_events_are_appended_one_by_one():
+    db.start_batch(ongoing(), "B-{YEAR}-{SEQ}", 2026)
+    assert db.add_timeline_event("B-2026-201", "Pump B loaded 63.5 g")
+    assert db.add_timeline_event("B-2026-201", "Esterification started")
+    assert not db.add_timeline_event("B-NONE", "Lost")
+    events = rows("SELECT event_sequence, event_label FROM batch_timeline ORDER BY event_sequence")
+    assert [(r["event_sequence"], r["event_label"]) for r in events] == [
+        (1, "Batch started"), (2, "Pump B loaded 63.5 g"), (3, "Esterification started")]
+
+
+def test_progress_row_lives_while_the_batch_is_in_progress():
+    b = db.start_batch(ongoing(), "B-{YEAR}-{SEQ}", 2026)
+    assert db.save_progress(b.model_copy(update={"ffa": 3, "oil_volume": 500}), "Oil Loading", {"step": 2})
+    assert db.save_progress(b.model_copy(update={"ffa": 3, "oil_volume": 500}), "Esterification", {"step": 3})
+    assert db.get_progress(b.id)["state"] == {"step": 3} and db.progress_stages() == {b.id: "Esterification"}
+    assert rows("SELECT COUNT(*) AS n FROM batch_progress")[0]["n"] == 1
+    assert db.get_batch(b.id).ffa == 3 and db.get_batch(b.id).timeline[0].label == "Batch started"
+    db.save_batch(db.get_batch(b.id).model_copy(update={"status": "Cancelled"}))
+    assert db.get_progress(b.id) is None
+    assert not db.save_progress(b, "Esterification", {})       # not in progress any more

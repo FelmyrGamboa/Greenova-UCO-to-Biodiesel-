@@ -262,8 +262,50 @@ export function getRecommendedParametersForFfa(ffa: number) {
   };
 }
 
+/** Saves a finished batch. The batch that was in progress is completed in its own entry (never a
+ * second entry with the same ID); any other ID that is already saved stays as it is. */
 export function saveCompletedBatch(batch: DemoBatch) {
   const batches = getBatches();
-  if (batches.some((item) => item.id === batch.id)) return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify([batch, ...batches]));
+  const existing = batches.find((item) => item.id === batch.id);
+  if (existing && existing.status !== "In Progress") return;
+  const next = existing ? batches.map((item) => (item.id === batch.id ? batch : item)) : [batch, ...batches];
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  if (getLocalProgress()?.id === batch.id) setLocalProgress(null);
+}
+
+// ---------- the batch in progress, without the backend ----------
+const PROGRESS_KEY = "greenova_active_process";
+
+/** Where the ongoing batch is on the Process page (same as the backend's batch_progress row). */
+export type LocalProgress = { id: string; stage: string; state: Record<string, unknown> | null; updatedAt: string };
+
+export function getLocalProgress(): LocalProgress | null {
+  try {
+    return JSON.parse(localStorage.getItem(PROGRESS_KEY) || "null") as LocalProgress | null;
+  } catch {
+    return null;
+  }
+}
+
+export function setLocalProgress(progress: LocalProgress | null) {
+  if (progress) localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
+  else localStorage.removeItem(PROGRESS_KEY);
+}
+
+/** Records a new batch as "In Progress", so it shows in Batch History at once. */
+export function startLocalBatch(id: string): DemoBatch {
+  const batch: DemoBatch = {
+    id, date: new Date().toISOString().slice(0, 10), oilVolume: 0, yield: 0, duration: 0, energy: 0,
+    status: "In Progress", labResult: "Pending", ffa: 0, esterificationRun: false, temperature: 0,
+    reactionTime: 0, stirringSpeed: 0,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify([batch, ...getBatches()]));
+  return batch;
+}
+
+/** Changes some fields of a saved batch (in place). */
+export function updateLocalBatch(id: string, changes: Partial<DemoBatch>): DemoBatch | undefined {
+  const batches = getBatches().map((batch) => (batch.id === id ? { ...batch, ...changes } : batch));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(batches));
+  return batches.find((batch) => batch.id === id);
 }

@@ -74,7 +74,7 @@ Run it from the backend folder or from the repo root (`python -m pytest backend`
 | `hardware.example.toml` | Template for `hardware.toml`: the Pi's pins, sensors and calibration |
 | `setup-pi.sh` | One-time setup on the Raspberry Pi |
 | `app/models.py` | Settings and batch fields, with their default values |
-| `app/db.py` | MySQL storage: turns batches and settings into rows of the 7 tables and back; `python -m app.db` checks the connection |
+| `app/db.py` | MySQL storage: turns batches and settings into rows of the 8 tables and back; `python -m app.db` checks the connection |
 | `schema.sql` | The MySQL tables (`greenova_db`): the backend creates any missing one by itself |
 | `.env.example` | Template for `.env`: your MySQL login (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) |
 | `app/migrate_sqlite.py` | One-time copy of an old `greenova.db` (SQLite) into MySQL |

@@ -1,7 +1,9 @@
 """All website endpoints, under /api. Open http://<pi-address>:8000/docs to try them.
 JSON uses the website's camelCase names (see API.md)."""
 import asyncio
+import logging
 import random
+import threading
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -10,15 +12,20 @@ from pydantic import ValidationError
 
 from . import analytics, calculations, config, db, system
 from .hardware import PUMP_LABELS, VALVE_LABELS, InterlockError
-from .models import (AfterEsterificationRequest, Batch, BatchIn, CalculateRequest, DemoAddIn, DemoOilIn,
-                     DrainStart, EsterificationStage, LabResultIn, MotorIn, PumpIn, PumpStart,
-                     PurificationRecord, PurificationStart, Settings, StageStart, SwitchIn, TimelineEvent,
-                     ValveIn)
+from .models import (AfterEsterificationRequest, Batch, BatchIn, BatchStartIn, CalculateRequest, DemoAddIn,
+                     DemoOilIn, DrainStart, EsterificationStage, LabResultIn, MotorIn, ProgressIn, PumpIn,
+                     PumpStart, PurificationRecord, PurificationStart, Settings, StageStart, SwitchIn,
+                     TimelineEvent, ValveIn)
 from . import purification as dry_wash
 from .stages import REACTIONS, StageError
 from .transfers import TransferError
 
 router = APIRouter(prefix="/api")
+log = logging.getLogger("greenova.api")
+
+# Starting, completing and cancelling a batch run one at a time (db.start_batch checks again in
+# MySQL), so two clicks at the same moment can never make two ongoing batches.
+_batch_lock = threading.Lock()
 
 
 # ---------- helpers ----------
@@ -47,16 +54,47 @@ def _live(app) -> dict:
 
 
 def _event(app, batch_id: Optional[str], label: str) -> None:
-    """Adds a line to the batch's timeline (saved batch, or measurements waiting for the save)."""
+    """Adds a line to the batch's timeline (saved or ongoing batch, or measurements waiting for the save)."""
     if not batch_id:
         return
-    event = {"label": label, "time": datetime.now().isoformat()}
-    saved = db.get_batch(batch_id)
-    if saved is not None:
-        saved.timeline.append(TimelineEvent.model_validate(event))
-        db.save_batch(saved)
+    now = datetime.now()
+    try:
+        if db.add_timeline_event(batch_id, label, now):
+            return
+    except Exception:   # MySQL unavailable: keep the event for the save, never stop the machine for it
+        log.exception("Timeline event for batch %s not saved in MySQL", batch_id)
+    _pending(app, batch_id)["timeline"].append({"label": label, "time": now.isoformat()})
+
+
+def _machine_busy(app) -> Optional[str]:
+    """What the machine is doing right now ("Transesterification is running (batch B-2026-004)"),
+    or None when it is idle."""
+    st = app.state
+    if st.stage.active:
+        what, batch_id = f"{st.stage.state['stage']} is {st.stage.state['state']}", st.stage.state["batchId"]
+    elif st.pump.running:
+        what, batch_id = f"{PUMP_LABELS[st.pump.state['pump']]} is loading", st.pump.state["batchId"]
+    elif st.drain.running:
+        what, batch_id = f"the {VALVE_LABELS[st.drain.state['valve']].lower()} is draining", st.drain.state["batchId"]
+    elif st.purification.running:
+        what, batch_id = "purification is running", st.purification.state["batchId"]
     else:
-        _pending(app, batch_id)["timeline"].append(event)
+        return None
+    return f"{what} (batch {batch_id})" if batch_id else what
+
+
+def _check_batch(batch_id: Optional[str]) -> None:
+    """While a batch is in progress, the machine runs only for that batch."""
+    if not batch_id:
+        return
+    try:
+        active = db.active_batch_id()
+    except Exception:   # MySQL unreachable: don't stop the batch for it (a new batch can't start without MySQL)
+        log.exception("Couldn't check the batch in progress")
+        return
+    if active is not None and active != batch_id:
+        raise HTTPException(409, f"Batch {active} is in progress: the machine can only run that batch. "
+                                 "Continue it, or cancel it, first.")
 
 
 async def stop_transfers(app, reason: str) -> None:
@@ -311,9 +349,61 @@ async def read_strip():
 
 
 # ---------- batches ----------
+# Only one batch is processed at a time. "Start batch" on the Process page records it as
+# "In Progress" (so it is in Batch History at once); the page saves where it is (progress), so the
+# batch can be continued from the Dashboard or another device; completing or cancelling it
+# updates the same row. While it is in progress, no other batch can be started.
+def _with_stage(b: Batch, stage: Optional[str] = None) -> dict:
+    """The batch's JSON, plus currentStage (the Process page stage) while it is in progress."""
+    if b.status != db.IN_PROGRESS:
+        return b.dump()
+    if stage is None:
+        progress = db.get_progress(b.id)
+        stage = progress["stage"] if progress else None
+    return b.dump() | {"currentStage": stage}
+
+
+def _active_dump(b: Batch) -> dict:
+    """The ongoing batch with its saved progress ({"stage", "state", "updatedAt"} or null)."""
+    progress = db.get_progress(b.id)
+    return b.dump() | {"currentStage": progress["stage"] if progress else None, "progress": progress}
+
+
+def _start(app, s: Settings, b: Batch) -> dict:
+    """Records b as the batch in progress. 409 when another batch is in progress or the machine
+    is still busy. Starting the ongoing batch again (same ID) just returns it."""
+    with _batch_lock:
+        active = db.active_batch_id()
+        if active is not None:
+            if active == b.id:
+                return _active_dump(db.get_batch(active))
+            raise HTTPException(409, str(db.ActiveBatchError(active)))
+        busy = _machine_busy(app)
+        if busy:
+            raise HTTPException(409, f"The machine is still busy: {busy}. Wait for it to finish, or stop it, "
+                                     "before starting a new batch.")
+        try:
+            started = db.start_batch(b, s.batch_format, date.today().year)
+        except db.ActiveBatchError as e:
+            raise HTTPException(409, str(e))
+        return _active_dump(started)
+
+
+def _finish_ongoing(existing: Batch, b: Batch) -> Batch:
+    """The website completes the batch that was in progress: the same row is updated, keeping what
+    was recorded while it ran (start time, timeline, the Pi's purification record)."""
+    b.created_at = existing.created_at
+    b.timeline = existing.timeline + b.timeline
+    b.notes = b.notes or existing.notes
+    if existing.purification is not None:
+        b.purification = _merge_purification(b.purification, existing.purification.dump())
+    return b
+
+
 @router.get("/batches")
 def list_batches():
-    return [b.dump() for b in db.list_batches()]
+    stages = db.progress_stages()
+    return [_with_stage(b, stages.get(b.id)) for b in db.list_batches()]
 
 
 @router.get("/batches/next-id")
@@ -321,38 +411,112 @@ def next_batch_id(request: Request):
     return {"id": db.next_batch_id(_settings(request).batch_format, date.today().year)}
 
 
+@router.get("/batches/active")
+def active_batch():
+    """The batch in progress, with where the Process page is (progress), or null when there's none."""
+    batch_id = db.active_batch_id()
+    b = db.get_batch(batch_id) if batch_id else None
+    return _active_dump(b) if b else None
+
+
+@router.post("/batches/start", status_code=201)
+def start_batch(request: Request, data: Optional[BatchStartIn] = None):
+    """"Start batch" on the Process page: records a new batch as In Progress. 409 when a batch is
+    already in progress (only one at a time) or the machine is still busy."""
+    now = datetime.now()
+    b = Batch(id=(data.id if data else None) or "", date=date.today().isoformat(), oil_volume=0,
+              status=db.IN_PROGRESS, created_at=now, timeline=[TimelineEvent(label="Batch started", time=now)])
+    return _start(request.app, _settings(request), b)
+
+
 @router.get("/batches/{batch_id}")
 def get_batch(batch_id: str):
-    return _batch_or_404(batch_id).dump()
+    return _with_stage(_batch_or_404(batch_id))
 
 
 @router.post("/batches", status_code=201)
 def save_batch(data: BatchIn, request: Request):
     """Saves a batch (the website's saveCompletedBatch). Missing ID and date are filled in, and
     anything the Pi measured for this batch ID (temperatures, energy, purification, output
-    weight) is added. Saving the same ID twice returns the saved batch unchanged."""
+    weight) is added. The batch in progress is completed in its own row (never a second row for
+    the same ID); saving any other existing ID returns the saved batch unchanged."""
     s = _settings(request)
-    batch_id = data.id or db.next_batch_id(s.batch_format, date.today().year)
-    existing = db.get_batch(batch_id)
-    if existing is not None:
-        return existing.dump()
     oil_volume = data.oil_volume
     if not oil_volume and data.oil_mass_g:
         oil_volume = round(data.oil_mass_g / s.oil_density, 1)
-    fields = data.model_dump(by_alias=True) | {"id": batch_id, "date": data.date or date.today().isoformat(),
+    fields = data.model_dump(by_alias=True) | {"date": data.date or date.today().isoformat(),
                                                "oilVolume": oil_volume or 0,
                                                "createdAt": datetime.now().isoformat()}
-    b = Batch.model_validate(fields)
-    b = _apply_pending(request.app, b, s)
-    b.timeline.append(TimelineEvent(label="Batch saved", time=datetime.now()))
-    b = _fill_batch(b, s)
-    db.save_batch(b)
+    if data.status == db.IN_PROGRESS:            # an ongoing batch: the same rule as "Start batch"
+        b = Batch.model_validate(fields | {"id": data.id or ""})
+        b.timeline.append(TimelineEvent(label="Batch started", time=datetime.now()))
+        return _start(request.app, s, b)
+    with _batch_lock:
+        batch_id = data.id or db.next_batch_id(s.batch_format, date.today().year)
+        existing = db.get_batch(batch_id)
+        if existing is not None and existing.status != db.IN_PROGRESS:
+            return existing.dump()
+        b = Batch.model_validate(fields | {"id": batch_id})
+        if existing is not None:
+            b = _finish_ongoing(existing, b)
+        b = _apply_pending(request.app, b, s)
+        b.timeline.append(TimelineEvent(label="Batch saved", time=datetime.now()))
+        b = _fill_batch(b, s)
+        db.save_batch(b)
+    return b.dump()
+
+
+# Batch fields the Process page sends while the batch is in progress (its setup so far). The
+# results (yield, energy, purification, timeline) are recorded when the batch is completed.
+PROGRESS_FIELDS = ("oilVolume", "oilMassG", "ffa", "ffaAboveStrip", "esterificationRun", "esterificationVoltage",
+                   "esterificationTime", "esterificationStirring", "esterificationCurrent", "reactionTime",
+                   "stirringSpeed", "voltage", "current", "methanolRatio", "catalystType", "adsorbent",
+                   "catalystToWeighG")
+
+
+@router.put("/batches/{batch_id}/progress")
+def save_progress(batch_id: str, data: ProgressIn):
+    """Saves where the ongoing batch is on the Process page (and its setup so far), so it can be
+    continued later or on another device. 409 when the batch isn't in progress."""
+    b = _batch_or_404(batch_id)
+    if b.status != db.IN_PROGRESS:
+        raise HTTPException(409, f"Batch {batch_id} is {b.status.lower()}: it can't be continued.")
+    setup = {k: v for k, v in (data.batch or {}).items() if k in PROGRESS_FIELDS}
+    try:
+        b = Batch.model_validate(b.dump() | setup)
+    except ValidationError as e:
+        raise HTTPException(400, _validation_message(e))
+    if not db.save_progress(b, data.stage, data.state):
+        raise HTTPException(409, f"Batch {batch_id} is no longer in progress.")
+    return {"id": batch_id, "stage": data.stage}
+
+
+@router.post("/batches/{batch_id}/cancel")
+def cancel_batch(batch_id: str, request: Request):
+    """Cancels the batch in progress. It stays in Batch History as Cancelled (lab result: Not
+    tested), and a new batch can be started. 409 while the machine is still working."""
+    app = request.app
+    with _batch_lock:
+        b = _batch_or_404(batch_id)
+        if b.status != db.IN_PROGRESS:
+            raise HTTPException(409, f"Only a batch in progress can be cancelled: {batch_id} is {b.status.lower()}.")
+        busy = _machine_busy(app)
+        if busy:
+            raise HTTPException(409, f"Stop the machine first: {busy}.")
+        b = Batch.model_validate(b.dump() | {"status": "Cancelled"})
+        b = _apply_pending(app, b, _settings(request))     # keep what the Pi recorded before the cancel
+        b.timeline.append(TimelineEvent(label="Batch cancelled", time=datetime.now()))
+        db.save_batch(b)
+    if getattr(app.state, "purification_armed", None) == batch_id:
+        app.state.purification_armed = None
     return b.dump()
 
 
 @router.patch("/batches/{batch_id}")
 def update_batch(batch_id: str, request: Request, updates: dict[str, Any] = Body(...)):
     b = _batch_or_404(batch_id)
+    if updates.get("status") == db.IN_PROGRESS and b.status != db.IN_PROGRESS:
+        raise HTTPException(409, "A finished batch can't be put back in progress. Start a new batch instead.")
     merged = b.dump() | {k: v for k, v in updates.items() if k != "id"}
     try:
         b = Batch.model_validate(merged)
@@ -475,7 +639,7 @@ def _after_stage(app, valve: str, batch_id: Optional[str]) -> None:
 def _stage_event(app):
     def record(label: str, st: dict) -> None:
         rec = _pending(app, st["batchId"])
-        rec["timeline"].append({"label": label, "time": datetime.now().isoformat()})
+        _event(app, st["batchId"], label)
         if st["stage"] in REACTIONS and st.get("faultReason") and "current" in st["faultReason"]:
             app.state.alarm = f"Electrodes stopped: {st['faultReason']}."
         if label == "Transesterification completed":
@@ -497,6 +661,7 @@ def stage_state(request: Request):
 @router.post("/process/stage/start")
 async def start_stage(data: StageStart, request: Request):
     app = request.app
+    await asyncio.to_thread(_check_batch, data.batch_id)
     if app.state.purification.running:
         raise HTTPException(409, "Purification is running.")
     if app.state.pump.running:
@@ -550,6 +715,7 @@ async def start_pump(data: PumpStart, request: Request):
     """"Load": pump A (NaOH/KOH + methanol) or pump B (H2SO4 + methanol) adds one premixed dose
     to the reactor and stops when the reactor load cell has gained targetG."""
     app, s = request.app, _settings(request)
+    await asyncio.to_thread(_check_batch, data.batch_id)
     if app.state.stage.active:
         raise HTTPException(409, f"{app.state.stage.state['stage']} is running. Load before starting the stage.")
     if app.state.drain.running and app.state.drain.state["valve"] == "reactor_outlet":
@@ -599,6 +765,7 @@ async def start_drain_again(data: DrainStart, request: Request):
     """Opens the reactor or centrifuge outlet again for its drain time (it opens by itself after
     transesterification and separation)."""
     app = request.app
+    await asyncio.to_thread(_check_batch, data.batch_id)
     if app.state.stage.active:
         raise HTTPException(409, f"{app.state.stage.state['stage']} is running.")
     if app.state.pump.running:
@@ -652,16 +819,23 @@ def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: boo
     def save_record(record: dict) -> None:
         if not batch_id:
             return
-        saved = db.get_batch(batch_id)
-        if saved is not None:   # batch already saved: update it directly
-            saved.purification = PurificationRecord.model_validate(record)
-            db.save_batch(_fill_batch(saved, s))
-        else:
-            rec = _pending(app, batch_id)
-            rec["purification"] = record
-            rec["timeline"].append({"label": "Purification completed" if not record["safetyStopOccurred"]
-                                    else f"Purification stopped ({record['safetyStopReason']})",
-                                    "time": datetime.now().isoformat()})
+        label = ("Purification completed" if not record["safetyStopOccurred"]
+                 else f"Purification stopped ({record['safetyStopReason']})")
+        try:
+            saved = db.get_batch(batch_id)
+            if saved is not None and saved.status == db.IN_PROGRESS:   # kept for when the website completes it
+                db.set_purification(batch_id, PurificationRecord.model_validate(record))
+                db.add_timeline_event(batch_id, label)
+                return
+            if saved is not None:   # batch already saved: update it directly
+                saved.purification = PurificationRecord.model_validate(record)
+                db.save_batch(_fill_batch(saved, s))
+                return
+        except Exception:   # MySQL unavailable: keep the record for the save
+            log.exception("Purification record for batch %s not saved in MySQL", batch_id)
+        rec = _pending(app, batch_id)
+        rec["purification"] = record
+        rec["timeline"].append({"label": label, "time": datetime.now().isoformat()})
 
     volume = _oil_volume_ml(app, s, batch_id, oil_volume_ml)
     chosen = adsorbent or (app.state.records.get(batch_id, {}).get("adsorbent") if batch_id else None) \
@@ -672,10 +846,7 @@ def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: boo
                                  magnesol_g=calculations.adsorbent_g(volume, chosen, s) if volume else None,
                                  automatic=automatic, adsorbent=chosen)
     app.state.purification_armed = None
-    if batch_id:
-        _pending(app, batch_id)["timeline"].append(
-            {"label": "Purification started automatically" if automatic else "Purification started",
-             "time": datetime.now().isoformat()})
+    _event(app, batch_id, "Purification started automatically" if automatic else "Purification started")
 
 
 def auto_start_purification(app) -> None:
@@ -701,6 +872,7 @@ def auto_start_purification(app) -> None:
 @router.post("/process/purification/start")
 async def start_purification(data: PurificationStart, request: Request):
     app, s = request.app, _settings(request)
+    await asyncio.to_thread(_check_batch, data.batch_id)
     level = app.state.hw.read().get("heaterSubmerged")
     if level is False:
         raise HTTPException(409, "The level switch doesn't detect biodiesel at the heater.")

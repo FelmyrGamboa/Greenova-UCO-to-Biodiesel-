@@ -361,3 +361,123 @@ def test_bentonite_batch(client):
     assert saved["adsorbent"] == "Bentonite" and saved["purification"]["adsorbent"] == "Bentonite"
     assert saved["materials"]["bentoniteKg"] == 0.0092 and saved["materials"]["magnesolKg"] == 0
     assert "Bentonite added (9.2 g)" in [e["label"] for e in saved["timeline"]]
+
+
+# ---------- one batch at a time: start, continue, complete, cancel ----------
+def _count(sql, *args):
+    from app import db
+    with db.transaction() as cur:
+        cur.execute(sql, args)
+        return cur.fetchone()["n"]
+
+
+def test_only_one_batch_in_progress(client):
+    assert client.get("/api/batches/active").json() is None
+    preview = client.get("/api/batches/next-id").json()["id"]
+    r = client.post("/api/batches/start", json={"id": preview})
+    assert r.status_code == 201
+    b = r.json()
+    assert b["id"] == preview and b["status"] == "In Progress" and b["progress"] is None
+    assert [e["label"] for e in b["timeline"]] == ["Batch started"]
+    # it is in Batch History at once, and the next ID moves on
+    listed = client.get("/api/batches").json()
+    assert [(x["id"], x["status"]) for x in listed] == [(preview, "In Progress")]
+    assert client.get("/api/batches/next-id").json()["id"] != preview
+    # a second batch is refused; starting the same one again just returns it
+    r = client.post("/api/batches/start", json={})
+    assert r.status_code == 409 and f"Batch {preview} is still in progress" in r.json()["detail"]
+    r = client.post("/api/batches", json={"oilVolume": 500, "status": "In Progress"})
+    assert r.status_code == 409
+    assert client.post("/api/batches/start", json={"id": preview}).json()["id"] == preview
+    assert client.get("/api/batches/active").json()["id"] == preview
+    assert _count("SELECT COUNT(*) AS n FROM production_batches") == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_lab_results") == 0   # no lab result while it runs
+    # the analytics don't count it as an unfinished (failed) batch
+    assert client.get("/api/analytics/summary").json()["completionRate"] == 0
+
+
+def test_progress_is_saved_for_continuing(client):
+    b = client.post("/api/batches/start").json()["id"]
+    state = {"version": 1, "step": 3, "ffa": "4", "loads": {"Esterification 1": {"completedG": 63.5}}}
+    r = client.put(f"/api/batches/{b}/progress", json={
+        "stage": "Esterification", "state": state,
+        "batch": {"oilVolume": 500, "oilMassG": 460, "ffa": 4, "esterificationRun": True, "catalystType": "KOH",
+                  "yield": 99, "status": "Completed", "labResult": "Passed"}})   # results are ignored
+    assert r.status_code == 200
+    active = client.get("/api/batches/active").json()
+    assert active["progress"]["stage"] == "Esterification" and active["progress"]["state"] == state
+    assert active["currentStage"] == "Esterification"
+    assert (active["oilVolume"], active["ffa"], active["catalystType"]) == (500, 4, "KOH")
+    assert (active["status"], active["yield"], active["labResult"]) == ("In Progress", 0, "Pending")
+    assert client.get("/api/batches").json()[0]["currentStage"] == "Esterification"
+    # saved again: the same progress row is updated
+    client.put(f"/api/batches/{b}/progress", json={"stage": "Transesterification", "state": {"step": 4}})
+    assert _count("SELECT COUNT(*) AS n FROM batch_progress") == 1
+    assert client.get(f"/api/batches/{b}").json()["currentStage"] == "Transesterification"
+    assert client.put("/api/batches/B-NONE/progress", json={"stage": "Oil Loading"}).status_code == 404
+
+
+def test_completing_the_ongoing_batch_updates_its_row(client):
+    b = client.post("/api/batches/start").json()["id"]
+    client.put(f"/api/batches/{b}/progress", json={"stage": "Separation", "state": {}})
+    # what the machine does is written to the ongoing batch's timeline as it happens
+    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b})
+    client.post("/api/process/stage/complete")
+    labels = [e["label"] for e in client.get(f"/api/batches/{b}").json()["timeline"]]
+    assert labels[:3] == ["Batch started", "Separation started", "Separation completed"]
+    client.post("/api/process/drain/stop")
+    client.post("/api/process/stage/reset")
+
+    saved = client.post("/api/batches", json={"id": b, "oilVolume": 500, "ffa": 1, "status": "Completed",
+                                              "biodieselOutputMl": 440, "reactionTime": 120}).json()
+    assert saved["status"] == "Completed" and saved["yield"] == 88.0 and saved["labResult"] == "Pending"
+    labels = [e["label"] for e in saved["timeline"]]
+    assert labels[0] == "Batch started" and labels[-1] == "Batch saved" and "Separation completed" in labels
+    # one row for the batch, one lab result row, no progress left; nothing is ongoing any more
+    assert _count("SELECT COUNT(*) AS n FROM production_batches WHERE batch_id = %s", b) == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_lab_results WHERE batch_id = %s", b) == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_progress") == 0
+    assert client.get("/api/batches/active").json() is None
+    assert "currentStage" not in client.get(f"/api/batches/{b}").json()
+    # saving it again changes nothing, and it can't be continued any more
+    again = client.post("/api/batches", json={"id": b, "oilVolume": 999, "status": "Completed"}).json()
+    assert again["oilVolume"] == 500 and len(again["timeline"]) == len(saved["timeline"])
+    assert client.put(f"/api/batches/{b}/progress", json={"stage": "Separation"}).status_code == 409
+    assert client.patch(f"/api/batches/{b}", json={"status": "In Progress"}).status_code == 409
+    # and the next batch can start
+    assert client.post("/api/batches/start").status_code == 201
+
+
+def test_cancel_the_ongoing_batch(client):
+    b = client.post("/api/batches/start").json()["id"]
+    cancelled = client.post(f"/api/batches/{b}/cancel").json()
+    assert cancelled["status"] == "Cancelled" and cancelled["labResult"] == "Not tested"
+    assert cancelled["timeline"][-1]["label"] == "Batch cancelled"
+    assert client.get("/api/batches/active").json() is None
+    assert client.post(f"/api/batches/{b}/cancel").status_code == 409
+    assert client.put(f"/api/batches/{b}/progress", json={"stage": "Oil Loading"}).status_code == 409
+    nxt = client.post("/api/batches/start").json()
+    assert nxt["id"] != b and nxt["status"] == "In Progress"
+    statuses = {x["id"]: x["status"] for x in client.get("/api/batches").json()}
+    assert statuses == {b: "Cancelled", nxt["id"]: "In Progress"}
+
+
+def test_the_machine_runs_only_the_ongoing_batch(client):
+    b = client.post("/api/batches/start").json()["id"]
+    r = client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-OTHER"})
+    assert r.status_code == 409 and f"Batch {b} is in progress" in r.json()["detail"]
+    r = client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 10, "volumeMl": 10, "batchId": "B-OTHER"})
+    assert r.status_code == 409
+    assert client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b}).status_code == 200
+    r = client.post(f"/api/batches/{b}/cancel")                   # not while it runs
+    assert r.status_code == 409 and "Separation is running" in r.json()["detail"]
+    client.post("/api/control/all-off")
+    assert client.post(f"/api/batches/{b}/cancel").status_code == 200
+
+
+def test_no_new_batch_while_the_machine_is_busy(client):
+    client.post("/api/process/stage/start", json={"stage": "Separation"})   # running without a batch
+    r = client.post("/api/batches/start")
+    assert r.status_code == 409 and "machine is still busy" in r.json()["detail"]
+    client.post("/api/control/all-off")
+    assert client.post("/api/batches/start").status_code == 201

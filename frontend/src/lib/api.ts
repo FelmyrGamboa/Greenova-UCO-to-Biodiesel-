@@ -49,7 +49,15 @@ export type BatchRecord = DemoBatch & {
   timeline?: Array<{ label: string; time: string }>;
   notes?: string | null;
   createdAt?: string | null;
+  /** While the batch is in progress: the Process page stage it is at ("Transesterification"). */
+  currentStage?: string | null;
 };
+
+/** Where the ongoing batch is on the Process page. state is the page's own data, for continuing. */
+export type BatchProgress = { stage: string; state: Record<string, unknown> | null; updatedAt: string | null };
+
+/** The batch in progress. Only one batch can be processed at a time. */
+export type ActiveBatch = BatchRecord & { progress: BatchProgress | null };
 
 export type RecommendedParameters = NonNullable<ReturnType<typeof local.getRecommendedParametersForFfa>>;
 
@@ -436,8 +444,16 @@ async function withLocalFallback<T>(remote: () => Promise<T>, fallback: () => T)
 }
 
 // ---------- same functions as greenovaData.ts ----------
+/** This browser's batches, with the Process page stage of the one in progress. */
+function localBatches(): BatchRecord[] {
+  const progress = local.getLocalProgress();
+  return local.getBatches().map((batch) =>
+    batch.status === "In Progress" ? { ...batch, currentStage: progress?.id === batch.id ? progress.stage : null } : batch,
+  );
+}
+
 export function getBatches(): Promise<BatchRecord[]> {
-  return withLocalFallback(() => get<BatchRecord[]>("/api/batches"), () => local.getBatches());
+  return withLocalFallback(() => get<BatchRecord[]>("/api/batches"), localBatches);
 }
 
 export function getBatch(id: string): Promise<BatchRecord | undefined> {
@@ -473,16 +489,127 @@ export function getRecommendedParametersForFfa(ffa: number): Promise<Recommended
   );
 }
 
+function localBatchId(): string {
+  return `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`;
+}
+
 export function getNextBatchId(): Promise<string> {
+  return withLocalFallback(async () => (await get<{ id: string }>("/api/batches/next-id")).id, localBatchId);
+}
+
+// ---------- the batch in progress (only one at a time) ----------
+/** Batch fields the Process page saves while the batch runs (its setup so far, not its results). */
+const PROGRESS_FIELDS = [
+  "oilVolume", "oilMassG", "ffa", "ffaAboveStrip", "esterificationRun", "esterificationVoltage", "esterificationTime",
+  "esterificationStirring", "esterificationCurrent", "reactionTime", "stirringSpeed", "voltage", "current",
+  "methanolRatio", "catalystType", "adsorbent", "catalystToWeighG",
+] as const;
+
+function activeMessage(id: string) {
+  return `Batch ${id} is still in progress. Only one batch can be processed at a time: continue it, or cancel it, before starting a new one.`;
+}
+
+function localActiveBatch(): ActiveBatch | null {
+  const batch = localBatches().find((item) => item.status === "In Progress");
+  if (!batch) return null;
+  const progress = local.getLocalProgress();
+  const own = progress?.id === batch.id ? progress : null;
+  return { ...batch, progress: own ? { stage: own.stage, state: own.state, updatedAt: own.updatedAt } : null };
+}
+
+/** The batch in progress, with where the Process page is, or null when no batch is running. */
+export function getActiveBatch(): Promise<ActiveBatch | null> {
+  return withLocalFallback(() => get<ActiveBatch | null>("/api/batches/active"), localActiveBatch);
+}
+
+/** "Start batch": records the batch as In Progress (shown in Batch History at once). Fails with
+ * 409 while another batch is in progress: only one batch can be processed at a time. */
+export function startBatch(id?: string): Promise<ActiveBatch> {
   return withLocalFallback(
-    async () => (await get<{ id: string }>("/api/batches/next-id")).id,
-    () => `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`,
+    () => send<ActiveBatch>("POST", "/api/batches/start", { id }),
+    () => {
+      const active = localActiveBatch();
+      if (active && active.id === id) return active;
+      if (active) throw new ApiError(409, activeMessage(active.id));
+      const taken = new Set(local.getBatches().map((batch) => batch.id));
+      let batchId = id && !taken.has(id) ? id : localBatchId();
+      while (taken.has(batchId)) batchId = `${batchId}-1`;
+      return { ...local.startLocalBatch(batchId), currentStage: null, progress: null };
+    },
   );
+}
+
+/** Saves where the ongoing batch is (stage + the page's state) and its setup so far, so it can be
+ * continued later, from the Dashboard or on another device. */
+/** Offline: the batch in progress in this browser, or (when it is the Pi's batch) the offline
+ * error again, so the page tries later instead of losing the batch. */
+function localOngoing(id: string, offline: unknown) {
+  const current = local.getBatches().find((item) => item.id === id && item.status === "In Progress");
+  if (!current) throw offline;
+  return current;
+}
+
+export async function saveBatchProgress(id: string, stage: string, state: Record<string, unknown>, batch?: Partial<DemoBatch>): Promise<void> {
+  try {
+    await send("PUT", `/api/batches/${encodeURIComponent(id)}/progress`, { stage, state, batch });
+  } catch (error) {
+    if (!isOffline(error)) throw error;
+    localOngoing(id, error);
+    const setup = Object.fromEntries(PROGRESS_FIELDS.filter((key) => batch?.[key] !== undefined).map((key) => [key, batch?.[key]]));
+    local.updateLocalBatch(id, setup as Partial<DemoBatch>);
+    local.setLocalProgress({ id, stage, state, updatedAt: new Date().toISOString() });
+  }
+}
+
+/** Cancels the batch in progress (it stays in Batch History as Cancelled). */
+export async function cancelBatch(id: string): Promise<BatchRecord> {
+  try {
+    return await send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/cancel`);
+  } catch (error) {
+    if (!isOffline(error)) throw error;
+    localOngoing(id, error);
+    local.setLocalProgress(null);
+    return local.updateLocalBatch(id, { status: "Cancelled", labResult: "Not tested" }) as BatchRecord;
+  }
+}
+
+/** Marks the ongoing batch Completed on the backend without its full record (used when the Pi
+ * refused the record and the operator kept it in this browser), so it doesn't stay "In Progress". */
+export function markBatchCompleted(id: string): Promise<BatchRecord> {
+  return send<BatchRecord>("PATCH", `/api/batches/${encodeURIComponent(id)}`, { status: "Completed" });
+}
+
+/** The batch in progress for a page, checked again every few seconds (another device may start,
+ * finish or cancel it). */
+export function useActiveBatch(refreshMs = 4000): { active: ActiveBatch | null; loaded: boolean } {
+  const [active, setActive] = useState<ActiveBatch | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let stopped = false;
+    const load = () =>
+      getActiveBatch()
+        .then((found) => {
+          if (!stopped) setActive(found);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (!stopped) setLoaded(true);
+        });
+    load();
+    const timer = window.setInterval(load, refreshMs);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [refreshMs]);
+
+  return { active, loaded };
 }
 
 /** Batches for a page: shows the local data at once, then the backend's when it answers. */
 export function useBatches(): { batches: BatchRecord[]; source: "backend" | "local"; reload: () => void } {
-  const [batches, setBatches] = useState<BatchRecord[]>(() => local.getBatches());
+  const [batches, setBatches] = useState<BatchRecord[]>(localBatches);
   const [source, setSource] = useState<"backend" | "local">("local");
   const [version, setVersion] = useState(0);
 
@@ -496,7 +623,7 @@ export function useBatches(): { batches: BatchRecord[]; source: "backend" | "loc
       })
       .catch(() => {
         if (cancelled) return;
-        setBatches(local.getBatches());
+        setBatches(localBatches());
         setSource("local");
       });
     return () => {
