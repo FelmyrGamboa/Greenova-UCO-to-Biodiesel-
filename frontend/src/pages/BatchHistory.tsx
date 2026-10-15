@@ -287,7 +287,7 @@ export default function BatchHistory() {
                     </tr>
                   ))) : (
                     <tr>
-                      <td colSpan={5} className="py-12 text-center">
+                      <td colSpan={10} className="py-12 text-center">
                         <div className="flex flex-col items-center gap-2">
                           <p className="text-sm font-medium text-gray-400">
                             {t("No batch records yet")}
