@@ -1,0 +1,9 @@
+# Files of ../backend that stay out of the backend image.
+.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+*.db
+frontend/dist/
+# The laptop's MySQL login: Docker uses the DB_* values in docker-compose.yaml instead.
+.env
