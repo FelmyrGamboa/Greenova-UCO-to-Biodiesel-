@@ -1,0 +1,9 @@
+# Files of ../frontend that stay out of the website image.
+# node_modules from Windows has Windows-only native parts (Vite, Tailwind): the image installs its own.
+node_modules/
+dist/
+build/
+.cache/
+.vite/
+*.log
+.env*
