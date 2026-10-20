@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.db
+frontend/dist/
+# your MySQL password (copy .env.example to .env)
+.env
+!.env.example

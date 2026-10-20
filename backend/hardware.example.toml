@@ -1,0 +1,154 @@
+# Actuator controller. ESP32 is the Cirkit Oct 16 wiring; gpio preserves the older Pi-GPIO wiring.
+[actuators]
+backend = "esp32"
+port = "/dev/ttyUSB0"
+baudrate = 115200
+
+[leds]
+# Raspberry Pi GPIO BCM numbers for the status LEDs.
+green = 17
+red = 27
+
+[separation]
+spin_up_seconds = 15
+stable_grams = 20
+stable_seconds = 60
+
+[purification]
+heating_timeout_minutes = 25
+# No drain time limit: the drain ends when the output load cell is stable for 30 s.
+
+# Greenova hardware configuration for the Raspberry Pi
+# -----------------------------------------------------
+# Copy this file to hardware.toml (setup-pi.sh does it) and change it to match your wiring.
+# This is the ONLY file you need to edit for pins, sensors and calibration.
+#
+# * Pin numbers are BCM GPIO numbers (GPIO17 = physical pin 11), not physical pin numbers.
+#   Run  pinout  on the Pi to see the header.
+# * Taken already: GPIO2/GPIO3 (I2C: strip reader, power monitor), GPIO4 (1-Wire temperature
+#   probe), GPIO17 (strip reader LED).
+# * After a change: .venv/bin/python -m app.hwtest check   (shows pin conflicts)
+#   then:          sudo systemctl restart greenova
+# * Full guide with wiring diagrams: docs/RASPBERRY_PI_SETUP.md
+
+# GPIO chip. Leave it out to let the backend find it (Pi 4: 0, Pi 5: 4 on older kernels, 0 on newer).
+# gpiochip = 0
+
+[relays]
+# Many relay boards switch ON when their input is LOW ("active low", often marked "low level trigger").
+# For those set active_high = false. Test with the heater unplugged: if a relay clicks ON when the
+# backend starts, this setting is wrong.
+active_high = true
+heater = 23              # immersion heater in the purification tank (through a contactor/SSR rated for it)
+electrode_power = 25     # DC power supply output to the graphite electrodes
+
+[pumps]
+# Peristaltic or diaphragm dosing pumps, each switched by a relay or a logic-level MOSFET. ON = pumping.
+catalyst = 5             # pump A: NaOH/KOH dissolved in methanol
+acid = 6                 # pump B: H2SO4 stirred into methanol
+
+[valves]
+# mode = "single": one relay per valve, relay ON = valve open
+#                  (2-wire normally-closed solenoid valve, or a spring-return motorized valve).
+# mode = "dual":   3-wire motorized ball valve (e.g. CR03 wiring): open_pin powers the OPEN wire,
+#                  close_pin powers the CLOSE wire. The valve's own end switches stop the motor.
+#   example: reactor_outlet = { mode = "dual", open_pin = 16, close_pin = 8 }
+reactor_outlet = { mode = "single", pin = 16 }       # reactor -> centrifuge (after transesterification)
+centrifuge_outlet = { mode = "single", pin = 20 }    # centrifuge -> purification tank (after separation)
+purification_outlet = { mode = "single", pin = 24 }  # purification tank -> filter -> output container
+
+[motors]
+# type = "pwm": DC motor driver or MOSFET with a PWM input (duty 0-100 %). frequency in Hz.
+# type = "esc": brushless motor ESC (1.0 ms = stop ... 2.0 ms = full, 50 Hz). Arm and test it
+#               with the rotor/blades removed first.
+# Speeds are set open-loop: PWM = target RPM / max RPM (Settings: stirrerMaxRpm, centrifugeMaxRpm,
+# purificationStirrerMaxRpm in the backend settings).
+stirrer = { type = "pwm", pin = 18, frequency = 1000 }               # reactor stirrer
+centrifuge = { type = "pwm", pin = 13, frequency = 1000 }
+purification_stirrer = { type = "pwm", pin = 12, frequency = 1000 }  # dry wash stirrer
+
+[level_switch]
+# Float switch at the heater's height in the purification tank, wired between the pin and GND
+# (the Pi's pull-up is used). With it, purification starts by itself after separation and the
+# heater stops if the level drops. Without it (enabled = false), the operator ticks
+# "the heater is fully submerged" on the website.
+enabled = false
+pin = 26
+closed_means_liquid = true   # false if your switch opens when it floats up
+
+[temperature]
+# type = "ds18b20": waterproof DS18B20 probe on 1-Wire (GPIO4, 4.7 kΩ pull-up to 3.3 V).
+#                   Enable 1-Wire: sudo raspi-config -> Interface Options -> 1-Wire (setup-pi.sh does it).
+# type = "none":    no probe (the heater and the electrodes will NOT switch on: no temperature = fault).
+type = "ds18b20"
+sensor_id = ""       # "28-0123456789ab" to pick one probe if several are connected ("" = the first one)
+
+[load_cells.reactor]
+# HX711 board under the main reactor: weighs the oil, the acetone poured in and the pump doses.
+# Wiring: HX711 VCC -> 3.3 V (not 5 V: the Pi's pins are 3.3 V), GND -> GND, DT -> data_pin, SCK -> clock_pin.
+# Calibrate: .venv/bin/python -m app.hwtest calibrate reactor   (prints offset and scale for here)
+enabled = false
+data_pin = 27        # HX711 DT
+clock_pin = 22       # HX711 SCK
+offset = 0           # raw reading with the empty reactor in place
+scale = 420.0        # raw counts per gram (negative is fine)
+samples = 3          # median of this many conversions per reading
+capacity_kg = 5
+vessel_kg = 0         # empty vessel weight on the load cell after tare
+
+[load_cells.output]
+# HX711 board under the biodiesel output container: the yield. Same wiring and calibration
+# (python -m app.hwtest calibrate output).
+enabled = false
+data_pin = 10
+clock_pin = 9
+offset = 0
+scale = 420.0
+samples = 3
+capacity_kg = 5
+vessel_kg = 0         # empty output container weight after tare
+
+[power_monitor]
+# Electrode voltage and current, for the live readings, the energy used and the over-current stop.
+# type = "ina226": I2C, up to 36 V (fits the 0-30 V supply).  Recommended.
+# type = "ina219": I2C, only up to 26 V: don't use it above 26 V.
+# type = "none":   no readings (the website shows "—"; the over-current stop can't work).
+# For up to 2 A use a 0.02 Ω shunt with the INA226 (many boards ship with 0.1 Ω = 0.8 A max).
+type = "none"
+i2c_bus = 1
+address = 0x40
+shunt_ohms = 0.02
+
+# RPM sensors: a hall sensor (A3144 / KY-003) with a magnet on the shaft, or an IR slot sensor.
+# Signal -> pin (open collector to GND is fine, the pull-up is on). pulses_per_rev = magnets per turn.
+# The website's Ready tiles for the three motors need these readings.
+[rpm.stirrer]
+enabled = false
+pin = 21
+pulses_per_rev = 1
+
+[rpm.centrifuge]
+enabled = false
+pin = 19
+pulses_per_rev = 1
+
+[rpm.purification_stirrer]
+enabled = false
+pin = 7
+pulses_per_rev = 1
+
+[power_supply]
+# control = "manual": you set the voltage and current on the supply's knobs; the website reminds
+#                     you the operator sets the supply current directly; no on-screen current prompt is shown.
+# control = "serial": the Pi sets them over the supply's USB/serial port (pyserial). Put in the
+#                     commands your supply understands ({volts} and {amps} are filled in):
+#   SCPI supplies:  voltage_command = "VOLT {volts:.2f}\n"  current_command = "CURR {amps:.2f}\n"
+#   Korad KA3005P:  voltage_command = "VSET1:{volts:.2f}"   current_command = "ISET1:{amps:.3f}"
+#                   output_on_command = "OUT1"              output_off_command = "OUT0"
+control = "manual"
+port = "/dev/ttyUSB0"
+baudrate = 9600
+voltage_command = "VOLT {volts:.2f}\n"
+current_command = "CURR {amps:.2f}\n"
+output_on_command = ""
+output_off_command = ""
