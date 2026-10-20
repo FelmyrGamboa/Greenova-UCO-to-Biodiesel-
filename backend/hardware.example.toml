@@ -1,0 +1,184 @@
+# Greenova hardware configuration for the Raspberry Pi
+# -----------------------------------------------------
+# Copy this file to hardware.toml (setup-pi.sh does it) and change it to match your wiring.
+# This is the ONLY file you need to edit for pins, the ESP32 outputs and calibration.
+#
+# * Pin numbers are BCM GPIO numbers (GPIO17 = physical pin 11), not physical pin numbers.
+#   Run  pinout  on the Pi to see the header.
+# * After a change:  .venv/bin/python -m app.hwtest check     (pin conflicts, ESP32 job list)
+#   then:            sudo systemctl restart greenova
+# * Full guide with wiring tables: docs/RASPBERRY_PI_SETUP.md (section "ESP32 controller").
+#
+# The machine is split between two boards (backend = "esp32"):
+#   ESP32 (USB cable, firmware/esp32_process_control): 8 relays, the heater relay, mixer 1 and 2
+#         on the L298N, and the DS18B20 temperature probe.
+#   Raspberry Pi pins: the centrifuge (BTS7960) and the HX711 load cell(s).
+
+# GPIO chip. Leave it out to let the backend find it (Pi 4: 0; Pi 5: 0 on new kernels, 4 on old ones).
+# gpiochip = 0
+
+[actuators]
+# "esp32": the ESP32 controller on USB + the Pi's centrifuge and load cell (this machine).
+# "gpio":  the older wiring with every relay and motor on the Pi's own pins (sections at the end).
+backend = "esp32"
+port = "auto"            # "auto" = the first USB serial port; or e.g. "/dev/serial/by-id/usb-Silicon_Labs_CP2102..."
+baudrate = 115200        # must match Serial.begin(115200) in the sketch
+
+[esp32]
+# Dead-man timer: every output is switched on as "<device> on 5" and repeated every second while it
+# should stay on. If the Pi, the backend or the USB cable stops, the ESP32 switches it off by itself
+# within lease_seconds. 0 = plain "on" (NOT recommended: an output then stays on if the Pi stops).
+lease_seconds = 5
+poll_seconds = 1.0           # how often the Pi asks for the ESP32's status ("json")
+offline_after_seconds = 3.5  # no status for this long = controller offline -> every process stops
+mixer_max_rpm = 1544         # the sketch's MAX_RPM (the ESP32 reports its own; this is the fallback)
+
+[esp32.devices]
+# Which ESP32 output does which Greenova job. The names are the sketch's device ids:
+#   dispenser1 (relay IN8, GPIO22)   dispenser2 (IN7, GPIO21)   reactorpump (IN6, GPIO19)
+#   pumpin (IN5, GPIO18)   oil (IN4, GPIO25)   pumpout (IN3, GPIO26)   valve (IN2, GPIO27)
+#   electrode (IN1, GPIO13)   heater (own relay, GPIO5)   mixer1 / mixer2 (L298N, speed in RPM)
+# "" = not fitted (that job can't switch on). Several outputs together: ["valve", "pumpout"].
+# Check each one with python -m app.hwtest outputs before the first batch.
+heater = "heater"                         # immersion heater in the purifier
+electrode_power = "electrode"             # DC supply to the graphite electrodes
+oil_pump = "oil"                          # oil input: oil tank -> reactor (Oil Loading step)
+catalyst_pump = "dispenser1"              # pump A: NaOH/KOH dissolved in methanol
+acid_pump = "dispenser2"                  # pump B: H2SO4 in methanol
+reactor_outlet = "reactorpump"            # reactor -> centrifuge (after transesterification)
+centrifuge_outlet = "pumpin"              # centrifuge -> purifier (after separation)
+purification_outlet = ["valve", "pumpout"]  # after purification: the valve opens and pumpout pumps to the output container
+stirrer = "mixer1"                        # reactor stirrer
+purification_stirrer = "mixer2"           # dry wash stirrer
+
+[esp32.max_on_seconds]
+# The transfers run until the batch is complete (every output stops at the end). reactorpump and
+# pumpin are pumps, so after their tank is empty they run dry until then. To stop one after a
+# set time instead (the ESP32 switches it off by itself), give it a run time here, e.g.:
+#   reactor_outlet = 300
+#   centrifuge_outlet = 300
+
+[oil_pump]
+# The oil pump's flow. Without a reactor load cell the oil is loaded by time at this rate, so
+# measure it: python -m app.hwtest pump oil 60  (then the mL in the jug).
+rate_ml_per_min = 500
+
+[centrifuge]
+# DC motor on a BTS7960 (IBT-2) driver, from the Pi's own pins. Open loop: duty % = target RPM / max_rpm.
+enabled = true
+max_rpm = 2500          # RPM at 100 % PWM
+min_duty = 0            # % duty at 1 RPM; raise (15-25) if the motor hums but won't start
+pwm_freq = 1000         # Hz
+ramp_seconds = 3.0      # soft start / stop: time from 0 to 100 %
+direction = "forward"   # forward = PWM on RPWM, reverse = on LPWM
+l_en = 23               # physical pin 16
+r_en = 24               # physical pin 18
+lpwm = 25               # physical pin 22
+rpwm = 21               # physical pin 40
+
+[load_cells.output]
+# HX711 under the biodiesel output container: the yield, and the end of the purification drain
+# (stable for 30 s). Wiring: VCC -> 3.3 V (pin 1, NOT 5 V), GND -> GND, DT -> data_pin, SCK -> clock_pin.
+# Calibrate on the website (Settings -> Hardware: Tare, then Calibrate with a known weight); that
+# calibration is saved in backend/loadcell_calibration.json and wins over the numbers here.
+enabled = true
+data_pin = 17           # HX711 DT  (physical pin 11)
+clock_pin = 27          # HX711 SCK (physical pin 13)
+offset = 41028.54       # raw reading with the empty container (from the Pi control panel's config.json)
+scale = 145.759         # raw counts per GRAM (its calibration_factor 145759 was per kg)
+samples = 10            # median of the last 10 conversions (about 1 s)
+cal_seconds = 3.0       # how long Tare / Calibrate average the readings
+capacity_kg = 5
+vessel_kg = 0
+
+[load_cells.reactor]
+# Optional second HX711 under the main reactor: weighs the oil and the pump doses. Without it
+# (enabled = false) the operator confirms the poured oil by volume and the pumps dose by time.
+enabled = false
+data_pin = 5            # physical pin 29
+clock_pin = 6           # physical pin 31
+offset = 0
+scale = 420.0
+samples = 10
+cal_seconds = 3.0
+capacity_kg = 5
+vessel_kg = 0
+
+[level_switch]
+# Optional float switch at the heater's height in the purification tank, between the pin and GND
+# (the Pi's pull-up is used). Without it, the operator confirms the heater is covered.
+enabled = false
+pin = 26
+closed_means_liquid = true   # false if your switch opens when it floats up
+
+[separation]
+spin_up_seconds = 15
+stable_grams = 20
+stable_seconds = 60
+
+[purification]
+heating_timeout_minutes = 25
+# No drain time limit: the drain ends when the output load cell is stable for 30 s.
+
+[power_monitor]
+# Electrode voltage and current (INA226 on the Pi's I2C), for the live readings, the energy used
+# and the over-current stop. "none" = no readings (the website shows "—").
+type = "none"
+i2c_bus = 1
+address = 0x40
+shunt_ohms = 0.02
+
+[power_supply]
+# control = "manual": you set the voltage and current on the supply's knobs.
+# control = "serial": the Pi sets them over the supply's own USB port (NOT the ESP32's port).
+control = "manual"
+port = "/dev/ttyUSB1"
+baudrate = 9600
+voltage_command = "VOLT {volts:.2f}\n"
+current_command = "CURR {amps:.2f}\n"
+output_on_command = ""
+output_off_command = ""
+
+# ---------------------------------------------------------------------------------------------
+# Only for backend = "gpio" (the older wiring with everything on the Pi's own pins). Ignored with
+# the ESP32: there the relays, the heater, the mixers and the temperature probe are on the ESP32.
+# ---------------------------------------------------------------------------------------------
+[relays]
+active_high = true       # false for "low level trigger" relay boards
+heater = 23
+electrode_power = 25
+
+[pumps]
+catalyst = 5
+acid = 6
+
+[valves]
+# mode = "single": one relay, ON = open.  mode = "dual": 3-wire motorized ball valve (open_pin, close_pin).
+reactor_outlet = { mode = "single", pin = 16 }
+centrifuge_outlet = { mode = "single", pin = 20 }
+purification_outlet = { mode = "single", pin = 24 }
+
+[motors]
+# type = "pwm" (motor driver PWM input) or "esc" (brushless ESC, 1-2 ms at 50 Hz)
+stirrer = { type = "pwm", pin = 18, frequency = 1000 }
+centrifuge = { type = "pwm", pin = 13, frequency = 1000 }
+purification_stirrer = { type = "pwm", pin = 12, frequency = 1000 }
+
+[temperature]
+type = "ds18b20"     # DS18B20 on the Pi's 1-Wire (GPIO4); "none" = no probe
+sensor_id = ""
+
+[rpm.stirrer]
+enabled = false
+pin = 21
+pulses_per_rev = 1
+
+[rpm.centrifuge]
+enabled = false
+pin = 19
+pulses_per_rev = 1
+
+[rpm.purification_stirrer]
+enabled = false
+pin = 7
+pulses_per_rev = 1
