@@ -59,7 +59,8 @@ def test_health_and_config(client):
     assert cfg["separation"] == {"timeMinutes": 60, "speedRpm": 2500, "timeMin": 1, "timeMax": 180,
                                  "speedMin": 100, "speedMax": 2500, "settleSeconds": 60}
     pur = cfg["purification"]
-    assert (pur["holdTemperature"], pur["holdBand"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 3, 95, 200)
+    assert (pur["holdTemperature"], pur["heaterPulseSeconds"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 2, 95, 200)
+    assert pur["pulseDropC"] == 0.2 and "holdBand" not in pur and "heatingTimeoutMinutes" not in pur
     assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settleSeconds"]) == (10, 10, 60)
     assert pur["magnesolGramsPerMlOil"] == 0.0092 and pur["bentoniteGramsPerMlOil"] == 0.0184
     assert pur["adsorbents"] == ["Magnesol", "Bentonite"] and pur["defaultAdsorbent"] == "Magnesol"
@@ -135,7 +136,7 @@ def test_purification_rules(client):
     time.sleep(0.1)
     r = client.post("/api/process/purification/start", json={})   # level switch confirms it
     assert r.status_code == 200, r.json()
-    assert r.status_code == 200 and r.json()["phase"] == "heating"
+    assert r.status_code == 200 and r.json()["phase"] == "methanol"          # no heating step
     client.post("/api/process/purification/abort")
     assert client.get("/api/process/purification").json()["phase"] == "fault"
     assert client.post("/api/process/purification/acknowledge").json()["phase"] == "ready"
@@ -218,11 +219,11 @@ def test_whole_batch_moves_through_the_machine(client):
     assert sensors["reactorValveOpen"] and sensors["centrifugeValveOpen"] and sensors["centrifugeRpm"] == 2000
 
     # the separation timer ends: all three stop and purification starts at once
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=4)
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=4)
     sensors = client.get("/api/live").json()["sensors"]
     assert not sensors["reactorValveOpen"] and not sensors["centrifugeValveOpen"] and sensors["centrifugeRpm"] == 0
-    assert p["batchId"] == b and p["automatic"] is True and p["heaterOn"] is True
-    assert p["stirrerOn"] is True and p["stirrerRpm"] is None                # no RPM reading while heating
+    assert p["batchId"] == b and p["automatic"] is True and p["heaterPulses"] >= 1   # first 2 s pulse at once
+    assert p["stirrerOn"] is True and p["stirrerRpm"] is None                # no RPM reading in methanol removal
     assert p["stirringSpeed"] == 200 and p["targetTemperature"] == 90
     # from the batch's oil: 276 g ÷ 0.92 g/mL = 300 mL; Magnesol = 300 × 0.0092 = 2.76 -> 2.8 g
     assert p["magnesolG"] == 2.8 and p["oilWeightG"] == 276
@@ -294,7 +295,7 @@ def test_purification_waits_until_its_sensors_read_and_an_earlier_stop_is_acknow
     time.sleep(0.3)
     assert client.get("/api/live").json()["purificationAutoStart"] == "B-WAIT-1"   # still waiting
     hw.plug_in("temperature")
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=3)
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=3)
     assert p["batchId"] == "B-WAIT-1" and p["automatic"] is True
     live = client.get("/api/live").json()
     assert live["purificationAutoStart"] is None and live["purificationWaiting"] is None
@@ -309,7 +310,7 @@ def test_purification_waits_until_its_sensors_read_and_an_earlier_stop_is_acknow
     assert "safety stop (stopped by operator)" in live["purificationWaiting"]
     assert live["purification"]["phase"] == "fault" and live["purification"]["batchId"] == "B-WAIT-1"
     client.post("/api/process/purification/acknowledge")
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=3)
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=3)
     assert p["batchId"] == "B-WAIT-2"
     client.post("/api/process/purification/abort")
 
@@ -379,7 +380,7 @@ def test_magnesol_step_waits_for_the_operator(client):
     r = client.post("/api/process/purification/start", json={"batchId": "B-MAG-1", "oilVolumeMl": 500})
     assert r.status_code == 200 and r.json()["magnesolG"] == 4.6
     assert client.post("/api/process/purification/magnesol-added").status_code == 409   # not asked yet
-    _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=3)     # 90 °C reached
+    assert r.json()["phase"] == "methanol"                                              # straight away
     p = _wait_for(client, "/api/process/purification", "phase", ["magnesol"], timeout=6)  # after 5 min
     assert p["heaterOn"] is False and p["stirrerOn"] is True
     time.sleep(1.5)
@@ -447,7 +448,7 @@ def test_bentonite_batch(client):
     client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 460,
                                                    "adsorbent": "Bentonite", "separationTime": 1})
     client.post("/api/process/stage/complete")
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=5)
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=5)
     assert p["adsorbent"] == "Bentonite" and p["adsorbentG"] == 9.2 and p["magnesolG"] == 9.2
     _wait_for(client, "/api/process/purification", "phase", ["magnesol"], timeout=8)
     client.post("/api/process/purification/magnesol-added")

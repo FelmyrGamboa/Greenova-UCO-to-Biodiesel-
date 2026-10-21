@@ -46,7 +46,7 @@ import { useT, type TFunction } from "../lib/i18n";
 
 type DeviceState = "ready" | "checking" | "fault";
 type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-const PURIFYING: PurificationPhase[] = ["heating", "methanol", "magnesol", "contact", "settle", "drain"];
+const PURIFYING: PurificationPhase[] = ["methanol", "magnesol", "contact", "settle", "drain"];
 type ChemistrySettings = {
   oilMolarMass: number;
   ffaThreshold: number;
@@ -121,15 +121,15 @@ export const PROCESS_CONFIG = {
     settleSeconds: 60,
   },
   // Purification (dry wash with Magnesol or bentonite): fixed values, same as the backend's purification.py.
-  // Methanol removal keeps it at 87–90 °C: the heater switches off at 90 °C and back on at 87 °C
-  // (holdTemperature - holdBand). After contact it settles for 1 min, then the valve and pumpout
-  // run until the output load cell is stable for 30 s.
+  // No heating step: methanol removal starts at once, with the heater in 2-second pulses (the next
+  // pulse when the temperature is getting lower again, never at or above holdTemperature). After
+  // contact it settles for 1 min, then the valve and pumpout run until the output load cell is
+  // stable for 30 s.
   purification: {
     holdTemperature: 90,
-    holdBand: 3,
+    heaterPulseSeconds: 2,
     settleSeconds: 60,
     maximumTemperature: 95,
-    heatingTimeoutMinutes: 25,
     stirringSpeedRpm: 200,
     drainStableGrams: 2,
     drainStableSeconds: 30,
@@ -988,6 +988,8 @@ type PurificationView = {
   temperature: number | null;
   highest: number | null;
   heaterOn: boolean;
+  /** 2-second heater pulses so far (methanol removal). */
+  heaterPulses: number;
   stirrerOn: boolean;
   stirrerRpm: number | null;
   valveOpen: boolean;
@@ -1012,14 +1014,13 @@ type PurificationView = {
 };
 
 const READY_PURIFICATION: PurificationView = {
-  phase: "ready", temperature: null, highest: null, heaterOn: false, stirrerOn: false, stirrerRpm: null,
+  phase: "ready", temperature: null, highest: null, heaterOn: false, heaterPulses: 0, stirrerOn: false, stirrerRpm: null,
   valveOpen: false, stepRemaining: null, outputG: 0, oilG: null, magnesolG: null, adsorbent: "Magnesol", warning: null, stopReason: null,
   stopOccurred: false, automatic: true, heatingSeconds: 0, methanolSeconds: 0, contactSeconds: 0,
   settleSeconds: 0, drainSeconds: 0, stableSeconds: 0,
 };
 
 const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
-  ["heating", "Heating"],
   ["methanol", "Methanol removal"],
   ["magnesol", "Add adsorbent"],   // shown as "Add Magnesol" or "Add Bentonite"
   ["contact", "Contact"],
@@ -1238,6 +1239,7 @@ export default function NewBatch() {
       temperature: p.liveTemperature ?? live.sensors.temperature,
       highest: p.highestTemperature,
       heaterOn: p.heaterOn,
+      heaterPulses: p.heaterPulses ?? 0,
       stirrerOn: p.stirrerOn,
       stirrerRpm: p.stirrerRpm,
       valveOpen: p.valveOpen,
@@ -2677,7 +2679,7 @@ export default function NewBatch() {
             <p className="mt-6 text-sm text-gray-400">{t("The centrifuge is still running and pumpin fills the purifier. Purification starts by itself when the separation time is over.")}</p>
           )}
 
-          {(purification.phase === "heating" || purification.phase === "methanol") && (
+          {purification.phase === "methanol" && (
             <p className="mt-6 text-sm text-gray-400" data-testid="prepare-magnesol">{t("Prepare {grams} g {adsorbent}", { grams: magnesolG.toFixed(1), adsorbent: t(adsorbentName) })}</p>
           )}
 
@@ -2695,22 +2697,24 @@ export default function NewBatch() {
                 label={t("Temperature")}
                 value={purification.temperature === null ? "—" : `${purification.temperature.toFixed(1)} °C`}
                 sub={
-                  purification.phase === "heating"
-                    ? t("heater off at {value} °C", { value: p.holdTemperature })
-                    : purification.phase === "methanol"
-                      ? t("kept at {low}–{high} °C", { low: p.holdTemperature - p.holdBand, high: p.holdTemperature })
-                      : purification.phase === "contact"
-                        ? t("heater off")
-                        : purification.phase === "settle"
-                          ? t("stirrer off · settling")
-                          : undefined
+                  purification.phase === "methanol"
+                    ? t("heater pulses when it drops · none from {value} °C", { value: p.holdTemperature })
+                    : purification.phase === "contact"
+                      ? t("heater off")
+                      : purification.phase === "settle"
+                        ? t("stirrer off · settling")
+                        : undefined
                 }
               />
               {/* The stirrer's RPM reading is shown during contact only. */}
               {purification.phase === "contact" && (
                 <Metric label={t("Stirrer")} value={purification.stirrerOn ? `${purification.stirrerRpm ?? "—"} / ${p.stirringSpeedRpm} RPM` : t("Off")} />
               )}
-              <Metric label={t("Heater")} value={purification.heaterOn ? t("On") : t("Off")} />
+              <Metric
+                label={t("Heater")}
+                value={purification.heaterOn ? t("On") : t("Off")}
+                sub={purification.phase === "methanol" ? t("{count} × {seconds} s pulses", { count: purification.heaterPulses, seconds: p.heaterPulseSeconds }) : undefined}
+              />
               <Metric label={t("Valve + pumpout")} value={purification.valveOpen ? t("On") : t("Off")} sub={t("to the output container")} />
               {purification.phase === "drain" ? (
                 <>

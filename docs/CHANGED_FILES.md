@@ -1,5 +1,20 @@
 # Greenova update notes
 
+## 2026-10-21 (5): no temperature checks in the reactions; purification heater in 2-second pulses
+
+- **Esterification and transesterification have no temperature checks.** No "temperature reading lost" or over-temperature fault, no start refusal without a reading, and the watchdog no longer switches the electrodes off for the temperature. A reading, when there is one, is still recorded (average temperature). They still don't start while the ESP32 controller is offline or faulty, and a measured over-current (power monitor fitted) still stops them.
+- **Clearer controller faults.** The backend reads the ESP32's boot messages: when it restarts, the fault says so, and for a brownout ("supply voltage dipped") it says to give the ESP32 and the relay / motor boards their own 5 V supply.
+- **Purification: no heating step.** Methanol removal starts at once (default 10 min) with the dry wash stirrer at 200 RPM. The heater runs in 2-second pulses: on 2 s, off; the Pi follows the temperature up to its highest point and, when it is getting lower again (0.2 °C below that point), gives the next 2-second pulse, until the time is over. No pulse at or above 90 °C; the 95 °C cutoff stays. Then, as before: **Add Magnesol** → **Confirm**, contact at 200 RPM, 1-minute settle, valve + pumpout until the output load cell is stable for 30 s. The level switch and stirrer checks cover the whole methanol step. `/api/config` purification: `heaterPulseSeconds` 2 and `pulseDropC` 0.2 replace `holdBand` and `heatingTimeoutMinutes`; the purification state has `heaterPulses`; `heatingTimeSeconds` is always 0. The Purification step shows the pulses.
+
+**Files**: `backend/app/stages.py`, `hardware.py`, `esp32.py`, `purification.py`, `api.py`; `backend/tests/simulator.py` (optional heater lag), `test_core.py`, `test_api.py`, `test_esp32.py`; `frontend/src/pages/NewBatch.tsx`, `Settings.tsx`, `lib/api.ts`, `lib/fil.ts`; `backend/README.md`, `API.md`, `frontend/README.md`, `docs/*.md`.
+
+## 2026-10-21 (4): reactions refuse to start without a temperature reading or with a controller fault
+
+- Esterification and transesterification now check before switching anything on: the ESP32 controller must be online without a fault, and the DS18B20 must give a reading. Before, a missing temperature started the stage and stopped it a second later ("temperature reading lost", shown as "Fault — controller reset required"). Now the start is refused with the reason and what to check.
+- `docker-compose.yaml` loads `backend/greenova_db_ver2.sql` (unchanged) on MySQL's first start; new `dockerfiles/frontend.Dockerfile` and `dockerfiles/mysql-init/01-greenova-user.sql`.
+
+**Files**: `backend/app/stages.py`, `backend/tests/test_esp32.py`, `frontend/src/lib/fil.ts`, `dockerfiles/*`, `docs/CHANGED_FILES.md`.
+
 ## 2026-10-21 (3): Docker setup for the real machine
 
 - New `dockerfiles/backend.Dockerfile`: Python 3.11 with FastAPI, PyMySQL, **pyserial** and **lgpio** (the build stops if one is missing). The old demo image had no pyserial, so the ESP32 stayed offline and no mixer, pump, electrode relay or heater could switch on, and separation (with the centrifuge) never started.

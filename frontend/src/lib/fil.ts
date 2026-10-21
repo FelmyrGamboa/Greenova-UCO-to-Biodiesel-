@@ -999,6 +999,9 @@ export const FIL: Record<string, string> = {
   "The reactor pump is running: stop it before a reaction stage.": "Tumatakbo ang reactor pump: ihinto ito bago ang isang reaction stage.",
   "No pump is running.": "Walang tumatakbong pump.",
   "Purification is waiting": "Naghihintay ang purification",
+  "Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: methanol removal straight away (stirred at 200 RPM, the heater in 2-second pulses, the next one when the temperature is getting lower, none from 90 °C), add the adsorbent, contact (stirred at 200 RPM, heater off), settle for 1 minute, then the valve opens and pumpout runs until the output load cell is stable for 30 s.": "Dry wash gamit ang Magnesol o bentonite (pinipili sa bawat batch sa Volume & Parameters). Kusa itong tumatakbo pagkatapos ng separation: methanol removal agad (hinahalo sa 200 RPM, ang heater ay naka-on nang 2 segundo bawat pulso, ang susunod kapag bumababa na ang temperatura, wala mula 90 °C), ilagay ang adsorbent, contact (hinahalo sa 200 RPM, naka-off ang heater), pag-settle nang 1 minuto, saka bubukas ang valve at tatakbo ang pumpout hanggang stable ang output load cell nang 30 s.",
+  "heater pulses when it drops · none from {value} °C": "pulso ng heater kapag bumababa · wala mula {value} °C",
+  "{count} × {seconds} s pulses": "{count} × {seconds} s na pulso",
   "Nothing is switched on. It starts by itself as soon as this is fixed.": "Walang naka-on. Kusa itong magsisimula kapag naayos na ito.",
 };
 
@@ -1066,6 +1069,7 @@ export const FIL_PATTERNS: Array<[RegExp, string]> = [
   [/^(.+): Use a whole number \(no decimals\)\.$/, "$1: Gumamit ng buong numero (walang decimal)."],
   [/^(.+) must be a whole number \(no decimals\)\.$/, "Dapat buong numero ang $1 (walang decimal)."],
   [/^Separation did not start by itself: (.+)$/, "Hindi kusang nagsimula ang separation: $1"],
+  [/^(Esterification|Transesterification) can't start: (.+)$/, "Hindi masimulan ang $1: $2"],
   [/^(Oil pump|Pump A|Pump B): all ([\d.]+) g pumped in \((\d+) min (\d+) s\)( for (.+))?$/, "$1: naipasok ang lahat ng $2 g ($3 min $4 s)$5"],
   [/^(Oil pump|Pump A|Pump B) stopped after (\d+) min (\d+) s \((.+)\)$/, "Huminto ang $1 pagkalipas ng $2 min $3 s ($4)"],
   [/^(Oil pump|Pump A|Pump B) stopped: (.+)$/, "Huminto ang $1: $2"],

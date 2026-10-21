@@ -218,11 +218,11 @@ def process_config(request: Request):
         # set per batch on Volume & Parameters (these are the defaults and limits); it starts by
         # itself after transesterification and a settle of settleSeconds in the reactor
         "separation": _separation_config(request.app, s),
-        # heating -> methanol removal (87-90 °C) -> add adsorbent -> contact -> settle -> drain
-        "purification": {"holdTemperature": dry_wash.HOLD_TEMPERATURE_C, "holdBand": dry_wash.HOLD_BAND_C,
+        # methanol removal (heater in 2 s pulses) -> add adsorbent -> contact -> settle -> drain
+        "purification": {"holdTemperature": dry_wash.HOLD_TEMPERATURE_C,
+                         "heaterPulseSeconds": dry_wash.HEATER_PULSE_S, "pulseDropC": dry_wash.PULSE_DROP_C,
                          "settleSeconds": dry_wash.PURIFIER_SETTLE_S,
                          "maximumTemperature": dry_wash.MAXIMUM_TEMPERATURE_C,
-                         "heatingTimeoutMinutes": dry_wash.HEATING_TIMEOUT_S / 60,
                          "methanolRemovalMinutes": s.methanol_removal_time, "contactMinutes": s.contact_time,
                          "stirringSpeedRpm": dry_wash.STIRRING_SPEED_RPM,
                          "drainStableGrams": dry_wash.DRAIN_STABLE_G, "drainStableSeconds": dry_wash.DRAIN_STABLE_S,
@@ -810,7 +810,7 @@ def _store_purification(app, s: Settings, batch_id: str, record: dict, label: st
 
 def begin_purification(app, s: Settings, batch_id: Optional[str], automatic: bool = False,
                        oil_volume_ml: Optional[float] = None, adsorbent: Optional[str] = None) -> None:
-    """Starts heating → methanol removal (87-90 °C) → add adsorbent → contact → settle → drain.
+    """Starts methanol removal (heater in 2 s pulses) → add adsorbent → contact → settle → drain.
     When it ends (completed, stopped or faulted) every output is switched off.
     The adsorbent (Magnesol or bentonite) is the one given, else the one sent with the batch's
     stages, else Settings defaultAdsorbent. Raises RuntimeError or InterlockError."""

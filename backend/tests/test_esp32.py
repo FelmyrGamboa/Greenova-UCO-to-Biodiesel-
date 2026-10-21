@@ -519,7 +519,7 @@ def test_a_stage_or_pump_that_cannot_start_leaves_nothing_half_on(lg, tmp_path):
     import asyncio
     from app.hardware import InterlockError
     from app.models import Settings
-    from app.stages import StageRunner
+    from app.stages import StageError, StageRunner
     from app.transfers import PumpRunner
     esp = FakeEsp32()
     hw, _ = _machine(lg, tmp_path, esp)
@@ -529,7 +529,7 @@ def test_a_stage_or_pump_that_cannot_start_leaves_nothing_half_on(lg, tmp_path):
 
         async def run():
             stage, pump = StageRunner(hw), PumpRunner(hw)
-            with pytest.raises(InterlockError, match="offline"):
+            with pytest.raises(StageError, match="can't start: ESP32 controller offline"):
                 stage.start("Transesterification", Settings())
             assert stage.state["state"] == "ready" and not stage.active
             with pytest.raises(InterlockError):
@@ -654,3 +654,47 @@ def test_gpio_chip_and_busy_pins_are_explained(lg, monkeypatch):
     monkeypatch.setattr(lg, "gpio_claim_output", busy)
     with pytest.raises(RuntimeError, match="GPIO 23 .centrifuge L_EN. is busy.*pi-control"):
         drivers.Centrifuge(lg, 0, config.HARDWARE_DEFAULTS["centrifuge"])
+
+
+def test_reactions_run_without_a_temperature_reading(lg, tmp_path):
+    """No DS18B20 reading: esterification starts and keeps running (no temperature checks in the
+    reactions), with the electrode relay and mixer 1 on."""
+    import asyncio
+    from app.models import Settings
+    from app.stages import StageRunner
+    hw, esp = _machine(lg, tmp_path, FakeEsp32(temp=None))
+    try:
+        hw.refresh()
+
+        async def run():
+            stage = StageRunner(hw, time_scale=10)
+            stage.start("Esterification", Settings())
+            for _ in range(30):                           # 3 s = 30 simulated seconds
+                hw.refresh()
+                assert hw.watchdog(95, 60) is None
+                await asyncio.sleep(0.1)
+            assert stage.state["state"] == "running", stage.state
+            assert stage.state["elapsedSeconds"] >= 20 and stage.state["averageTemperature"] is None
+            assert esp.on("electrode") and esp.on("mixer1")
+            await stage.emergency_stop("test over")
+        asyncio.run(run())
+    finally:
+        hw.close()
+
+
+def test_an_esp32_brownout_is_named_in_the_fault(lg, tmp_path):
+    """The ESP32 restarts when its supply dips (a motor or relay switching on): the controller fault
+    says so, instead of only "stopped answering"."""
+    esp = FakeEsp32()
+    hw, _ = _machine(lg, tmp_path, esp)
+    try:
+        hw.refresh()
+        with esp._lock:
+            esp.rx += b"Brownout detector was triggered\r\n\r\nets Jul 29 2019 12:21:46\r\n\r\n" \
+                      b"rst:0xc (SW_CPU_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)\r\n"
+        esp.silent = True
+        wait_until(lambda: not hw.link.online, what="offline")
+        fault = hw.link_fault
+        assert "brownout" in fault and "own 5 V supply" in fault, fault
+    finally:
+        hw.close()

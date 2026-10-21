@@ -5,33 +5,33 @@ adds it is still called "magnesol" in the code and the API, so older screens kee
 
 It starts by itself when the separation stage has finished (the centrifuge timer is over and
 pumpin has sent everything to the purifier). Steps, one after the other, run by the Pi:
-1. heating: the dry wash stirrer starts (200 RPM), then the heater, until the biodiesel reaches
-   90 °C. At 90 °C the heater switches off and the run goes on to methanol removal. Stops with a
-   fault if 90 °C isn't reached within 25 min.
-2. methanol: the biodiesel is kept at 87-90 °C for the methanol removal time (default 10 min), so
-   the excess methanol evaporates: the heater switches off at 90 °C and back on when the
-   temperature drops to 87 °C.
-3. magnesol: heater off, stirrer on. The website shows "Add X g Magnesol (1% of the oil weight)";
+1. methanol: methanol removal starts at once (no separate heating step) and lasts the methanol
+   removal time (default 10 min). The dry wash stirrer runs (200 RPM) and the heater works in
+   2-second pulses: on for 2 s, then off; the Pi watches the temperature rise to its highest
+   point, and when it is getting lower again (0.2 °C below that highest reading) the heater gets
+   the next 2-second pulse, and so on until the 10 minutes are over. No pulse at or above 90 °C.
+2. magnesol: heater off, stirrer on. The website shows "Add X g Magnesol (1% of the oil weight)";
    the sequence waits until the operator confirms that it was added.
-4. contact: stirred at 200 RPM for the contact time (default 10 min) with the heater off.
-5. settle: the stirrer stops and the biodiesel settles for 1 minute (PURIFIER_SETTLE_S).
-6. drain: the valve opens and pumpout runs (the purification outlet): purifier -> polishing
+3. contact: stirred at 200 RPM for the contact time (default 10 min) with the heater off.
+4. settle: the stirrer stops and the biodiesel settles for 1 minute (PURIFIER_SETTLE_S).
+5. drain: the valve opens and pumpout runs (the purification outlet): purifier -> polishing
    filter -> output container. The run is complete only when the output load cell reading has
    stayed within ±2 g for 30 s (counted once the biodiesel has started arriving). No time limit.
-7. complete: the valve closes and pumpout stops (api.py then switches every output off). A "Low
+6. complete: the valve closes and pumpout stops (api.py then switches every output off). A "Low
    output – check the polishing filter" warning when less than 70% of the oil weight came out.
 
-Fixed: the 87-90 °C hold, the 95 °C cutoff, the 200 RPM stirrer, the 1 min settle and the drain
-rule. Settings: methanolRemovalTime and contactTime.
+Fixed: the 2 s heater pulses, the 90 °C pulse limit, the 95 °C cutoff, the 200 RPM stirrer, the
+1 min settle and the drain rule. Settings: methanolRemovalTime and contactTime.
 
 The stirrer's RPM reading is reported (stirrerRpm) only during contact; in the other steps it is
 null, so the website shows it only there.
 
 Safety: the heater runs only while the stirrer runs and the heater is submerged (hardware.py
-enforces it for every caller), and the valve never opens while the heater is on. Any fault turns
-the heater and stirrer off and closes the valve; the operator must acknowledge it.
+enforces it for every caller), and the valve never opens while the heater is on. No temperature
+reading during methanol removal, or above 95 °C: safety stop. Any fault turns the heater and
+stirrer off and closes the valve; the operator must acknowledge it.
 
-Phase names: "ready", "heating", "methanol", "magnesol", "contact", "settle", "drain",
+Phase names: "ready", "methanol", "magnesol", "contact", "settle", "drain",
 "complete" or "fault". It runs on the Pi, so closing the website never leaves the heater on.
 """
 import asyncio
@@ -40,10 +40,10 @@ from typing import Callable, Optional
 from .hardware import Hardware
 from .models import Settings
 
-HOLD_TEMPERATURE_C = 90        # the heater switches off here (fixed)
-HOLD_BAND_C = 3                # methanol removal: back on at 87 °C, off again at 90 °C
+HOLD_TEMPERATURE_C = 90        # no heater pulse at or above this (a pulse in progress stops here)
+HEATER_PULSE_S = 2             # methanol removal: the heater is switched on for 2 s at a time ...
+PULSE_DROP_C = 0.2             # ... again once the reading is this far below its highest point
 MAXIMUM_TEMPERATURE_C = 95     # software cutoff: the heater stops above this
-HEATING_TIMEOUT_S = 25 * 60    # 90 °C must be reached within 25 min
 STIRRING_SPEED_RPM = 200       # dry wash stirrer target (fixed)
 STIRRER_STOPPED_RPM = 100      # with an RPM reading below this, the stirrer counts as not turning
 STIRRER_GRACE_S = 5            # seconds the stirrer may read low (spin-up) before the heater stops
@@ -52,7 +52,7 @@ DRAIN_STABLE_S = 30            # ... for 30 s (the only way the run completes)
 LOW_OUTPUT_FRACTION = 0.7      # warn below 70% of the oil weight
 PURIFIER_SETTLE_S = 60         # after contact: the stirrer stops and it settles for 1 min
 
-RUNNING_PHASES = ("heating", "methanol", "magnesol", "contact", "settle", "drain")
+RUNNING_PHASES = ("methanol", "magnesol", "contact", "settle", "drain")
 RPM_PHASES = ("contact",)      # the only step whose stirrer RPM reading is reported
 
 
@@ -76,7 +76,9 @@ class PurificationRunner:
         return {"phase": "ready", "batchId": None, "automatic": False,
                 "targetTemperature": HOLD_TEMPERATURE_C, "maximumTemperature": MAXIMUM_TEMPERATURE_C,
                 "liveTemperature": None, "startingTemperature": None, "highestTemperature": None,
-                "heatingTimeSeconds": 0, "heatingTimeoutSeconds": HEATING_TIMEOUT_S,
+                # no heating step any more: heatingTimeSeconds stays 0 (the record's column needs a value)
+                "heatingTimeSeconds": 0, "heaterPulseSeconds": HEATER_PULSE_S, "heaterPulses": 0,
+                "pulsePeakTemperature": None,
                 "methanolTotalSeconds": 0, "methanolRemainingSeconds": 0,
                 # adsorbent: "Magnesol" or "Bentonite"; adsorbentG is its amount (magnesolG = same value, older name)
                 "adsorbent": "Magnesol", "adsorbentG": None,
@@ -117,7 +119,7 @@ class PurificationRunner:
                                "reading has been stable for 30 s, so check the output load cell first.")
         methanol = round(s.methanol_removal_time * 60)
         contact = round(s.contact_time * 60)
-        self.state = {**self._ready_state(), "phase": "heating", "batchId": batch_id, "automatic": automatic,
+        self.state = {**self._ready_state(), "phase": "methanol", "batchId": batch_id, "automatic": automatic,
                       "liveTemperature": t, "startingTemperature": t, "highestTemperature": t,
                       "methanolTotalSeconds": methanol, "methanolRemainingSeconds": methanol,
                       "contactTotalSeconds": contact, "contactRemainingSeconds": contact,
@@ -188,7 +190,8 @@ class PurificationRunner:
             return None
         if t > MAXIMUM_TEMPERATURE_C:
             raise SafetyStop(f"temperature exceeded {MAXIMUM_TEMPERATURE_C:g} °C")
-        if self.hw.heater_on:
+        # during methanol removal the heater pulses on and off: these checks hold for the whole step
+        if self.hw.heater_on or self.state["phase"] == "methanol":
             if reading.get("heaterSubmerged") is False:
                 raise SafetyStop("biodiesel level dropped below the heater")
             # Safety only (not shown): a fitted RPM sensor that reads a stalled stirrer stops the heater.
@@ -223,35 +226,38 @@ class PurificationRunner:
         st = self.state
         target = HOLD_TEMPERATURE_C
         try:
-            # 1. Heating: valve closed, stirrer first, then the heater, until 90 °C; then the heater stops
+            # 1. Methanol removal, straight away: valve closed, stirrer on, heater in 2-second pulses.
+            #    Pulse -> the temperature rises to its highest point -> once it is getting lower
+            #    (PULSE_DROP_C below that point) -> the next pulse. Until the time is over.
             self.hw.set_valve("mesh_bed", False)
             self._stir(s, True)
-            self.hw.set_heater(True)
             self._sync()
-            while self._check() < target:
-                if st["heatingTimeSeconds"] >= HEATING_TIMEOUT_S:
-                    raise SafetyStop(f"{target:g} °C not reached within {HEATING_TIMEOUT_S // 60} min")
-                self._step(None, None)
-                await self._tick()
-                st["heatingTimeSeconds"] += 1
-                self._sync()
-            self.hw.set_heater(False)            # 90 °C reached: heater off
-            self._sync()
-
-            # 2. Methanol removal: 87-90 °C (heater off at 90 °C, back on at 87 °C)
-            st["phase"] = "methanol"
+            pulse_left = 0          # seconds of the running pulse still to go
+            peak = None             # highest reading since the last pulse ended
+            first = True            # the first pulse right at the start
             while st["methanolRemainingSeconds"] > 0:
                 t = self._check()
-                if t >= target and self.hw.heater_on:
-                    self.hw.set_heater(False)
-                elif t <= target - HOLD_BAND_C and not self.hw.heater_on:
-                    self.hw.set_heater(True)
+                if self.hw.heater_on:
+                    if pulse_left <= 0 or t >= target:
+                        self.hw.set_heater(False)            # the 2 s are over (or 90 °C reached)
+                        peak = t
+                else:
+                    peak = t if peak is None else max(peak, t)
+                    falling = t <= peak - PULSE_DROP_C
+                    if (first or falling) and t < target:
+                        self.hw.set_heater(True)
+                        pulse_left = HEATER_PULSE_S
+                        first = False
+                        st["heaterPulses"] += 1
+                st["pulsePeakTemperature"] = peak
                 self._sync()
                 self._step(st["methanolRemainingSeconds"], st["methanolTotalSeconds"])
                 await self._tick()
                 st["methanolRemainingSeconds"] -= 1
+                if self.hw.heater_on:
+                    pulse_left -= 1
 
-            # 3. Add Magnesol: heater off, stirrer on, wait for the operator
+            # 2. Add Magnesol: heater off, stirrer on, wait for the operator
             st["phase"] = "magnesol"
             self.hw.set_heater(False)
             self._step(None, None)
@@ -263,17 +269,17 @@ class PurificationRunner:
                 st["magnesolWaitSeconds"] += 1
             st["magnesolAdded"] = True
 
-            # 4. Contact: stirred at 200 RPM, heater off
+            # 3. Contact: stirred at 200 RPM, heater off
             st["phase"] = "contact"
             await self._countdown("contactRemainingSeconds", check_required=False)
 
-            # 5. Settle: stirrer off for 1 min
+            # 4. Settle: stirrer off for 1 min
             self._stir(s, False)                 # also keeps the heater off
             self.hw.set_heater(False)
             st["phase"] = "settle"
             await self._countdown("settleRemainingSeconds", check_required=False)
 
-            # 6. Drain: valve open + pumpout, until the output load cell has been stable for 30 s
+            # 5. Drain: valve open + pumpout, until the output load cell has been stable for 30 s
             self._output_base = self.hw.read().get("outputWeightG") or 0.0
             self.hw.set_valve("mesh_bed", True)
             st["phase"] = "drain"

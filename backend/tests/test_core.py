@@ -264,13 +264,19 @@ def test_watchdog():
     hw.set_temperature(97)
     hw.refresh()
     assert hw.watchdog(95, 60) == "Heater stopped: temperature exceeded 95 °C." and not hw.heater_on
+    # the electrodes are not checked against the temperature (the reactions have no temperature check)
     hw.set_electrode_power(True)
-    assert hw.watchdog(95, 60).startswith("Electrodes stopped") and not hw.electrode_power_on
+    hw.set_temperature(80)
+    hw.refresh()
+    assert hw.watchdog(95, 60) is None and hw.electrode_power_on
+    hw._read_sensors = lambda: {"temperature": None}
+    hw.refresh()
+    assert hw.watchdog(95, 60) is None and hw.electrode_power_on
 
 
 # ---------- purification (dry wash with Magnesol) ----------
 SCALE = 400   # run the simulated machine 400x faster
-PHASES = ["heating", "methanol", "magnesol", "contact", "settle", "drain", "complete"]
+PHASES = ["methanol", "magnesol", "contact", "settle", "drain", "complete"]   # no heating step
 
 
 async def _purify(runner, hw, fault=None, oil_g=460, magnesol_g=4.6, confirm=True, settings=S):
@@ -282,7 +288,7 @@ async def _purify(runner, hw, fault=None, oil_g=460, magnesol_g=4.6, confirm=Tru
     loop = asyncio.create_task(sensor_loop())
     records, phases = [], []
     runner.start(settings, "B-test", records.append, oil_g=oil_g, magnesol_g=magnesol_g, automatic=True)
-    if fault:   # a sensor goes wrong 20 simulated seconds into heating
+    if fault:   # a sensor goes wrong 20 simulated seconds into methanol removal
         await asyncio.sleep(0.05)
         read = hw._read_sensors
         hw._read_sensors = lambda: {**read(), **fault}
@@ -310,34 +316,64 @@ def _machine(scale=SCALE):
 QUICK = Settings(methanol_removal_time=5, contact_time=1)
 
 
-def test_purification_full_sequence():
-    # 100x (not 400x): finer simulated steps, so the 87-90 °C hold isn't skewed by timer jitter
-    hw = _machine(100)
-    violations, switches = [], []
+def _heater_log(hw, runner):
+    """Records every heater switch: (simulated second, on, phase, latest reading) and checks the
+    interlocks on every switch-on."""
+    switches, violations = [], []
     write = hw._write_heater
-    runner = PurificationRunner(hw, 100)
 
     def guarded(on):
         if on and (hw.valves["mesh_bed"] or not hw.motor_duty["purification_stirrer"]):
             violations.append(True)
-        switches.append((runner.state["phase"], on, hw.temp_c))
+        st = runner.state
+        switches.append((hw.seconds, on, st["phase"], hw.read().get("temperature"),
+                         st["methanolTotalSeconds"] - st["methanolRemainingSeconds"]))   # the runner's own clock
         write(on)
     hw._write_heater = guarded
+    return switches, violations
+
+
+def _pulses(switches, with_off_reading=False):
+    """[(on second, off second, reading when switched on)] for each heater pulse
+    (+ the reading and the phase when switched off, with_off_reading)."""
+    pulses, start = [], None
+    for second, on, phase, t, clock in switches:
+        if on and start is None:
+            start = (second, t, clock)
+        elif not on and start is not None:
+            pulses.append((start[0], second, start[1]) + ((t, phase, clock - start[2]) if with_off_reading else ()))
+            start = None
+    return pulses
+
+
+def _full_length(pulses_with_off):
+    """Every pulse lasted 2 of the runner's seconds, except one cut at 90 °C or by the end of
+    methanol removal."""
+    return all(length == 2 or t_off >= 90 or phase != "methanol" for _, _, _, t_off, phase, length in pulses_with_off)
+
+
+def test_purification_full_sequence():
+    hw = _machine(100)
+    runner = PurificationRunner(hw, 100)
+    switches, violations = _heater_log(hw, runner)
     rec, phases = run(_purify(runner, hw))
     st = runner.state
     assert st["phase"] == "complete", st
-    assert phases == PHASES                                    # contact -> 1 min settle -> drain
+    assert phases == PHASES                                    # straight to methanol removal; settle; drain
     assert not rec["safetyStopOccurred"] and rec["automatic"] and rec["warning"] is None
-    assert rec["heatingTimeSeconds"] <= 100                    # 27 -> 90 °C at 45 °C per minute
-    # the heater switched off when heating reached 90 °C, before methanol removal began
-    first_off = next(s for s in switches if s[1] is False)
-    assert first_off[0] == "heating" and first_off[2] >= 90
-    # methanol removal: back on only at or below 87 °C, off again at 90 °C
-    assert any(phase == "methanol" and on for phase, on, t in switches)
-    assert all(t <= 87.5 for phase, on, t in switches if phase == "methanol" and on)
-    assert all(t >= 89.5 for phase, on, t in switches if phase == "methanol" and not on)
+    assert rec["heatingTimeSeconds"] == 0                      # no heating step
+    pulses = _pulses(switches)
+    # the heater only ever ran during methanol removal, in 2-second pulses, the first one at once
+    assert all(phase == "methanol" for _, on, phase, _, _ in switches if on)
+    assert len(pulses) >= 5
+    # 2 s each; shorter only when 90 °C was reached during the pulse
+    assert _full_length(_pulses(switches, True)), pulses
+    assert sum(p[-1] == 2 for p in _pulses(switches, True)) >= 5
+    assert switches[0][1] is True and switches[0][3] < 28      # the first pulse at once, from room temperature
+    assert all(t < 90 for _, _, t in pulses)                   # never a pulse at or above 90 °C
+    assert st["heaterPulses"] == len(pulses)
     assert rec["holdTimeSeconds"] == 600                       # 10 min methanol removal
-    assert 90 <= rec["highestTemperature"] < 92                # below the 95 °C cutoff
+    assert rec["highestTemperature"] < 95                      # below the 95 °C cutoff
     assert rec["magnesolAdded"] and rec["magnesolG"] == 4.6
     assert rec["contactTimeSeconds"] == 600                    # contactTime 10 min
     assert rec["settlingTimeSeconds"] == 60 and rec["coolingTimeSeconds"] == 0
@@ -346,6 +382,46 @@ def test_purification_full_sequence():
     assert rec["stirringSpeed"] == 200 and rec["oilWeightG"] == 460
     assert not violations and not hw.heater_on and not hw.valves["mesh_bed"]
     assert hw.motor_duty["purification_stirrer"] == 0
+
+
+def test_heater_pulses_wait_for_the_temperature_to_fall():
+    """With a real heater the temperature keeps rising after a pulse. The next 2-second pulse comes
+    only once the reading is getting lower: 0.2 °C below its highest point since the last pulse."""
+    hw = SimulatedMachine(100, heater_lag=0.8)
+    hw.load_oil(500)
+    hw.fill_tank(hw.oil_g * hw.BIODIESEL_FRACTION)
+    hw.set_temperature(60)
+    readings = []
+    read = hw._read_sensors
+
+    def logged():
+        r = read()
+        readings.append((hw.seconds, r["temperature"]))
+        return r
+    hw._read_sensors = logged
+    hw.refresh()
+    runner = PurificationRunner(hw, 100)
+    switches, violations = _heater_log(hw, runner)
+    run(_purify(runner, hw, settings=QUICK))
+    pulses = [p for p in _pulses(switches)]
+    assert len(pulses) >= 3 and _full_length(_pulses(switches, True)) and not violations
+    for (_, previous_off, _), (on, _, t_on) in zip(pulses, pulses[1:]):
+        between = [t for second, t in readings if previous_off <= second <= on]
+        peak = max(between)
+        assert t_on <= peak - 0.2 + 1e-9, (previous_off, on, t_on, peak)    # it was getting lower
+        assert peak > between[0]                                            # it rose after the pulse first
+    assert all(phase == "methanol" for _, on, phase, _, _ in switches if on)
+
+
+def test_no_heater_pulse_at_or_above_90():
+    hw = _machine(400)
+    hw.set_temperature(92)
+    hw.refresh()
+    runner = PurificationRunner(hw, 400)
+    switches, _ = _heater_log(hw, runner)
+    run(_purify(runner, hw, settings=QUICK))
+    assert all(t < 90 for _, on, _, t, _ in switches if on)
+    assert runner.state["phase"] == "complete"
 
 
 def test_purification_waits_for_the_magnesol():
@@ -365,7 +441,7 @@ def test_purification_waits_for_the_magnesol():
         while runner.state["phase"] != "magnesol":
             assert runner.running, runner.state                # a safety stop would wait here forever
             st = runner.state
-            if st["phase"] in ("heating", "methanol") and st["heatingTimeSeconds"] > 2:
+            if st["phase"] == "methanol" and st["methanolRemainingSeconds"] < st["methanolTotalSeconds"] - 2:
                 seen.setdefault(st["phase"], set()).add((st["stirrerOn"], st["stirrerRpm"]))
             await asyncio.sleep(0.002)
         while runner.state["magnesolWaitSeconds"] <= 40:       # 40 simulated seconds: still waiting
@@ -385,8 +461,8 @@ def test_purification_waits_for_the_magnesol():
         await runner.abort()
         loop.cancel()
     run(scenario())
-    # heating and methanol removal: the stirrer runs, but no RPM reading is reported
-    assert seen["heating"] == {(True, None)} and seen["methanol"] == {(True, None)}
+    # methanol removal: the stirrer runs, but no RPM reading is reported
+    assert "heating" not in seen and seen["methanol"] == {(True, None)}
     assert seen["magnesol"] == ("magnesol", False, True, True, None)   # heater off, stirrer on, waiting
     assert seen["after"] == "contact"
     assert seen["contact"] == ("contact", False, True, True)           # stirred at 200 RPM, heater off
@@ -596,23 +672,21 @@ async def _start_separation(runner, **kwargs):
     runner.start("Separation", S, **kwargs)
 
 
-def test_reaction_overheat_faults():
+def test_reactions_have_no_temperature_check():
+    """Esterification keeps running when the temperature is high or there is no reading."""
     hw = _machine()
     runner = StageRunner(hw, 2000)
 
     async def scenario():
-        runner.start("Esterification", S, voltage=20, time_min=60, stirring=500)
+        runner.start("Esterification", S, voltage=20, time_min=30, stirring=500)
         hw.set_temperature(70)
-        hw._snapshot = {**hw.read(), "temperature": 70.0}
+        while runner.active and runner.state["elapsedSeconds"] < 60:
+            await asyncio.sleep(0.005)
+        hw._read_sensors = lambda: {"temperature": None}
         while runner.active:
             await asyncio.sleep(0.005)
     run(scenario())
-    assert runner.state["state"] == "fault" and "60 °C" in runner.state["faultReason"]
-    assert not hw.electrode_power_on
-    with pytest.raises(StageError):
-        runner.start("Transesterification", S)   # needs a reset first
-    runner.reset()
-
+    assert runner.state["state"] == "complete" and runner.state["faultReason"] is None
 
 def test_stage_limits():
     runner = StageRunner(SimulatedMachine())

@@ -87,7 +87,12 @@ class StageRunner:
         if self.state["state"] == "fault":
             raise StageError("Fault — controller reset required.")
         if stage in REACTIONS:
-            limits = s.esterification if stage == "Esterification" else s.transesterification
+            # Checked now, so the stage doesn't start and then fault a second later. (No temperature
+            # check: the reactions run with or without a temperature reading.)
+            fault = getattr(self.hw, "link_fault", None)
+            if fault:
+                raise StageError(f"{stage} can't start: {fault}.")
+            limits =s.esterification if stage == "Esterification" else s.transesterification
             voltage = limits.voltage.default if voltage is None else voltage
             time_min = limits.time.default if time_min is None else time_min
             stirring = limits.stirring.default if stirring is None else stirring
@@ -225,19 +230,15 @@ class StageRunner:
                 st["elapsedSeconds"] += 1
                 st["remainingSeconds"] = max(round(st["timeMinutes"] * 60) - st["elapsedSeconds"], 0)
                 if st["stage"] in REACTIONS:
-                    if t is None:
-                        self._finish("fault", "temperature reading lost")
-                        break
-                    if t > s.reaction_maximum_temperature:
-                        self._finish("fault", f"temperature exceeded {s.reaction_maximum_temperature:g} °C")
-                        break
+                    # no temperature checks in the reactions: the reading is only recorded (if there is one)
                     i = st["liveCurrent"]
                     self._over_current = self._over_current + 1 if i is not None and i > st["current"] else 0
                     if self._over_current >= OVERCURRENT_SECONDS:
                         self._finish("fault", f"current {i:.2f} A went above the {st['current']:g} A setting")
                         break
-                    self._temperatures.append(t)
-                    st["averageTemperature"] = round(sum(self._temperatures) / len(self._temperatures), 1)
+                    if t is not None:
+                        self._temperatures.append(t)
+                        st["averageTemperature"] = round(sum(self._temperatures) / len(self._temperatures), 1)
                     if st["liveVoltage"] is not None and st["liveCurrent"] is not None:
                         st["energyKwh"] += st["liveVoltage"] * st["liveCurrent"] / 3_600_000   # 1 s of V × A
                 if st["remainingSeconds"] <= 0:

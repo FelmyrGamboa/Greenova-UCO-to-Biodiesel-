@@ -27,8 +27,13 @@ class SimulatedMachine(Hardware):
     OUTLET_G_PER_S = 3.0
     BIODIESEL_FRACTION = 0.85
 
-    def __init__(self, time_scale: float = 1.0, level_switch: bool = False):
+    def __init__(self, time_scale: float = 1.0, level_switch: bool = False, heater_lag: float = 0.0):
         super().__init__()
+        # heater_lag 0: the heater warms the reading at once. > 0: its heat first goes into the
+        # heater and the tank and reaches the probe a share (1 - heater_lag) per second later, so the
+        # temperature keeps rising after a pulse, peaks and then falls (like the real immersion heater).
+        self.heater_lag = heater_lag
+        self.heat_store = 0.0
         self.time_scale = time_scale
         self.level_switch = level_switch   # True: a float switch at the heater (reads the purifier level)
         self._lock = threading.Lock()
@@ -91,7 +96,13 @@ class SimulatedMachine(Hardware):
         """Moves the machine on by dt simulated seconds (0: only takes note of a switched output)."""
         with self._lock:
             self.seconds += dt
-            if self.heater_on:
+            if self.heater_lag:
+                if self.heater_on:
+                    self.heat_store += 0.75 * dt
+                passed = self.heat_store * (1 - self.heater_lag ** dt)
+                self.heat_store -= passed
+                self.temp_c += passed - (self.temp_c - self.AMBIENT_C) * min(0.002 * dt, 1.0)
+            elif self.heater_on:
                 self.temp_c += 0.75 * dt
             elif self.electrode_power_on:
                 self.temp_c += (42.0 - self.temp_c) * min(0.002 * dt, 1.0)   # settles near 42 °C

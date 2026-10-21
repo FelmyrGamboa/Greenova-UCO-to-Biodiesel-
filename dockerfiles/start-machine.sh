@@ -91,7 +91,7 @@ if [ "$MODE" = "--test-outputs" ]; then
 fi
 
 for f in frontend.Dockerfile mysql-init; do
-  [ -e "$HERE/$f" ] || warn "$f is missing next to docker-compose.yaml (keep your own from before)."
+  [ -e "$HERE/$f" ] || warn "$f is missing next to docker-compose.yaml (it comes with the project zip)."
 done
 
 step "1. Stopping programs that use the ESP32's USB port or the GPIO pins"

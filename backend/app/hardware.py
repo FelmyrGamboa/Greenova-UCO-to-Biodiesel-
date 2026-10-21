@@ -195,9 +195,10 @@ class Hardware:
             return self.refresh()
         return {**self._snapshot, **self._output_states()}
 
-    def watchdog(self, heater_max_c: float, reaction_max_c: float) -> Optional[str]:
-        """Turns the heater or the electrodes off if something is wrong. Returns an alarm
-        message, or None."""
+    def watchdog(self, heater_max_c: float, reaction_max_c: Optional[float] = None) -> Optional[str]:
+        """Turns the heater off if something is wrong (no temperature reading, too hot, level
+        switch dry). Returns an alarm message, or None. The electrodes are not checked against the
+        temperature (the reactions run without a temperature check); reaction_max_c is unused."""
         t = self.read().get("temperature")
         problem = None if t is not None else "temperature reading lost"
         if self.heater_on and (problem or t > heater_max_c):
@@ -206,9 +207,6 @@ class Hardware:
         if self.heater_on and self.read().get("heaterSubmerged") is False:
             self.set_heater(False)
             return "Heater stopped: biodiesel level dropped below the heater."
-        if self.electrode_power_on and (problem or t > reaction_max_c):
-            self.set_electrode_power(False)
-            return f"Electrodes stopped: {problem or f'temperature exceeded {reaction_max_c:g} °C'}."
         return None
 
     # ----- implemented by Esp32Hardware and PiHardware (and the tests' simulated machine) -----

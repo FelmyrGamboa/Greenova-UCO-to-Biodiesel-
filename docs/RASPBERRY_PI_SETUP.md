@@ -79,8 +79,8 @@ ESP32 outputs: see `firmware/esp32_process_control/README.md` (`dispenser1` GPIO
 | Reactor stirrer | `mixer1` | reaction stages |
 | Reactor pump (reactor → centrifuge) | `reactorpump` | separation (after the 1 min settle), with the centrifuge |
 | Pumpin (centrifuge → purifier) | `pumpin` | separation, with the centrifuge |
-| Immersion heater | `heater` | purification heating and methanol removal (87–90 °C) |
-| Dry wash stirrer | `mixer2` | purification heating, methanol removal, the Magnesol prompt and contact (200 RPM) |
+| Immersion heater | `heater` | purification methanol removal, 2-second pulses (the next one when the temperature is getting lower; none from 90 °C) |
+| Dry wash stirrer | `mixer2` | purification methanol removal, the Magnesol prompt and contact (200 RPM) |
 | Purification outlet (purifier → output container) | `valve` + `pumpout` | after contact and the 1 min settle, until the output load cell is stable for 30 s |
 
 Check which dispenser holds which premix. Change any line to match the real machine (`""` = not fitted, `["valve", "pumpout"]` = outputs that work together). `[esp32.max_on_seconds]` can give an output an extra time limit (the ESP32 switches it off by itself), but it isn't needed: every output is switched off by its process step.
@@ -129,7 +129,7 @@ Greenova now names the cause when a pin is taken ("GPIO 23 (centrifuge L_EN) is 
 
 ### Running the backend in Docker
 
-Use the files in `dockerfiles/` (keep your own `frontend.Dockerfile` and `mysql-init/` next to them) and start everything with one command on the Pi:
+Use the files in `dockerfiles/` (`docker-compose.yaml`, `backend.Dockerfile`, `frontend.Dockerfile`, `mysql-init/`, `start-machine.sh`) and start everything with one command on the Pi:
 
 ```bash
 cd ~/Desktop/Greenova-UCO-to-Biodiesel-/dockerfiles
@@ -144,6 +144,10 @@ It stops the old Pi control panel and a native `greenova` service (both would ta
 - The backend container gets the whole `/dev` (`privileged: true`), so it finds the ESP32 as `/dev/ttyUSB0` or `/dev/ttyACM0` (also after a replug) and the header's GPIO chip on a Pi 4 or Pi 5 by itself. No `GPIO_CHIP` or device list to edit.
 - `backend/data` holds `hardware.toml` (optional: without it the built-in pins are used, which match the supplied wiring) and `loadcell_calibration.json` (Tare / Calibrate), so they survive a rebuild.
 - A few seconds after it starts, the backend writes a **Hardware check:** line for each part to its log (`docker compose logs backend`).
+
+### "Fault — controller reset required" in esterification or transesterification
+
+The reactions no longer check the temperature, so a missing DS18B20 reading can't stop them. A reaction doesn't start while the ESP32 controller is offline or faulty (the page says why). If it stops while running, the reason is under **Stopped:** on the stage and in the alarm. The usual one is the ESP32 restarting: when the backend sees its boot messages it says "the ESP32 stopped answering: its supply voltage dipped (brownout)…". That happens when mixer 1 or the electrode relay switches on and the ESP32, the relay board and the L298N share the Pi's USB power. Give them their own 5 V supply (GND shared) and use a short, good USB data cable. Press **Reset controller**, then start again.
 
 ### When separation doesn't go on to purification
 

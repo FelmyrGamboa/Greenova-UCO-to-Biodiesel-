@@ -51,7 +51,7 @@ They run anywhere (a laptop too): the process tests use `tests/simulator.py`, a 
 | `app/analytics.py` | Summary, best parameters per FFA range, recommended parameters, cost per liter |
 | `app/stages.py` | Esterification, Transesterification and Separation (settle, then reactor pump + centrifuge + pumpin) |
 | `app/transfers.py` | The oil pump and the dispensers (pump A, pump B): on until the operator presses Done |
-| `app/purification.py` | Purification: heating → methanol removal at 87–90 °C → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
+| `app/purification.py` | Purification: methanol removal straight away (heater in 2 s pulses) → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
 | `app/system.py` | System Status tiles and device list |
 | `app/hardware.py` | Safety interlocks and the older all-on-the-Pi wiring (`PiHardware`, `backend = "gpio"`) |
 | `app/esp32.py` | The machine (`backend = "esp32"`, the default): the ESP32 serial link (dead-man timer, status checks) and `Esp32Hardware` with the Pi's centrifuge and load cells |
@@ -104,15 +104,14 @@ After separation, purification runs by itself. The operator only adds the adsorb
 
 | Step | What happens | Time |
 |---|---|---|
-| 1. Heating | Stirrer (`mixer2`) at 200 RPM, then the heater, until **90 °C**; there the heater switches off. The website shows "Prepare X g Magnesol". | Fault if 90 °C isn't reached in 25 min |
-| 2. Methanol removal | Kept at **87–90 °C**: the heater switches off at 90 °C and back on when it drops to 87 °C, so the excess methanol evaporates. | `methanolRemovalTime` (10 min) |
-| 3. Add adsorbent | Heater off, stirrer on. "Add X g Magnesol (1% of the oil weight)"; waits for **Confirm**. | Waits for the operator |
-| 4. Contact | Stirred at **200 RPM** (the RPM is shown here), heater off. | `contactTime` |
-| 5. Settle | Stirrer off: it settles for **1 minute**. | 60 s |
-| 6. Drain | The **valve** opens and **pumpout** runs: purifier → filter → output container. Done **only** when the output load cell stays within ±2 g for **30 s** (counted once the flow has started). No time limit. | |
-| 7. Done | Everything is switched off. "Low output – check the polishing filter" when less than 70% of the oil weight came out. | |
+| 1. Methanol removal | Starts at once (no heating step). Stirrer (`mixer2`) at 200 RPM; the heater runs in **2-second pulses**: on 2 s, off, the Pi waits for the temperature to rise to its highest point, and when it is getting lower (0.2 °C below that point) the next 2 s pulse, until the time is over. No pulse at or above 90 °C. The website shows "Prepare X g Magnesol". | `methanolRemovalTime` (10 min) |
+| 2. Add adsorbent | Heater off, stirrer on. "Add X g Magnesol (1% of the oil weight)"; waits for **Confirm**. | Waits for the operator |
+| 3. Contact | Stirred at **200 RPM** (the RPM is shown here), heater off. | `contactTime` |
+| 4. Settle | Stirrer off: it settles for **1 minute**. | 60 s |
+| 5. Drain | The **valve** opens and **pumpout** runs: purifier → filter → output container. Done **only** when the output load cell stays within ±2 g for **30 s** (counted once the flow has started). No time limit. | |
+| 6. Done | Everything is switched off. "Low output – check the polishing filter" when less than 70% of the oil weight came out. | |
 
-**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g: Magnesol 1% = oil volume × 0.0092 g (500 mL → 4.6 g), bentonite 2% = × 0.0184 g. Settings → Purification has the two times, the two doses and the default adsorbent; the 87–90 °C hold, the 95 °C cutoff, the 200 RPM stirrer, the 1-minute settle and the drain rule are fixed in `app/purification.py`. The settle time is recorded in the `settlingTimeSeconds` column. Purification needs a reading from the output load cell (it is the only way the run completes).
+**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g: Magnesol 1% = oil volume × 0.0092 g (500 mL → 4.6 g), bentonite 2% = × 0.0184 g. Settings → Purification has the two times, the two doses and the default adsorbent; the 2 s heater pulses (none from 90 °C), the 95 °C cutoff, the 200 RPM stirrer, the 1-minute settle and the drain rule are fixed in `app/purification.py`. The settle time is recorded in the `settlingTimeSeconds` column. Purification needs a reading from the output load cell (it is the only way the run completes).
 
 With the optional level switch (`[level_switch]` in `hardware.toml`) the heater waits until biodiesel covers it; without one, purification starts at once (and a manual restart asks the operator to confirm that the heater is submerged).
 
@@ -121,9 +120,9 @@ With the optional level switch (`[level_switch]` in `hardware.toml`) the heater 
 - The heater runs only while the purification stirrer runs and the heater is submerged, and never while the purification outlet (valve + pumpout) is on. Stopping the stirrer or opening the valve turns the heater off first. Enforced in `hardware.py`, for every caller.
 - Pumps into the reactor (oil, A, B) never run while the reactor pump empties it (and the reverse), and only one at a time.
 - Every output is switched on with the ESP32's 5 s timer and refreshed every second: if the Pi, the backend or the USB cable stops, the ESP32 switches it off by itself. No status from the ESP32 for 3.5 s, or an output that doesn't follow its command, stops every process and switches everything off.
-- Every second, a watchdog turns off the heater (above **95 °C**, or the level switch reads dry) or the electrodes (above `reactionMaximumTemperature`, default 60 °C) when the temperature is too high or the reading is lost.
-- A reaction stage faults on lost temperature, over-temperature, or a measured current above the current setting; it needs a controller reset before the next start.
-- Purification stops safely (heater, stirrer, valve and pumpout off) on lost temperature, above 95 °C, not reaching 90 °C within 25 min, the level switch reading dry, an operator Stop, or any unexpected error; it won't start again until the stop is acknowledged.
+- Every second, a watchdog turns off the heater above **95 °C**, when the temperature reading is lost, or when the level switch reads dry.
+- The reactions (esterification, transesterification) have **no temperature check**: they run with or without a temperature reading. They don't start while the ESP32 controller is offline or faulty, and a reaction stage faults on a measured current above the current setting (with a power monitor fitted); it needs a controller reset before the next start.
+- Purification stops safely (heater, stirrer, valve and pumpout off) on lost temperature during methanol removal, above 95 °C, the level switch reading dry, an operator Stop, or any unexpected error; it won't start again until the stop is acknowledged.
 - Emergency stop (website) stops the stage, the pumps and purification and switches every output off. On startup and shutdown everything is off.
 
 The thermal fuse stays your hardware backup. Set the software maximum below the fuse rating, so the software trips first.

@@ -20,10 +20,11 @@ export type Catalyst = "NaOH" | "KOH";
 export type Adsorbent = "Magnesol" | "Bentonite";
 export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-/** Dry wash with Magnesol or bentonite: heating (heater off at 90 °C) → methanol removal (kept at
- * 87–90 °C) → add the adsorbent (operator; the phase is still called "magnesol") → contact (stirred
- * at 200 RPM, heater off) → settle (1 min, stirrer off) → drain (valve + pumpout, until the output
- * load cell is stable for 30 s) → complete. */
+/** Dry wash with Magnesol or bentonite: methanol removal straight away (stirrer on, heater in 2 s
+ * pulses: the next pulse when the temperature is getting lower again, none at or above 90 °C) → add
+ * the adsorbent (operator; the phase is still called "magnesol") → contact (stirred at 200 RPM,
+ * heater off) → settle (1 min, stirrer off) → drain (valve + pumpout, until the output load cell is
+ * stable for 30 s) → complete. ("heating" is no longer used.) */
 export type PurificationPhase =
   | "ready" | "heating" | "methanol" | "magnesol" | "contact" | "settle" | "drain" | "complete" | "fault";
 export type TileState = "ready" | "checking" | "fault";
@@ -205,14 +206,17 @@ export type PurificationStatus = {
   batchId: string | null;
   /** Started by itself after separation (level switch), rather than by hand. */
   automatic: boolean;
-  /** Fixed: heater off at 90 °C (back on at 87 °C), safety cutoff above 95 °C. */
+  /** Fixed: no heater pulse at or above 90 °C, safety cutoff above 95 °C. */
   targetTemperature: number;
   maximumTemperature: number;
   liveTemperature: number | null;
   startingTemperature: number | null;
   highestTemperature: number | null;
+  /** Always 0 now (no heating step). */
   heatingTimeSeconds: number;
-  heatingTimeoutSeconds: number;
+  /** Methanol removal: the heater's pulse length (2 s) and the pulses so far. */
+  heaterPulseSeconds?: number;
+  heaterPulses?: number;
   methanolTotalSeconds: number;
   methanolRemainingSeconds: number;
   /** Adsorbent to add (g): Magnesol oil mL × 0.0092, bentonite oil mL × 0.0184. */
@@ -233,7 +237,7 @@ export type PurificationStatus = {
   /** Biodiesel collected in this run (output load cell). */
   outputWeightG: number | null;
   oilWeightG: number | null;
-  /** The current step's timer (null for steps without one, e.g. heating). */
+  /** The current step's timer (null for steps without one, e.g. the Magnesol prompt). */
   stepRemainingSeconds: number | null;
   stepTotalSeconds: number | null;
   heaterOn: boolean;
@@ -294,7 +298,7 @@ export type ProcessConfig = {
    * limits. It starts by itself after transesterification and a settle of settleSeconds. */
   separation: { timeMinutes: number; speedRpm: number; timeMin: number; timeMax: number; speedMin: number;
     speedMax: number; settleSeconds: number };
-  purification: { holdTemperature: number; holdBand: number; maximumTemperature: number; heatingTimeoutMinutes: number;
+  purification: { holdTemperature: number; heaterPulseSeconds: number; pulseDropC: number; maximumTemperature: number;
     methanolRemovalMinutes: number; contactMinutes: number; settleSeconds: number;
     stirringSpeedRpm: number; drainStableGrams: number; drainStableSeconds: number;
     lowOutputFraction: number; magnesolGramsPerMlOil: number; bentoniteGramsPerMlOil?: number; adsorbents?: Adsorbent[];

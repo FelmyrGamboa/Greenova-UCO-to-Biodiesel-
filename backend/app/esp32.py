@@ -142,6 +142,7 @@ class Esp32Serial:
         self._last_rx = 0.0
         self._opened_at = 0.0
         self._rx_lines = 0
+        self._restart: Optional[tuple[float, str]] = None   # (when, why) the ESP32 last restarted by itself
         self.error: Optional[str] = "connecting..."
         self.log: collections.deque = collections.deque(maxlen=40)
         self._stop = threading.Event()
@@ -260,6 +261,26 @@ class Esp32Serial:
                     log.exception("ESP32 status check failed")
         elif " -> " not in text:          # skip the ESP32's echo of every (repeated) switch command
             self._add_log(text)
+            self._note_restart(text)
+
+    def _note_restart(self, text: str) -> None:
+        """The ESP32's own boot messages: it restarted (a reset, or its supply voltage dipped)."""
+        lower = text.lower()
+        why = None
+        if "brownout" in lower:
+            why = ("its supply voltage dipped (brownout), usually when a motor or relay switches on. Give the "
+                   "ESP32 and the relay / motor boards their own 5 V supply (not only the Pi's USB port), "
+                   "with GND shared")
+        elif "rst:0x" in lower:
+            why = f"it restarted ({text[lower.index('rst:0x'):].split(',')[0]})"
+        elif lower.startswith("connecting to ") and self._last_rx > self._opened_at:
+            why = "it restarted (its sketch started again)"
+        if why is None:
+            return
+        previous = self._restart
+        if previous is None or "brownout" not in previous[1] or time.monotonic() - previous[0] > 30:
+            self._restart = (time.monotonic(), why)     # a brownout stays the reason for that restart
+        log.warning("ESP32: %s", why)
 
     def _poller(self) -> None:
         while not self._stop.wait(self.poll_seconds):
@@ -308,6 +329,8 @@ class Esp32Serial:
         if self._ser is None:
             return self.error or "not connected"
         if self._last_rx > self._opened_at:
+            if self._restart and self._restart[0] >= self._last_rx - 1:
+                return f"the ESP32 stopped answering: {self._restart[1]}"
             return "the ESP32 stopped answering (was it reset or unplugged?)"
         waited = time.monotonic() - self._opened_at
         if waited < 15:

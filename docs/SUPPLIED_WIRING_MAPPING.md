@@ -70,7 +70,7 @@ When each output runs (2026-10-21):
   Done (a 30-minute limit stops a forgotten pump with a fault).
 - `reactorpump`, the centrifuge and `pumpin`: together, after transesterification and a 1-minute
   settle in the reactor, for the batch's separation time (Volume & Parameters); all three stop then.
-- `heater`: purification heating to 90 °C, then 87–90 °C during methanol removal.
+- `heater`: purification methanol removal, in 2-second pulses (the next one when the temperature is getting lower; none from 90 °C).
 - `mixer2`: heating, methanol removal, the Magnesol prompt and contact (200 RPM); off for the
   1-minute settle and the drain.
 - `valve` + `pumpout`: after the settle, until the output load cell is stable for 30 s.
