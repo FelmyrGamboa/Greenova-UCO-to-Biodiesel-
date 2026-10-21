@@ -1,0 +1,98 @@
+# Greenova in Docker on the Raspberry Pi wired to the machine: MySQL + backend (FastAPI, drives the
+# ESP32 and the Pi's GPIO) + website (Vite dev server).
+#
+# Easiest, from this folder:   bash start-machine.sh
+#   (stops the old Pi control panel, builds, starts, then checks the ESP32, temperature, load cell
+#    and centrifuge and tells you what doesn't work)
+# By hand:
+#     docker compose up -d --build      start everything in the background
+#     docker compose logs -f backend    the backend's log (the "Hardware check:" lines)
+#     docker compose down               stop it (the MySQL data is kept)
+#
+# Website: http://<pi>:8443   API: http://<pi>:8000/docs   MySQL: 127.0.0.1:3307
+# Keep your own frontend.Dockerfile and mysql-init/ folder next to this file.
+
+name: greenova
+
+services:
+  # ---------- MySQL 8.4: the greenova_db database, user "greenova" with no password ----------
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: greenova_db
+      # Only for logging in as root (e.g. in HeidiSQL). The backend uses "greenova".
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-greenova_root}
+      TZ: ${TZ:-Asia/Manila}
+      # MYSQL_USER is not set on purpose: the image refuses to create a user without a password,
+      # so mysql-init/01-greenova-user.sql creates 'greenova' (no password) instead.
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # 127.0.0.1 only: a user without a password should not be reachable from the Wi-Fi.
+      - "127.0.0.1:${MYSQL_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "mysql", "-h", "127.0.0.1", "-u", "greenova", "-e", "SELECT 1", "greenova_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------- Backend: FastAPI on port 8000, driving the real machine ----------
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../dockerfiles/backend.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # The ESP32's USB serial port and the Pi's GPIO chip. With the whole /dev the backend finds them
+    # itself: /dev/ttyUSB0 or /dev/ttyACM0 (also after the cable is replugged and the name changes),
+    # and the header's chip on a Pi 4 (gpiochip0) or a Pi 5 (gpiochip0 or gpiochip4). privileged is
+    # needed for that; this Pi is the machine's controller.
+    privileged: true
+    volumes:
+      - /dev:/dev
+      # hardware.toml (optional: without it the built-in pins are used, which match the supplied
+      # wiring) and loadcell_calibration.json (Tare / Calibrate from the website)
+      - ../backend/data:/app/data
+    environment:
+      # The MySQL login (app/config.py reads these; they win over anything in backend/.env).
+      DB_HOST: mysql                     # the service name above, not localhost
+      DB_PORT: "3306"                    # the port inside Docker's network, not 3307
+      DB_USER: greenova
+      DB_PASSWORD: ""                    # no password
+      DB_NAME: greenova_db
+      TZ: ${TZ:-Asia/Manila}
+      # GPIO_CHIP is not set: the backend picks the header's chip by its name (pinctrl-rp1 / -bcm2711)
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    # time for the backend to switch every output off when it stops
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ---------- Website: Vite dev server (npm run dev) on port 8443 ----------
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../dockerfiles/frontend.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # vite.config.ts forwards /api to this address (the backend service, inside Docker).
+      GREENOVA_API: http://backend:8000
+      PORT: "8443"
+    ports:
+      - "${FRONTEND_PORT:-8443}:8443"
+
+volumes:
+  mysql-data:

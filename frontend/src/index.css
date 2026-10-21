@@ -1,0 +1,598 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import 'tailwindcss';
+
+/*
+ * Greenova themes
+ * ---------------
+ * Every color comes from the variables below, so one switch (data-theme on <html>) changes the
+ * whole interface. Dark is "night shift": deep forest greens. Light is "daylight lab": soft sage
+ * paper with white panels. The landing page always stays dark (data-theme="dark" on its layout).
+ *
+ * The pages use Tailwind classes like text-white, text-gray-500, border-white/[0.07] and
+ * text-green-400. Those read Tailwind's palette variables, so each theme redefines them:
+ * "white" means "strongest text color" and "gray-500" means "secondary text", in both themes.
+ */
+@theme inline {
+  --color-gv-bg: var(--gv-bg);
+  --color-gv-surface: var(--gv-surface);
+  --color-gv-card: var(--gv-card);
+  --color-gv-inset: var(--gv-inset);
+  --color-gv-border: var(--gv-border);
+  --color-gv-border-hover: var(--gv-border-strong);
+  --color-gv-green: var(--gv-accent-fill);
+  --color-gv-green-dark: #166534;
+  --color-gv-green-dim: #14532d;
+  --color-gv-lime: #15803d;
+  --color-gv-text: var(--gv-text);
+  --color-gv-muted: var(--gv-text-3);
+  --color-gv-muted-light: var(--gv-text-2);
+}
+
+@theme {
+  --font-display: 'Manrope', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+/* ---------- dark (default) ---------- */
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+  --gv-bg: #0b120e;
+  --gv-surface: #0f1813;
+  --gv-card: #121c17;
+  --gv-inset: rgba(0, 0, 0, 0.22);
+  --gv-border: rgba(226, 244, 233, 0.08);
+  --gv-border-strong: rgba(226, 244, 233, 0.16);
+  --gv-input: #0d1511;
+  --gv-text: #edf4ef;
+  --gv-text-2: #b7c4bc;
+  --gv-text-3: #8a978f;
+  --gv-placeholder: #5b6861;
+  --gv-accent-fill: #16a34a;
+  --gv-accent-text: #4ade80;
+  --gv-button: #0c8442;
+  --gv-button-hover: #0a7239;
+  --gv-shadow: none;
+  --gv-chart-grid: rgba(226, 244, 233, 0.07);
+  --gv-chart-text: #8a978f;
+  --gv-chart-label: #b7c4bc;
+  --gv-logo-green: #edf4ef;
+  --gv-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a978f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* Tailwind palette, tuned to green-tinted neutrals with readable contrast on dark */
+  --color-white: #edf4ef;
+  --color-black: #000;
+  --color-gray-100: #f1f5f2;
+  --color-gray-200: #dfe7e2;
+  --color-gray-300: #cbd6cf;
+  --color-gray-400: #a8b5ad;
+  --color-gray-500: #8a978f;
+  --color-gray-600: #75827a;
+  --color-gray-700: #3b4741;
+  --color-gray-800: #1d2823;
+  --color-green-300: oklch(87.1% 0.15 154.449);
+  --color-green-400: oklch(79.2% 0.209 151.711);
+  --color-amber-400: oklch(82.8% 0.189 84.429);
+  --color-yellow-400: oklch(85.2% 0.199 91.936);
+  --color-red-300: oklch(80.8% 0.114 19.571);
+  --color-red-400: oklch(70.4% 0.191 22.216);
+  --color-blue-400: oklch(70.7% 0.165 254.624);
+  --color-cyan-400: oklch(78.9% 0.154 211.53);
+}
+
+/* ---------- light ---------- */
+[data-theme='light'] {
+  color-scheme: light;
+  --gv-bg: #edf2ee;
+  --gv-surface: #ffffff;
+  --gv-card: #ffffff;
+  --gv-inset: #f4f7f5;
+  --gv-border: #dbe3de;
+  --gv-border-strong: #c3cfc7;
+  --gv-input: #ffffff;
+  --gv-text: #12201a;
+  --gv-text-2: #34443b;
+  --gv-text-3: #5c6b63;
+  --gv-placeholder: #98a59e;
+  --gv-accent-fill: #16a34a;
+  --gv-accent-text: #0b7a38;
+  --gv-button: #0c8442;
+  --gv-button-hover: #0a7239;
+  --gv-shadow: 0 1px 2px rgba(18, 32, 26, 0.05), 0 4px 16px -8px rgba(18, 32, 26, 0.08);
+  --gv-chart-grid: rgba(18, 32, 26, 0.08);
+  --gv-chart-text: #5c6b63;
+  --gv-chart-label: #34443b;
+  --gv-logo-green: #12201a;
+  --gv-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235c6b63' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* "white" = strongest text, "black" = shadow/overlay; grays run dark to light */
+  --color-white: #12201a;
+  --color-black: #12201a;
+  --color-gray-100: #12201a;
+  --color-gray-200: #1d2b24;
+  --color-gray-300: #2c3a33;
+  --color-gray-400: #46544c;
+  --color-gray-500: #57655d;
+  --color-gray-600: #607068;
+  --color-gray-700: #a7b3ac;
+  --color-gray-800: #e1e8e3;
+  /* accent text colors dark enough to read on white */
+  --color-green-300: #0a6a30;
+  --color-green-400: #0b7a38;
+  --color-amber-400: #a15c00;
+  --color-yellow-400: #8f6200;
+  --color-red-300: #9b1c1c;
+  --color-red-400: #b91c1c;
+  --color-blue-400: #1d5fd1;
+  --color-cyan-400: #0e7490;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--gv-bg);
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  color: var(--gv-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--gv-accent-fill) 30%, transparent) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--gv-accent-fill) 28%, transparent);
+  border-radius: 3px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--gv-accent-fill);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/*
+ * Component classes live in the "components" layer, so Tailwind utilities on the same element
+ * (for example lg:hidden or !p-2 on a button) still win.
+ */
+@layer components {
+  /* Panel / card base */
+  .glass {
+    background: var(--gv-card);
+    border: 1px solid var(--gv-border);
+    box-shadow: var(--gv-shadow);
+  }
+
+  .glass-hover:hover {
+    border-color: var(--gv-border-strong);
+  }
+
+  .glow-green {
+    box-shadow: 0 0 20px rgba(22, 163, 74, 0.08);
+  }
+
+  .glow-green-sm {
+    box-shadow: none;
+  }
+
+  /* Background */
+  .bg-grid {
+    background-image:
+      linear-gradient(rgba(22, 163, 74, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(22, 163, 74, 0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .bg-blob {
+    background-color: var(--gv-bg);
+  }
+
+  .gv-pulse {
+    animation: gv-pulse 2.4s ease-in-out infinite;
+  }
+
+  /* Sidebar items */
+  .sidebar-item-active {
+    background: color-mix(in srgb, var(--gv-accent-fill) 12%, transparent);
+    border-left: 2px solid var(--gv-accent-fill);
+  }
+
+  .sidebar-item-hover:hover {
+    background: color-mix(in srgb, var(--gv-text) 5%, transparent);
+  }
+
+  /* Inputs */
+  .gv-input,
+  .gv-select,
+  .gv-textarea {
+    background: var(--gv-input);
+    border: 1px solid var(--gv-border-strong);
+    color: var(--gv-text);
+    border-radius: 8px;
+    padding: 9px 13px;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    outline: none;
+    width: 100%;
+  }
+
+  .gv-input::placeholder,
+  .gv-textarea::placeholder {
+    color: var(--gv-placeholder);
+  }
+
+  .gv-input:focus,
+  .gv-select:focus,
+  .gv-textarea:focus {
+    border-color: var(--gv-accent-fill);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--gv-accent-fill) 18%, transparent);
+  }
+
+  .gv-input:disabled,
+  .gv-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Number fields: no browser spin buttons (they covered the unit, e.g. ₱/L) */
+  .gv-input[type='number'] {
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
+
+  .gv-input[type='number']::-webkit-outer-spin-button,
+  .gv-input[type='number']::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .gv-select {
+    appearance: none;
+    cursor: pointer;
+    padding-right: 36px;
+    background-image: var(--gv-select-arrow);
+    background-repeat: no-repeat;
+    background-position: right 13px center;
+  }
+
+  .gv-select option {
+    background: var(--gv-card);
+    color: var(--gv-text);
+  }
+
+  .gv-textarea {
+    resize: vertical;
+    min-height: 80px;
+  }
+
+  /* Buttons */
+  .btn-primary,
+  .btn-secondary,
+  .btn-ghost,
+  .btn-danger {
+    border-radius: 8px;
+    padding: 9px 18px;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;   /* centered text when a button is stretched full width (phones) */
+    gap: 7px;
+  }
+
+  .btn-primary {
+    background: var(--gv-button);
+    color: #ffffff;
+    border: 1px solid var(--gv-button);
+    font-weight: 600;
+  }
+
+  .btn-primary:hover {
+    background: var(--gv-button-hover);
+    border-color: var(--gv-button-hover);
+  }
+
+  .btn-primary:active {
+    transform: translateY(1px);
+  }
+
+  .btn-secondary {
+    background: color-mix(in srgb, var(--gv-accent-fill) 10%, transparent);
+    color: var(--gv-accent-text);
+    border: 1px solid color-mix(in srgb, var(--gv-accent-fill) 30%, transparent);
+  }
+
+  .btn-secondary:hover {
+    background: color-mix(in srgb, var(--gv-accent-fill) 16%, transparent);
+    border-color: color-mix(in srgb, var(--gv-accent-fill) 45%, transparent);
+  }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--gv-text-2);
+    border: 1px solid var(--gv-border-strong);
+  }
+
+  .btn-ghost:hover {
+    background: color-mix(in srgb, var(--gv-text) 5%, transparent);
+    color: var(--gv-text);
+  }
+
+  .btn-danger {
+    background: color-mix(in srgb, #ef4444 10%, transparent);
+    color: var(--color-red-400);
+    border: 1px solid color-mix(in srgb, #ef4444 30%, transparent);
+  }
+
+  .btn-danger:hover {
+    background: color-mix(in srgb, #ef4444 16%, transparent);
+  }
+
+  .btn-primary:disabled,
+  .btn-secondary:disabled,
+  .btn-ghost:disabled,
+  .btn-danger:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  /* Animations */
+  .fade-in-up {
+    animation: fadeInUp 0.28s ease forwards;
+  }
+
+  .fade-in {
+    animation: fadeIn 0.22s ease forwards;
+  }
+
+  .toast-enter {
+    animation: slideInRight 0.25s ease forwards;
+  }
+
+  /* Progress bar */
+  .progress-track {
+    background: color-mix(in srgb, var(--gv-text) 9%, transparent);
+    border-radius: 99px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    background: var(--gv-accent-fill);
+    border-radius: 99px;
+    transition: width 0.5s ease;
+  }
+
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+
+  .separator {
+    border: none;
+    border-top: 1px solid var(--gv-border);
+  }
+
+  /* Tables */
+  .gv-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .gv-table th {
+    text-align: left;
+    padding: 10px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--gv-text-3);
+    border-bottom: 1px solid var(--gv-border);
+  }
+
+  .gv-table td {
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--gv-text-2);
+    border-bottom: 1px solid var(--gv-border);
+  }
+
+  .gv-table tr:last-child td {
+    border-bottom: none;
+  }
+
+  .gv-table tr:hover td {
+    background: color-mix(in srgb, var(--gv-text) 3%, transparent);
+  }
+
+  .gv-checkbox {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--gv-accent-fill);
+    cursor: pointer;
+  }
+
+  .gv-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--gv-text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+    display: block;
+  }
+
+  .section-kicker {
+    color: var(--gv-accent-text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .greenova-logo-green {
+    color: var(--gv-logo-green);
+  }
+
+  .greenova-logo-ova {
+    color: #01ab4a;
+  }
+
+  /* Theme switch in the sidebar */
+  .theme-switch {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    padding: 3px;
+    border-radius: 9px;
+    background: var(--gv-inset);
+    border: 1px solid var(--gv-border);
+  }
+
+  .theme-switch button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--gv-text-3);
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+  }
+
+  .theme-switch button:hover {
+    color: var(--gv-text);
+  }
+
+  .theme-switch button[aria-pressed='true'] {
+    background: var(--gv-card);
+    color: var(--gv-text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  }
+
+  /* Landing page */
+  .landing-cta {
+    align-items: center;
+    background: #01ab4a;
+    border: 1px solid #01ab4a;
+    border-radius: 7px;
+    color: #ffffff;
+    display: inline-flex;
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    justify-content: center;
+    transition: background-color 150ms ease, border-color 150ms ease, transform 100ms ease;
+  }
+
+  .landing-cta:hover {
+    background: #019b43;
+    border-color: #019b43;
+  }
+
+  .landing-cta:active {
+    transform: translateY(1px);
+  }
+
+  .landing-cta-nav {
+    font-size: 13px;
+    padding: 8px 15px;
+  }
+
+  .landing-cta-hero {
+    gap: 9px;
+    font-size: 14px;
+    padding: 11px 21px;
+  }
+
+  .text-glow {
+    /* intentionally plain */
+  }
+
+  /* Sidebar close button: only on small screens */
+  .nav-close-button {
+    padding: 0.5rem !important;
+  }
+
+  @media screen and (min-width: 1024px) {
+    .nav-close-button {
+      display: none;
+    }
+  }
+}
+
+@keyframes gv-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

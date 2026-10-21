@@ -1,0 +1,10 @@
+{
+  "description": "Streamline task management for teams, enhancing collaboration and productivity with intuitive tools for tracking progress and deadlines.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
