@@ -2,7 +2,7 @@
 
 Sources: Van Gerpen, Tech Note 33 (2.25 g methanol and 0.05 g sulfuric acid per gram of FFA;
 catalyst with an FFA term); Canakci & Van Gerpen 2001 (20:1, then 40:1 methanol to FFA;
-target below 1% FFA). FFA is taken "as oleic acid".
+target at or below 3% FFA). FFA is taken "as oleic acid".
 """
 from typing import Optional
 
@@ -160,8 +160,8 @@ def quantity_cards(oil_g: float, ffa: float, ratio: float, catalyst: str, s: Set
 
 def after_esterification(oil_g: float, ffa_after: float, stage_done: int, ratio: float,
                          catalyst: str, s: Settings) -> dict:
-    """After a stage: another stage if FFA is still above the target, otherwise the exact
-    transesterification amounts."""
+    """After a stage: another stage if FFA is above the accepted target; otherwise return exact
+    transesterification amounts. The working database target is migrated to 3%."""
     if ffa_after > s.ffa_target:
         return {"action": "anotherStage", **esterification(oil_g, ffa_after, s, stage_done + 1)}
     return {"action": "transesterification", "ffa": ffa_after, "isEstimate": False,

@@ -1,36 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { getNetworkAddresses } from "../lib/api";
+import { piUrl, PI_ADDRESS } from "../lib/pi";
 import { qrModules, qrSvgPath } from "../lib/qr";
 import { useT } from "../lib/i18n";
 
-const LOCAL_HOSTS = ["localhost", "127.0.0.1", "::1", "[::1]"];
-
-/** The addresses a phone can open: this page's own address when it isn't "localhost";
- * otherwise this computer's network addresses (from the backend) with the same port. */
-function usePhoneUrls(active: boolean): string[] | null {
-  const [urls, setUrls] = useState<string[] | null>(null);
-  useEffect(() => {
-    if (!active) return;
-    const { protocol, hostname, port, origin } = window.location;
-    if (!LOCAL_HOSTS.includes(hostname)) {
-      setUrls([`${origin}/dashboard`]);
-      return;
-    }
-    let cancelled = false;
-    setUrls(null);
-    getNetworkAddresses()
-      .then((addresses) => {
-        if (!cancelled) setUrls(addresses.map((ip) => `${protocol}//${ip}${port ? `:${port}` : ""}/dashboard`));
-      })
-      .catch(() => {
-        if (!cancelled) setUrls([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [active]);
-  return urls;
+/** The address a phone opens: always the Raspberry Pi (PI_ADDRESS), on this page's port
+ * (8443 for the website in Docker, 8000 when the backend serves it). */
+function phoneUrl(): string {
+  return piUrl(window.location.port, "/dashboard");
 }
 
 function QrImage({ text }: { text: string }) {
@@ -52,14 +29,12 @@ const PhoneIcon = () => (
   </svg>
 );
 
-/** "Open on phone": a button that shows a QR code of the website's address on the local network. */
+/** "Open on phone": a button that shows a QR code of the website on the Raspberry Pi. */
 export default function PhoneAccess({ className = "" }: { className?: string }) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const [choice, setChoice] = useState(0);
   const [copied, setCopied] = useState(false);
-  const urls = usePhoneUrls(open);
-  const url = urls && urls.length ? urls[Math.min(choice, urls.length - 1)] : null;
+  const url = phoneUrl();
 
   useEffect(() => {
     if (!open) return;
@@ -85,10 +60,7 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
     <>
       <button
         type="button"
-        onClick={() => {
-          setChoice(0);
-          setOpen(true);
-        }}
+        onClick={() => setOpen(true)}
         className={`flex w-full items-center justify-center gap-2 rounded-lg border border-white/[0.08] px-3 py-2 text-xs font-medium text-gray-400 transition-colors hover:bg-white/[0.04] hover:text-white ${className}`}
       >
         <PhoneIcon />
@@ -105,56 +77,30 @@ export default function PhoneAccess({ className = "" }: { className?: string }) 
               role="dialog"
               aria-modal="true"
               aria-labelledby="phone-access-title"
-              className="glass fade-in-up w-full max-w-md rounded-2xl p-6"
+              // className="glass fade-in-up w-full max-w-md rounded-2xl p-6"
+              className="glass fade-in-up w-full max-w-md max-h-[90dvh] overflow-y-auto overscroll-contain rounded-2xl p-4 sm:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <h2 id="phone-access-title" className="font-display text-lg font-semibold text-white">{t("Open on your phone")}</h2>
-                  <p className="mt-1 text-sm text-gray-500">{t("Scan with the phone's camera. The phone must be on the same Wi-Fi as this computer.")}</p>
+                  <p className="mt-1 text-sm text-gray-500">{t("Scan with the phone's camera to open Greenova on the Raspberry Pi.")}</p>
                 </div>
                 <button type="button" onClick={() => setOpen(false)} aria-label={t("Close")} className="rounded-md px-2 py-1 text-lg leading-none text-gray-500 hover:text-white">×</button>
               </div>
 
               <div className="mt-6 flex flex-col items-center">
-                {urls === null ? (
-                  <div className="flex h-56 w-56 items-center justify-center rounded-xl border border-white/[0.08] text-sm text-gray-500">{t("Finding this computer's address…")}</div>
-                ) : url ? (
-                  <>
-                    <QrImage text={url} />
-                    <div className="mt-4 flex w-full items-center gap-2 rounded-lg border border-white/[0.08] bg-gv-inset px-3 py-2">
-                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200">{url}</span>
-                      <button type="button" onClick={copy} className="shrink-0 text-xs font-semibold text-green-400 hover:text-green-300">{copied ? t("Copied") : t("Copy")}</button>
-                    </div>
-                    {urls.length > 1 && (
-                      <div className="mt-3 w-full">
-                        <div className="gv-label">{t("Other addresses of this computer")}</div>
-                        <div className="flex flex-wrap gap-2">
-                          {urls.map((other, index) => (
-                            <button
-                              key={other}
-                              type="button"
-                              onClick={() => setChoice(index)}
-                              className={`rounded-md border px-2 py-1 font-mono text-xs ${index === choice ? "border-green-500/40 text-green-400" : "border-white/[0.08] text-gray-500 hover:text-white"}`}
-                            >
-                              {new URL(other).hostname}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div className="w-full rounded-xl border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm leading-6 text-amber-400">
-                    {t("Couldn't find this computer's network address. Start the backend (python main.py), or run ipconfig in Command Prompt and open http://<IPv4 Address>:{port} on the phone.", { port: window.location.port || "80" })}
-                  </div>
-                )}
+                <QrImage text={url} />
+                <div className="mt-4 flex w-full items-center gap-2 rounded-lg border border-white/[0.08] bg-gv-inset px-3 py-2">
+                  <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200">{url}</span>
+                  <button type="button" onClick={copy} className="shrink-0 text-xs font-semibold text-green-400 hover:text-green-300">{copied ? t("Copied") : t("Copy")}</button>
+                </div>
               </div>
 
               <div className="mt-6 space-y-2 rounded-xl border border-white/[0.07] bg-gv-inset p-4 text-xs leading-5 text-gray-500">
                 <p className="font-semibold text-gray-300">{t("It doesn't open on the phone?")}</p>
-                <p>{t("When Windows asks, allow Node.js on Private networks, and set the Wi-Fi to Private (Settings → Network & internet → Wi-Fi → your network → Private network).")}</p>
-                <p>{t("School and public Wi-Fi often block devices from reaching each other. Turn on your phone's hotspot, connect this computer to it, and scan again.")}</p>
+                <p>{t("The phone must be on the same Wi-Fi as the Raspberry Pi ({address}), and the Pi must be on.", { address: PI_ADDRESS })}</p>
+                <p>{t("School and public Wi-Fi often block devices from reaching each other. Use the Wi-Fi the Pi is on.")}</p>
               </div>
             </div>
           </div>,

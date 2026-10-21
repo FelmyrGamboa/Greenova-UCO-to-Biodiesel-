@@ -2,11 +2,10 @@ import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
-import dgram from 'node:dgram'
-import os from 'node:os'
 
 import siteConfiguration from './.figma/make/site.json'
 import { qrTerminal } from './src/lib/qr'
+import { PI_ADDRESS } from './src/lib/pi'
 
 // Greenova backend (FastAPI). In development, /api is forwarded to it, so the website and the
 // backend look like one address and no CORS setup is needed. Change GREENOVA_API to use a
@@ -18,7 +17,7 @@ const greenovaApiProxy = {
     changeOrigin: true,
     ws: true,
     configure: (proxy: any) => {
-      // Backend not running: answer "offline" so the website falls back to its demo data.
+      // Backend not running: answer "offline" so the website says the Raspberry Pi can't be reached.
       proxy.on('error', (_error: unknown, _request: unknown, response: any) => {
         if (response && typeof response.writeHead === 'function' && !response.headersSent) {
           response.writeHead(503, { 'Content-Type': 'application/json', 'X-Greenova-Offline': '1' })
@@ -409,58 +408,12 @@ function figmaMakeKitPlugin(options: { storiesGlob: string | string[] }): Plugin
   }
 }
 
-/** The address this computer uses on its main network (the one with the internet route).
- * A UDP "connect" picks the network without sending anything. */
-function outgoingAddress(): Promise<string | null> {
-  return new Promise((resolve) => {
-    let finished = false
-    const socket = dgram.createSocket('udp4')
-    const done = (value: string | null) => {
-      if (finished) return
-      finished = true
-      try {
-        socket.close()
-      } catch {
-        // already closed
-      }
-      resolve(value)
-    }
-    socket.once('error', () => done(null))
-    setTimeout(() => done(null), 800)
-    try {
-      socket.connect(1, '10.255.255.255', () => {
-        try {
-          done(socket.address().address)
-        } catch {
-          done(null)
-        }
-      })
-    } catch {
-      done(null)
-    }
-  })
-}
-
-/** IPv4 addresses of this computer, with the network adapter's name. */
-function lanAddresses(): Array<{ ip: string; adapter: string }> {
-  const result: Array<{ ip: string; adapter: string }> = []
-  for (const [adapter, entries] of Object.entries(os.networkInterfaces())) {
-    for (const entry of entries ?? []) {
-      if (entry.family === 'IPv4' && !entry.internal && !entry.address.startsWith('169.254.')) result.push({ ip: entry.address, adapter })
-    }
-  }
-  return result
-}
-
 /**
- * Greenova: after "npm run dev" prints its addresses, also print a QR code of the Wi-Fi
- * address, so a phone on the same Wi-Fi can open the website by scanning it.
+ * Greenova: after "npm run dev" prints its addresses, also print a QR code of the website on the
+ * Raspberry Pi (PI_ADDRESS in src/lib/pi.ts, or GREENOVA_PI_ADDRESS), so a phone on the Pi's Wi-Fi
+ * can open it by scanning.
  */
 function greenovaPhoneQr(): Plugin {
-  // Adapters of virtual machines, WSL and VPNs: a phone can't reach them.
-  const virtual = /virtual|vmware|vbox|vethernet|wsl|hyper-v|docker|hamachi|radmin|zerotier|tailscale|bluetooth|loopback/i
-  const wifi = /wi-?fi|wlan|wireless/i
-
   return {
     name: 'greenova-phone-qr',
     apply: 'serve',
@@ -469,29 +422,13 @@ function greenovaPhoneQr(): Plugin {
       server.printUrls = () => {
         printUrls()
         const port = server.resolvedUrls?.network[0]?.match(/:(\d+)\/?$/)?.[1] ?? String(server.config.server.port ?? 8443)
-        const addresses = lanAddresses()
-        if (addresses.length === 0) {
-          console.log('\n  No Wi-Fi or network connection found, so a phone can\'t open the website.\n')
-          return
+        const url = `http://${process.env.GREENOVA_PI_ADDRESS || PI_ADDRESS}:${port}`
+        try {
+          console.log(`\n  Open on your phone (same Wi-Fi as the Raspberry Pi): scan this, or type ${url}\n`)
+          console.log(qrTerminal(url).replace(/^/gm, '  '))
+        } catch {
+          // a QR code is only a convenience; never stop the dev server for it
         }
-        outgoingAddress().then((outgoing) => {
-          const score = ({ ip, adapter }: { ip: string; adapter: string }) =>
-            (ip === outgoing ? 0 : 10) + (virtual.test(adapter) ? 5 : 0) + (wifi.test(adapter) ? 0 : 1)
-          const ranked = [...addresses].sort((a, b) => score(a) - score(b))
-          const best = ranked[0]
-          const url = `http://${best.ip}:${port}`
-          try {
-            console.log(`\n  Open on your phone (same Wi-Fi as "${best.adapter}"): scan this, or type ${url}\n`)
-            console.log(qrTerminal(url).replace(/^/gm, '  '))
-            const others = ranked.slice(1)
-            if (others.length) {
-              console.log(`\n  Other addresses of this computer: ${others.map((a) => `${a.ip} (${a.adapter})`).join(', ')}`)
-            }
-            console.log('\n  It doesn\'t open on the phone? Double-click check-phone-access.bat in the frontend folder.\n')
-          } catch {
-            // a QR code is only a convenience; never stop the dev server for it
-          }
-        })
       }
     },
   }

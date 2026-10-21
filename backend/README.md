@@ -1,204 +1,128 @@
 # Greenova Backend (FastAPI)
 
-The backend runs on the Raspberry Pi. It reads the sensors, runs the reaction, separation and purification stages with their safety rules, does the chemical calculations, stores the batch records, and computes the analytics. The website only shows data and sends commands, so closing the browser never leaves the heater or electrodes on.
+The backend runs on the **Raspberry Pi that is wired to the machine**: the ESP32 controller on its USB port (relays, heater, the two mixers, the temperature probe) and, on the Pi's own pins, the centrifuge (BTS7960) and the HX711 output load cell. It runs the reaction, separation and purification stages with their safety rules, does the chemical calculations, stores the batch records in MySQL, and computes the analytics. The website only shows data and sends commands, so closing the browser never leaves the heater or electrodes on.
 
-It speaks the website's language: batches use the same fields as `DemoBatch` in `src/lib/greenovaData.ts`, settings use the same keys as the Settings page, and the calculator and analytics follow exactly the same formulas and rules as `NewBatch.tsx` and `BatchHistory.tsx`. On the sample data, the backend and the website give identical numbers.
+There is **no demo or simulated mode**: the website always drives the real machine. When the Pi can't be reached, the website says so (it has no sample data or local simulation). The automated tests use their own simulated machine (`tests/simulator.py`), which the backend never loads.
 
-It starts in **demo mode** (simulated machine), so you can connect the website on a laptop before the hardware is ready.
+Batches use the same fields as `BatchData` in `frontend/src/lib/greenovaData.ts`, settings use the same keys as the Settings page, and the calculator and analytics follow exactly the same formulas as `NewBatch.tsx` and `BatchHistory.tsx`.
 
-## 1. Run it on your laptop (demo mode)
+## 1. Install it on the Raspberry Pi
 
-You need Python 3.10 or newer (3.11 works).
-
-**Simplest:** in the backend folder, run `python main.py`. It uses the `.venv` by itself (no need to activate it), starts the backend at http://localhost:8000, and restarts when you edit the code. The first time, create the `.venv` and install the packages as shown below.
-
-**Or on Windows:** double-click `start-backend.bat`, or run it from Command Prompt. The first time, it creates `.venv` and installs the packages. Then it loads the sample batches and starts the backend at http://localhost:8000. Leave the window open.
-
-By hand:
+**Full guide: [`docs/RASPBERRY_PI_SETUP.md`](../docs/RASPBERRY_PI_SETUP.md)** (parts, wiring, every `hardware.toml` key, testing, calibration, troubleshooting) and [`docs/PI_DEPLOYMENT.md`](../docs/PI_DEPLOYMENT.md). In short:
 
 ```bash
-cd backend
-python -m venv .venv
-# Windows:      .venv\Scripts\activate
-# macOS/Linux:  source .venv/bin/activate
-pip install -r requirements.txt
-python -m app.seed               # loads the same 6 sample batches as the website
-python -m uvicorn app.main:app --reload
+cd ~/Greenova-UCO-to-Biodiesel-/backend
+bash setup-pi.sh                              # packages, .venv, hardware.toml, the greenova service
+sudo reboot
+.venv/bin/python -m app.db                    # MySQL connection (backend/.env)
+nano hardware.toml                            # [esp32.devices]: which ESP32 output does which job; load cell pins
+.venv/bin/python -m app.hwtest check          # pin conflicts and the job list
+.venv/bin/python -m app.hwtest esp32          # the ESP32 answers (outputs, temperature)
+.venv/bin/python -m app.hwtest read           # every sensor
+.venv/bin/python -m app.hwtest outputs        # each job's output (heater and supply unplugged!)
+.venv/bin/python -m app.hwtest calibrate output    # or on the website: Settings -> Hardware
+sudo systemctl enable --now greenova          # the website at http://<pi-address>:8000
+journalctl -u greenova -f
 ```
 
-Always start it from the backend folder. `python -m app.main` and `python app/main.py` work too, but they don't restart when you edit the code. On a laptop, don't set `GREENOVA_MOCK=0`: hardware mode needs the Raspberry Pi's GPIO, and the backend now tells you so instead of crashing.
+**Database (once):** the backend uses **MySQL 8** (not MariaDB) with the database in `greenova_db_ver2.sql`, imported as it is (HeidiSQL: *File > Run SQL file*, or `mysql -u root -p < greenova_db_ver2.sql`). That file creates `greenova_db`, its tables and data, and the MySQL user `greenova@localhost` (no password), the backend's default login. MySQL can run on the Pi or on another computer (then set `DB_HOST`, `DB_USER`, `DB_PASSWORD` in `backend/.env`). See [`database.md`](../database.md).
 
-Open **http://localhost:8000/docs**. Every endpoint is listed there with a "Try it out" button. Good first tries:
+By hand (on the Pi, from the backend folder): `python main.py` (uses `.venv` by itself, restarts on code changes) or `.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`. Stop the `greenova` service first: only one program can use the ESP32's serial port and the GPIO pins.
 
-- `POST /api/calculate` with `{"oilMassG": 460, "ffa": 6, "catalyst": "NaOH"}`. Expect esterification methanol 130.6 mL (the uniform dose for 10% FFA) and NaOH up to 5.36 g. FFA is a whole percent: `"ffa": 2.5` is refused with "ffa: Use a whole number (no decimals)."
-- `POST /api/demo/load-oil` with `{"volumeMl": 500}`, then `POST /api/process/purification/start` with `{}`, and `GET /api/process/purification` a few times to watch it heat, hold, flow and drain by itself.
+Open **http://<pi-address>:8000/docs** to see every endpoint (see `API.md`).
 
-To make the simulated machine run faster for demos, set a time scale before starting (20 = twenty times faster):
-
-```bash
-# Windows PowerShell:  $env:GREENOVA_TIME_SCALE="20"
-# macOS/Linux:         export GREENOVA_TIME_SCALE=20
-```
-
-Run the tests:
+## 2. The tests
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Run it from the backend folder or from the repo root (`python -m pytest backend`). `conftest.py` makes `from app.main import app` work from both places, so the tests import `app.main`, not `backend.main`.
+They run anywhere (a laptop too): the process tests use `tests/simulator.py`, a simulated machine that runs up to 1000× faster; the ESP32 tests use a fake ESP32 and fake GPIO. The database tests log in like the backend (`greenova@localhost`, or `.env`) but use a separate database, `greenova_test`, built from the table definitions of `greenova_db_ver2.sql` and emptied before each test; your `greenova_db` is never touched. Without a reachable MySQL server those tests are skipped; without FastAPI the API tests are skipped.
 
-## 2. What's in the folder
+## 3. What's in the folder
 
 | File | What it does |
 |---|---|
 | `main.py` | `python main.py` starts the backend (uses `.venv` by itself, restarts on code changes) |
-| `app/main.py` | The app: reads the sensors every second, runs the watchdog, serves the website |
-| `app/api.py` | All endpoints (see `API.md`) |
-| `app/calculations.py` | Esterification, transesterification and Magnesol amounts (same as `calculateQuantityCards`) |
-| `app/analytics.py` | Summary, best parameters per FFA range, recommended parameters, cost per liter |
-| `app/stages.py` | Esterification, Transesterification and Separation: start, pause, resume, complete, emergency stop |
-| `app/purification.py` | Automatic purification (dry wash with Magnesol): heating → methanol removal → add Magnesol → contact → settling → cooling → draining |
-| `app/transfers.py` | Dosing pumps A and B (load a dose by weight) and the reactor and centrifuge outlet valves |
+| `app/main.py` | The app: reads the sensors every second, runs the watchdog, stops everything when the ESP32 is lost, starts purification after separation, serves the website |
+| `app/api.py` | All endpoints (see `API.md`) and the hand-offs between the processes |
+| `app/calculations.py` | Esterification, transesterification and adsorbent amounts (same as `calculateQuantityCards`) |
+| `app/analytics.py` | Statistical treatment: completion and lab pass rates; mean and range of yield and cost per liter (materials only) per FFA range; recommended (Proven) settings |
+| `app/stages.py` | Esterification, Transesterification and Separation (settle, then reactor pump + centrifuge + pumpin) |
+| `app/transfers.py` | The oil pump and the dispensers (pump A, pump B): on until the operator presses Done |
+| `app/purification.py` | Purification: methanol removal straight away (heater in 4 s pulses) → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
 | `app/system.py` | System Status tiles and device list |
-| `app/hardware.py` | Safety interlocks, the simulated machine, and the real Pi hardware (`PiHardware`, configured by `hardware.toml`) |
+| `app/hardware.py` | Safety interlocks and the older all-on-the-Pi wiring (`PiHardware`, `backend = "gpio"`) |
+| `app/esp32.py` | The machine (`backend = "esp32"`, the default): the ESP32 serial link (dead-man timer, status checks) and `Esp32Hardware` with the Pi's centrifuge and load cells |
 | `app/drivers.py` | Pi sensor drivers: HX711 load cells, INA226/INA219 power monitor, RPM counters, DS18B20, serial power supply |
-| `app/hwtest.py` | Bench test and calibration on the Pi: `python -m app.hwtest check / read / outputs / calibrate / i2c` |
-| `hardware.example.toml` | Template for `hardware.toml`: the Pi's pins, sensors and calibration |
-| `setup-pi.sh` | One-time setup on the Raspberry Pi |
+| `app/hwtest.py` | Bench test and calibration on the Pi: `python -m app.hwtest check / esp32 / read / outputs / pump / calibrate / i2c` |
 | `app/models.py` | Settings and batch fields, with their default values |
-| `app/db.py` | SQLite storage (`greenova.db`) |
-| `app/strip_reader.py` | FFA strip reader (TCS34725) |
-| `app/seed.py` | The website's sample batches |
-| `app/config.py` | Demo mode, database path, allowed website addresses, and the `hardware.toml` loader |
-| `frontend/dist` | Optional: the built website, served at `http://<pi-address>:8000` (section 4) |
+| `app/db.py` | MySQL 8 storage: turns batches and settings into rows of the 8 tables and back; `python -m app.db` checks the connection |
+| `app/config.py` | The MySQL login (`.env`/environment), CORS, the website folder, and the `hardware.toml` loader and checks |
+| `hardware.example.toml` | Template for `hardware.toml`: the ESP32 jobs, the Pi's pins, sensors and calibration |
+| `setup-pi.sh` | One-time setup on the Raspberry Pi (and the `greenova` service) |
+| `greenova.service` | The systemd service that starts the backend when the Pi boots |
+| `greenova_db_ver2.sql` | **The database** (MySQL 8 export): `greenova_db`, its 8 tables and data, and the user `greenova@localhost`. Import it once as it is; the backend checks its tables against this file |
+| `.env.example` | Optional overrides for the MySQL login (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) |
+| `tests/simulator.py` | The tests' simulated machine (never used by the backend itself) |
+| `tests/sample_batches.py` | Fixed sample batches for the analytics and database tests (never put in the database) |
 
-## 3. Move it to the Raspberry Pi
+## 4. The website
 
-**Full guide: [`docs/RASPBERRY_PI_SETUP.md`](../docs/RASPBERRY_PI_SETUP.md)** (parts list, wiring diagram and default pins, every `hardware.toml` key, testing, calibration, troubleshooting). In short:
+The website (`frontend`) is served by the backend from `frontend/dist`: build it once with Node.js 22 (`cd frontend && npm ci && npm run build`, on any computer) and copy the project to the Pi. Then the whole system is at `http://<pi-address>:8000` (or `http://greenova.local:8000`) on the Pi's touchscreen, a laptop or a phone on the same network, without internet.
 
-```bash
-cd ~/Greenova-UCO-to-Biodiesel-/backend
-bash setup-pi.sh                              # packages, I2C + 1-Wire, .venv, hardware.toml, the service
-sudo reboot
-nano hardware.toml                            # your pins, relay type, valve/motor types, which sensors are fitted
-.venv/bin/python -m app.hwtest check          # pin conflicts
-.venv/bin/python -m app.hwtest read           # every sensor
-.venv/bin/python -m app.hwtest outputs        # each relay/pump/valve/motor (heater and supply unplugged!)
-.venv/bin/python -m app.hwtest calibrate reactor   # and: output
-sudo systemctl enable --now greenova          # hardware mode (GREENOVA_MOCK=0), starts on boot
-journalctl -u greenova -f
-```
+For changing the website: `npm run dev` on a laptop, with `GREENOVA_API=http://<pi-address>:8000` so the dev server forwards `/api` to the Pi (`set GREENOVA_API=...` in Command Prompt, `$env:GREENOVA_API="..."` in PowerShell).
 
-**All wiring lives in `hardware.toml`**, not in the code: pins (BCM numbers), `relays.active_high` (false for "low level trigger" boards), valves `single` (one relay) or `dual` (3-wire motorized ball valves), motors `pwm` or `esc` (brushless), the level switch, the DS18B20, both HX711 load cells with their calibration, the INA226/INA219 power monitor, the three RPM sensors, and the power supply (`manual`, or `serial` to set voltage and current over USB). A part that isn't enabled reads "—", and the backend works around it. The backend refuses to start if two parts share a pin.
+The **System** badge at the bottom of the sidebar shows **Connected** (the Pi answers) or **Pi offline**. While the Pi is offline the Process page shows "The Raspberry Pi can't be reached" and nothing can be started; a batch that is already running carries on on the Pi, and the page catches up when the connection is back.
 
-**Strip reader:** enable I2C, and put `white_ref.csv` and `ffa_calibration.csv` (made with `python3 app/strip_reader.py white` and `cal`) inside the `app` folder. Readings are rounded to whole percent.
+## 5. The batch sequence
 
-**If some sensors are wired to the ESP32:** have the ESP32 print one JSON line per second over USB, for example `{"oil_g": 461.2, "temp_c": 31.5}`, and read it in `PiHardware._read_sensors` with `pyserial`.
-
-## 4. Connect the website
-
-The website (the `frontend` folder) is already connected to this backend. Its `src/lib/api.ts` talks to the backend, and the Dashboard, Process, Batch History, Batch Details and Settings pages use it. There is nothing to copy.
-
-**On your laptop, use two Command Prompt windows.**
-
-Window 1, the backend:
-
-```bat
-cd backend
-python main.py
-```
-
-Window 2, the website (needs Node.js 22):
-
-```bat
-cd frontend
-npm install
-npm run dev
-```
-
-`npm install` is only needed the first time. Then open **http://localhost:8443**. To open it on a phone on the same Wi-Fi, scan the QR code that `npm run dev` prints, or click **Open on phone** in the sidebar. See `frontend/README.md`. The website's dev server forwards every `/api` request to the backend on `localhost:8000`, so you don't need a `.env` file or any CORS setting.
-
-The **System** badge at the bottom of the sidebar shows what the website is using:
-
-| Badge | Meaning |
-|---|---|
-| **Backend · demo** | The backend is running in demo mode, so the machine is simulated |
-| **Connected** | The backend is running on the Pi with the real hardware (`GREENOVA_MOCK=0`) |
-| **Local demo** | The backend can't be reached, so the website uses its own sample data, as before |
-
-**Backend on the Pi, website on the laptop:** before `npm run dev`, point the website at the Pi:
-
-```bat
-set GREENOVA_API=http://192.168.1.50:8000
-```
-
-In PowerShell, use `$env:GREENOVA_API="http://192.168.1.50:8000"` instead.
-
-**Serving the website from the Pi:** run `npm run build` in `frontend` and restart the backend. It serves `frontend/dist` by itself (it also looks in `backend/frontend/dist`). Then the whole system is at `http://<pi-address>:8000` and works without internet.
-
-**Figma Make preview:** the preview can't reach a backend on your computer, so there it shows "Local demo". If you change the design in Figma Make again, keep `src/lib/api.ts`, `src/contexts/LiveContext.tsx` and the changes in `vite.config.ts`. Otherwise a new export would lose the connection.
-
-## 5. Dosing pumps, outlet valves and the batch sequence
-
-| Step | Who does it | What happens |
+| Step | Who / what | What happens |
 |---|---|---|
-| Oil | Operator | Pours the oil through the inlet filter. The reactor load cell weighs it. The button says **Continue to Esterification** (FFA above 1%) or **Continue to Transesterification** (1% or below): it records the oil weight and goes straight to that stage. FFA is entered as a whole percent. |
-| Esterification dose | Pump B | The operator mixes the methanol and H₂SO₄ in tank B beforehand. When the stage opens, pump B loads the premix by itself and stops when the reactor load cell has gained its weight. If the pump faults, the website shows "Pump problem – check the line" and a **Retry** button. |
-| Acetone | Operator | Poured through the inlet **after** the pump has finished (the pump doses by the reactor's weight, so pouring during pumping would stop it early). The website shows the weight gained against the target (10% of the oil volume, provisional). |
-| Esterification | Pi | Starts by itself once the dose and the acetone are in. Electrodes and stirrer for the set time, at the set voltage and current (default 1 A, 1–2 A, whole amperes). Then the operator enters the FFA re-check: at or below 1%, go on; above it, another stage dosed for the reading (40:1, no new acetone). |
-| Transesterification dose | Pump A | NaOH or KOH dissolved in the methanol in tank A, loaded by itself when the stage opens. The catalyst amount is exact here: it neutralizes the last re-check reading. |
-| Transesterification | Pi | Starts by itself once loaded. Then the **reactor outlet valve opens by itself** for `reactorDrainTime` (default 1 min): reactor → centrifuge, and closes. |
-| Separation | Pi | **Starts by itself as soon as the reactor outlet has closed** (`autoAdvance`, default on; the website moves on to it too). Centrifuge for the set time. When it has stopped (RPM ≈ 0, or `centrifugeSpinDownTime` without an RPM sensor), the **centrifuge outlet valve opens by itself** for `centrifugeDrainTime` (default **2 min**): biodiesel → purification tank. |
-| Purification | Pi | Starts by itself once the centrifuge outlet has closed and the level switch sees biodiesel (section 6). |
-| Yield | Pi | The output load cell weighs the biodiesel container. When the purification outlet has closed, the website saves the batch by itself (output volume and yield included) and shows Process Complete. |
+| Volume & Parameters | Operator | Target oil volume, FFA, reaction settings, the dry wash adsorbent, and the **separation time and centrifuge speed** for this batch (defaults: Settings `separationTime` / `separationSpeed`; speed at most the centrifuge's 2500 RPM). |
+| Oil | Oil pump (`oil`) | The operator measures the target volume into the oil container. When the Oil Loading step opens, the oil pump **switches on by itself** and runs until the operator presses **Done – the oil container is empty**. (**Stop pump** stops it; start it again for the rest.) |
+| Esterification dose | Pump B (`dispenser2`) | The operator measures the computed methanol + H₂SO₄ premix into container B. When the stage opens, pump B switches on and runs until **Done**. |
+| Acetone | Operator | Optional: pour it through the inlet and press **Acetone added**, or **Continue without acetone**. |
+| Esterification | Pi | Starts by itself after Done + the acetone choice. Electrodes and stirrer (`mixer1`) for the set time. Then the FFA re-check: at or below 3%, go on; above it, another stage. |
+| Transesterification dose | Pump A (`dispenser1`) | NaOH/KOH dissolved in methanol, measured into container A; pump A runs until **Done**. |
+| Transesterification | Pi | Starts by itself after Done + the acetone choice. |
+| Settle | Pi | When transesterification finishes, the mixture **settles in the reactor for 1 minute** with everything off. |
+| Separation | Pi | Then the **reactor pump** (`reactorpump`, reactor → centrifuge), the **centrifuge** (at the batch's speed) and **pumpin** (`pumpin`, centrifuge → purifier) run **together** for the batch's separation time, so the biodiesel goes straight on to the purifier. All three stop when the time is over. |
+| Purification | Pi | Starts by itself as soon as separation has finished (everything is in the purifier): section 6. |
+| Yield | Pi | The output load cell weighs the biodiesel container. When purification is done, everything is switched off and the website saves the batch (output volume and yield included) and shows Process Complete. |
 
-**Uniform esterification dose.** The FFA strip reads only up to 5% (its darkest color). Every batch above 1% gets one dose, calculated as if the oil had `esterificationDesignFfa` (default 10%): per 100 mL of oil, about 26 mL methanol and 0.25 mL H₂SO₄. When the strip shows its darkest color, tick that on the website; the batch is recorded as "≥ 5%". The re-check after each stage decides the next one.
+**Pumps.** The oil pump and the dispensers have no automatic stop: the containers hold exactly the computed amount, and the operator presses Done when a container is empty. A pump left running for 30 minutes stops by itself with a fault (forgotten, or a blocked line). Only one pump into the reactor runs at a time, never while the reactor pump is running. After an emergency stop and a controller reset, the stage starts with its Start button instead of by itself.
 
-**Pumps.** Each pump has its own tank. Mix about 10% extra in the same proportions so the line stays full: the pump stops by weight, so only the dose enters. The pump stops with a fault when the load cell doesn't rise for `pumpNoFlowSeconds` (default 20 s: empty tank or blocked line) or after twice the expected time. Without a load cell reading, it doses by time at `pumpCatalystRate` / `pumpAcidRate` (mL/min). Only one pump runs at a time. After an emergency stop and a controller reset, the stage starts with its Start button instead of by itself.
+**RPM.** There are no RPM sensors: the mixers and the centrifuge are driven open loop, and the RPM shown is the set speed (the ESP32 sketch's `MAX_RPM` 1544 for the mixers, `[centrifuge] max_rpm` 2500 for the centrifuge).
 
-**Valves.** The website shows each motorized valve as an **Open / Closed** indicator only; it has no buttons for them. An outlet time of 0 in Settings means the valve isn't used: move the liquid yourself. (`/api/control/valve` still exists for testing.)
+**If separation doesn't start by itself** (for example after a fault), the Separation step shows **Start separation now** after a few seconds; it uses the batch's time and speed, without the settle.
 
-**Choices to check against your machine** (change them if yours is different):
-- The outlet valves stay open for a set time (they have no level sensor behind them).
-- The purification stirrer runs at a fixed 200 RPM from heating to the end of contact, and is off for settling and draining.
-- Each pump tank holds one batch's premix, mixed by the operator.
+## 6. Purification (dry wash with Magnesol or bentonite)
 
-## 6. Automatic purification (dry wash with Magnesol or bentonite)
-
-After separation, purification runs by itself. The operator only adds the adsorbent (Magnesol or bentonite, chosen per batch on the website) when asked. The steps are the same for both; the API phase is still called `magnesol`:
+After separation, purification runs by itself. The operator only adds the adsorbent (Magnesol or bentonite, chosen per batch) when asked. The API phase is still called `magnesol`:
 
 | Step | What happens | Time |
 |---|---|---|
-| 1. Heating | Stirrer on (200 RPM), then the heater, until **90 °C**. The website shows "Prepare X g Magnesol". | Fault if 90 °C isn't reached in 15 min |
-| 2. Methanol removal | Hold 90 ±2 °C with the stirrer running, so leftover methanol evaporates | `methanolRemovalTime`, default **10 min** (5–30) |
-| 3. Add adsorbent | Heater off, stirrer on. The website shows "Add X g Magnesol (1% of the oil weight)" or "Add X g Bentonite (2% …)" and waits for **Confirm** | Waits for the operator |
-| 4. Contact | Stirring, heater off | `contactTime`, default **15 min** |
-| 5. Settling | Stirrer off | `settlingTime`, default **10 min** |
-| 6. Cooling | Only if needed: waits until the tank is at or below the water filter's limit | `maxDrainTemperature`, default **50 °C** |
-| 7. Draining | The purification outlet valve opens: tank → filter → output container. Done when the output load cell stays within ±2 g for 30 s (counted once the flow has started), 20 min at most | |
-| 8. Done | Valve closed. Warns "Low output – check the filter" when less than 70% of the oil weight came out. The website saves the batch by itself and shows Process Complete | |
+| 1. Methanol removal | Starts at once (no heating step). Stirrer (`mixer2`) at 200 RPM; the heater runs in **4-second pulses**: on 4 s, off, the Pi waits for the temperature to rise to its highest point, and when it is getting lower (0.2 °C below that point) the next 4 s pulse, until the time is over. No pulse at or above 90 °C. The website shows "Prepare X g Magnesol". | `methanolRemovalTime` (10 min) |
+| 2. Add adsorbent | Heater off, stirrer on. "Add X g Magnesol (1% of the oil weight)"; waits for **Confirm**. | Waits for the operator |
+| 3. Contact | Stirred at **200 RPM** (the RPM is shown here and in methanol removal, as the ESP32 reports it), heater off. | `contactTime` |
+| 4. Settle | Stirrer off: it settles for **1 minute**. | 60 s |
+| 5. Drain | The **valve** opens and **pumpout** runs: purifier → filter → output container. Done **only** when the output load cell stays within ±2 g for **30 s** (counted once the flow has started). No time limit. | |
+| 6. Done | Everything is switched off. "Low output – check the polishing filter" when less than 70% of the oil weight came out. | |
 
-**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g. Magnesol 1% (`magnesolDose`) = oil volume × 0.0092 g (500 mL → 4.6 g); bentonite 2% (`bentoniteDose`) = oil volume × 0.0184 g (500 mL → 9.2 g). The same value is shown in Volume & Parameters. The batch record keeps `adsorbent` and `adsorbentG`, and the cost per liter counts `magnesolKg` or `bentoniteKg` (prices `magnesolPrice`, `bentonitePrice`).
+**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g: Magnesol 1% = oil volume × 0.0092 g (500 mL → 4.6 g), bentonite 2% = × 0.0184 g. Settings → Purification has the two times, the two doses and the default adsorbent; the 4 s heater pulses (none from 90 °C), the 95 °C cutoff, the 200 RPM stirrer, the 1-minute settle and the drain rule are fixed in `app/purification.py`. The settle time is recorded in the `settlingTimeSeconds` column. Purification needs a reading from the output load cell (it is the only way the run completes).
 
-Settings → Purification has the four times above, the two doses and the default adsorbent. The 90 °C hold, the 95 °C cutoff, the 200 RPM stirrer and the drain rule are fixed in `app/purification.py`.
-
-It starts as soon as the centrifuge outlet has closed after separation **and** the level switch (`[level_switch]` in `hardware.toml`) detects biodiesel covering the heater. The switch is a float switch at the heater's height in the purification tank, wired between a GPIO pin and GND. Without a level switch, the website asks the operator to confirm once that the heater is submerged. That one check stays because an immersion heater that runs dry can start a fire.
-
-The output weight counts only this batch's biodiesel, even if the collection container isn't empty.
-
-To time a whole batch for a demo, start the backend with `GREENOVA_TIME_SCALE=20`. Then the 10-minute methanol removal takes 30 seconds.
+With the optional level switch (`[level_switch]` in `hardware.toml`) the heater waits until biodiesel covers it; without one, purification starts at once (and a manual restart asks the operator to confirm that the heater is submerged).
 
 ## 7. Safety rules built in
 
-- The heater runs only while the purification stirrer is running and the heater is submerged, and never while the purification outlet valve is open. Stopping the stirrer or opening the valve turns the heater off first. This is enforced in `hardware.py`, so it applies to every caller.
-- The dosing pumps can't run while the reactor outlet is open (and the reverse), and only one pump runs at a time. The centrifuge can't spin with its outlet open, and its outlet can't open while it spins.
-- Pumps don't run during a stage, and a stage can't start while a pump runs or an outlet valve drains. Emergency stop stops the pumps and closes every valve.
-- Every second, a watchdog turns off the heater (above **95 °C**, or when the level switch reads dry) or the electrodes (above `reactionMaximumTemperature`, default 60 °C, below methanol's 64.7 °C boiling point) when the temperature is too high or the reading is lost.
-- A reaction stage faults on lost temperature, over-temperature, or a measured current above the current setting (2 readings in a row): the electrodes stop and the website shows a warning. It needs a controller reset before the next start. Pause switches the electrodes and motor off.
-- Purification stops safely (heater off, stirrer off, valve closed) on: lost temperature, above 95 °C, not reaching 90 °C within 15 min, the level switch reading dry while the heater is on, the stirrer reading under 100 RPM for more than 5 s while the heater is on, an operator Stop, or any unexpected error. It won't start again until the stop is acknowledged.
-- Only one thing runs at a time: a stage can't start during purification, and the reverse. Manual controls are blocked while either runs.
-- The heater only turns on with biodiesel covering it: the level switch must report it. Without a level switch, the operator confirms it once on the website. On startup and shutdown, everything is switched off.
+- The heater runs only while the purification stirrer runs and the heater is submerged, and never while the purification outlet (valve + pumpout) is on. Stopping the stirrer or opening the valve turns the heater off first. Enforced in `hardware.py`, for every caller.
+- Pumps into the reactor (oil, A, B) never run while the reactor pump empties it (and the reverse), and only one at a time.
+- Every output is switched on with the ESP32's 5 s timer and refreshed every second: if the Pi, the backend or the USB cable stops, the ESP32 switches it off by itself. No status from the ESP32 for 3.5 s, or an output that doesn't follow its command, stops every process and switches everything off.
+- Every second, a watchdog turns off the heater above **95 °C**, when the temperature reading is lost, or when the level switch reads dry.
+- The reactions (esterification, transesterification) have **no temperature check**: they run with or without a temperature reading. They don't start while the ESP32 controller is offline or faulty, and a reaction stage faults on a measured current above the current setting (with a power monitor fitted); it needs a controller reset before the next start.
+- Purification stops safely (heater, stirrer, valve and pumpout off) on lost temperature during methanol removal, above 95 °C, the level switch reading dry, an operator Stop, or any unexpected error; it won't start again until the stop is acknowledged.
+- Emergency stop (website) stops the stage, the pumps and purification and switches every output off. On startup and shutdown everything is off.
 
 The thermal fuse stays your hardware backup. Set the software maximum below the fuse rating, so the software trips first.

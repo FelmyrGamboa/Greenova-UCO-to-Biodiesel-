@@ -5,18 +5,21 @@
 #     sudo systemctl enable --now greenova
 [Unit]
 Description=Greenova backend
-After=network-online.target
+# The MySQL 8 database must be up first when it runs on the Pi. Units that don't exist are ignored.
+After=network-online.target mysql.service
 Wants=network-online.target
 
 [Service]
 User=__USER__
 WorkingDirectory=__BACKEND__
-# Hardware mode (real pins). The wiring is in __BACKEND__/hardware.toml.
-Environment=GREENOVA_MOCK=0
+# The website drives the real machine (hardware.toml: the ESP32 controller on USB + the Pi's
+# centrifuge and load cell). There is no demo mode.
+# The MySQL login defaults to greenova@localhost (greenova_db_ver2.sql); override it in __BACKEND__/.env.
 ExecStart=__BACKEND__/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Also restarts when MySQL wasn't reachable yet at boot.
 Restart=on-failure
-RestartSec=3
-# On stop the backend switches every output off first (heater, electrodes, pumps, valves, motors).
+RestartSec=5
+# Time for the shutdown handler to switch every output off (the ESP32 also stops by itself within 5 s).
 TimeoutStopSec=15
 
 [Install]

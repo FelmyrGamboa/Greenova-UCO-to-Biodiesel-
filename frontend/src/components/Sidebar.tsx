@@ -52,7 +52,7 @@ function readOperator() {
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
   const t = useT();
-  const { backend, mock, connecting } = useLiveData();
+  const { backend, connecting } = useLiveData();
   const { theme, setTheme } = useTheme();
   const operator = readOperator();
   return (
@@ -105,14 +105,12 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           </div>
           <div className="mb-4 flex items-center justify-between">
             <span className="text-xs text-gray-500">{t("System")}</span>
-            {backend && !mock ? (
+            {backend ? (
               <Status>{t("Connected")}</Status>
-            ) : backend ? (
-              <Status tone="yellow">{t("Backend · demo")}</Status>
             ) : connecting ? (
               <Status tone="neutral">{t("Connecting…")}</Status>
             ) : (
-              <Status tone="neutral">{t("Local demo")}</Status>
+              <Status tone="red">{t("Pi offline")}</Status>
             )}
           </div>
           <div className="flex items-center gap-3">

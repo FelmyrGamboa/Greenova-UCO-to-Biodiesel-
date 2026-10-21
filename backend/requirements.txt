@@ -1,2 +1,4 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
+PyMySQL>=1.1          # MySQL 8 driver (pure Python: works on Windows and the Raspberry Pi)
+cryptography>=41      # needed by PyMySQL for MySQL 8's default login method (caching_sha2_password)
