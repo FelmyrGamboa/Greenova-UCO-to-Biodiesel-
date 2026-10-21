@@ -13,6 +13,7 @@ import copy
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -56,14 +57,6 @@ DB_NAME = os.getenv("DB_NAME", "greenova_db").strip() or "greenova_db"
 DATABASE = {"host": DB_HOST, "port": DB_PORT, "user": DB_USER, "password": DB_PASSWORD,
             "database": DB_NAME, "connect_timeout": 5, "pool_size": 5}
 
-# Demo mode: simulated hardware, so the backend runs on any laptop.
-# On the Raspberry Pi with the real machine, start with GREENOVA_MOCK=0.
-MOCK = os.getenv("GREENOVA_MOCK", "1") == "1"
-
-# Demo only: run the simulated machine faster (10 = ten times faster). Always 1 on real hardware.
-TIME_SCALE = float(os.getenv("GREENOVA_TIME_SCALE", "1")) if MOCK else 1.0
-
-
 # Built website (Vite "dist" folder). If it exists, the backend serves the website too.
 # Looked for in backend/frontend/dist, then in ../frontend/dist (a repo with frontend/ and backend/).
 def _frontend_dir() -> Path:
@@ -85,16 +78,39 @@ CORS_ORIGINS = os.getenv(
 
 
 # ---------- Raspberry Pi hardware (hardware.toml) ----------
-# Pin numbers are BCM GPIO numbers (GPIO17 = physical pin 11). These legacy direct-GPIO defaults
-# are used only when [actuators].backend = "gpio". The operator-supplied split ESP32/Pi wiring has
-# GPIO conflicts and is not yet safe to run in live mode; create_hardware() fails closed for
-# backend="esp32" until the hybrid serial/controller mapping has been implemented.
+# Pin numbers are BCM GPIO numbers (GPIO17 = physical pin 11).
+# [actuators] backend = "esp32" (default): the ESP32 controller on USB (relays, heater, mixers,
+#   temperature) + the Pi's own pins for the centrifuge (BTS7960) and the HX711 load cell(s). See esp32.py.
+# [actuators] backend = "gpio": the older wiring with every relay and motor on the Pi's pins
+#   (relays, pumps, valves, motors, rpm and temperature below). Set every pin in hardware.toml.
 HARDWARE_DEFAULTS: dict = {
-    "actuators": {"backend": "esp32", "port": "/dev/ttyUSB0", "baudrate": 115200},
-    "leds": {"green": 17, "red": 27},
-    "separation": {"spin_up_seconds": 15, "stable_grams": 20, "stable_seconds": 60},
-    # The purification drain has no time limit: it ends when the output load cell is stable for 30 s.
-    "purification": {"heating_timeout_minutes": 25},
+    "actuators": {"backend": "esp32", "port": "auto", "baudrate": 115200},
+    "esp32": {
+        # Dead-man timer: outputs are switched on as "<device> on 5" and refreshed every second, so
+        # the ESP32 switches them off by itself within 5 s if the Pi, the backend or the cable stops.
+        "lease_seconds": 5,
+        "poll_seconds": 1.0,
+        "offline_after_seconds": 3.5,
+        "mixer_max_rpm": 1544,           # the sketch's MAX_RPM (used until the ESP32 reports its own)
+        # Greenova job -> ESP32 device name(s) in esp32_process_control.ino ("" = not fitted)
+        "devices": {
+            "heater": "heater",
+            "electrode_power": "electrode",
+            "oil_pump": "oil",                 # oil input: oil tank -> reactor
+            "catalyst_pump": "dispenser1",     # pump A: NaOH/KOH + methanol
+            "acid_pump": "dispenser2",         # pump B: H2SO4 + methanol
+            "reactor_outlet": "reactorpump",   # reactor -> centrifuge
+            "centrifuge_outlet": "pumpin",     # centrifuge -> purifier
+            "purification_outlet": ["valve", "pumpout"],   # after purification: valve opens, pump to the output container
+            "stirrer": "mixer1",               # reactor stirrer
+            "purification_stirrer": "mixer2",  # dry wash stirrer
+        },
+        # job -> seconds: an extra limit, the ESP32 switches the output off by itself after this long.
+        # Empty = the process step switches it off (separation timer, purification drain, Done).
+        "max_on_seconds": {},
+    },
+    "centrifuge": {"enabled": True, "max_rpm": 2500, "min_duty": 0, "pwm_freq": 1000, "ramp_seconds": 3.0,
+                   "direction": "forward", "l_en": 23, "r_en": 24, "lpwm": 25, "rpwm": 21},
     "gpiochip": None,                    # None = find the Pi's GPIO chip by itself (Pi 4 and Pi 5)
     "relays": {"active_high": True, "heater": 23, "electrode_power": 25},
     "pumps": {"catalyst": 5, "acid": 6},  # pump A: NaOH/KOH + methanol, pump B: H2SO4 + methanol
@@ -113,8 +129,12 @@ HARDWARE_DEFAULTS: dict = {
     "level_switch": {"enabled": False, "pin": 26, "closed_means_liquid": True},
     "temperature": {"type": "ds18b20", "sensor_id": ""},
     "load_cells": {
-        "reactor": {"enabled": False, "data_pin": 27, "clock_pin": 22, "offset": 0, "scale": 420.0, "samples": 3, "capacity_kg": 5, "vessel_kg": 0},
-        "output": {"enabled": False, "data_pin": 10, "clock_pin": 9, "offset": 0, "scale": 420.0, "samples": 3, "capacity_kg": 5, "vessel_kg": 0},
+        # ESP32 mode: the output load cell is the HX711 on DT 17 / SCK 27, with the calibration from the
+        # Pi control panel's config.json (offset 41028.54; factor 145759 per kg = 145.759 counts per gram).
+        "reactor": {"enabled": False, "data_pin": 5, "clock_pin": 6, "offset": 0, "scale": 420.0, "samples": 10,
+                    "cal_seconds": 3.0, "capacity_kg": 5, "vessel_kg": 0},
+        "output": {"enabled": True, "data_pin": 17, "clock_pin": 27, "offset": 41028.54, "scale": 145.759,
+                   "samples": 10, "cal_seconds": 3.0, "capacity_kg": 5, "vessel_kg": 0},
     },
     "power_monitor": {"type": "none", "i2c_bus": 1, "address": 0x40, "shunt_ohms": 0.02},
     "rpm": {
@@ -122,14 +142,14 @@ HARDWARE_DEFAULTS: dict = {
         "centrifuge": {"enabled": False, "pin": 19, "pulses_per_rev": 1},
         "purification_stirrer": {"enabled": False, "pin": 7, "pulses_per_rev": 1},
     },
-    "power_supply": {"control": "manual", "port": "/dev/ttyUSB0", "baudrate": 9600,
+    "power_supply": {"control": "manual", "port": "/dev/ttyUSB1", "baudrate": 9600,
                      "voltage_command": "VOLT {volts:.2f}\n", "current_command": "CURR {amps:.2f}\n",
                      "output_on_command": "", "output_off_command": ""},
 }
 
-RESERVED_PINS = {2: "I2C SDA", 3: "I2C SCL", 4: "1-Wire (DS18B20)", 17: "strip reader LED"}
-
 HARDWARE_FILE = Path(os.getenv("GREENOVA_HARDWARE", BASE_DIR / "hardware.toml"))
+# Load cell Tare / Calibrate from the website (ESP32 mode) are kept here; they win over hardware.toml.
+CALIBRATION_FILE = Path(os.getenv("GREENOVA_CALIBRATION", BASE_DIR / "loadcell_calibration.json"))
 
 
 def _merge(base: dict, extra: dict) -> dict:
@@ -162,40 +182,73 @@ def load_hardware(path: Path = HARDWARE_FILE) -> dict:
     return hw
 
 
-def used_pins(hw: dict) -> list[tuple[int, str]]:
-    """Every GPIO pin the configuration uses, with what it's for (enabled devices only)."""
+def actuator_backend(hw: dict) -> str:
+    """ "esp32" (ESP32 controller + Pi centrifuge and load cell) or "gpio" (everything on the Pi)."""
+    return str(hw.get("actuators", {}).get("backend", "esp32")).strip().lower()
+
+
+def reserved_pins(hw: dict, backend: Optional[str] = None) -> dict[int, str]:
+    """Pins other parts already use: I2C (power monitor) and, in gpio mode, the Pi's
+    1-Wire temperature probe."""
+    reserved = {2: "I2C SDA", 3: "I2C SCL"}
+    if (backend or actuator_backend(hw)) == "gpio" and hw["temperature"].get("type", "ds18b20") == "ds18b20":
+        reserved[4] = "1-Wire (DS18B20)"
+    return reserved
+
+
+def used_pins(hw: dict, backend: Optional[str] = None) -> list[tuple[int, str]]:
+    """Every Raspberry Pi GPIO pin the configuration uses, with what it's for (enabled devices only).
+    In ESP32 mode the relays, heater and mixers are on the ESP32, so only the Pi's own parts count."""
+    backend = backend or actuator_backend(hw)
     pins: list[tuple[int, str]] = []
-    pins += [(hw["relays"][k], f"relays.{k}") for k in ("heater", "electrode_power")]
-    pins += [(pin, f"pumps.{k}") for k, pin in hw["pumps"].items()]
-    for name, v in hw["valves"].items():
-        if v.get("mode", "single") == "dual":
-            pins += [(v["open_pin"], f"valves.{name}.open_pin"), (v["close_pin"], f"valves.{name}.close_pin")]
-        else:
-            pins.append((v["pin"], f"valves.{name}"))
-    pins += [(m["pin"], f"motors.{k}") for k, m in hw["motors"].items()]
+    if backend == "esp32":
+        c = hw["centrifuge"]
+        if c.get("enabled"):
+            pins += [(c[k], f"centrifuge.{k}") for k in ("l_en", "r_en", "lpwm", "rpwm")]
+    else:
+        pins += [(hw["relays"][k], f"relays.{k}") for k in ("heater", "electrode_power")]
+        pins += [(pin, f"pumps.{k}") for k, pin in hw["pumps"].items()]
+        for name, v in hw["valves"].items():
+            if v.get("mode", "single") == "dual":
+                pins += [(v["open_pin"], f"valves.{name}.open_pin"), (v["close_pin"], f"valves.{name}.close_pin")]
+            else:
+                pins.append((v["pin"], f"valves.{name}"))
+        pins += [(m["pin"], f"motors.{k}") for k, m in hw["motors"].items()]
+        for k, r in hw["rpm"].items():
+            if r.get("enabled"):
+                pins.append((r["pin"], f"rpm.{k}"))
     if hw["level_switch"].get("enabled"):
         pins.append((hw["level_switch"]["pin"], "level_switch"))
     for k, cell in hw["load_cells"].items():
         if cell.get("enabled"):
             pins += [(cell["data_pin"], f"load_cells.{k}.data_pin"), (cell["clock_pin"], f"load_cells.{k}.clock_pin")]
-    for k, r in hw["rpm"].items():
-        if r.get("enabled"):
-            pins.append((r["pin"], f"rpm.{k}"))
     return pins
 
 
-def check_hardware(hw: dict) -> list[str]:
+def check_hardware(hw: dict, backend: Optional[str] = None) -> list[str]:
     """Problems in the wiring configuration: a pin used twice, or a reserved pin."""
+    backend = backend or actuator_backend(hw)
     problems, seen = [], {}
-    for pin, what in used_pins(hw):
+    if backend not in ("esp32", "gpio"):
+        problems.append(f"actuators.backend: {backend!r} is not 'esp32' or 'gpio'.")
+    reserved = reserved_pins(hw, backend)
+    for pin, what in used_pins(hw, backend):
         if not isinstance(pin, int) or not 0 <= pin <= 27:
             problems.append(f"{what}: {pin!r} is not a BCM GPIO number (0-27).")
             continue
         if pin in seen:
             problems.append(f"GPIO{pin} is used twice: {seen[pin]} and {what}.")
         seen[pin] = what
-        if pin in RESERVED_PINS:
-            problems.append(f"{what}: GPIO{pin} is already used by the {RESERVED_PINS[pin]}.")
+        if pin in reserved:
+            problems.append(f"{what}: GPIO{pin} is already used by the {reserved[pin]}.")
+    if backend == "esp32":
+        a, ps = hw["actuators"], hw["power_supply"]
+        if ps.get("control") == "serial" and str(a.get("port")) == str(ps.get("port")):
+            problems.append(f"The ESP32 and the power supply can't share {ps.get('port')}: set [actuators] port "
+                            "or [power_supply] port (ls /dev/serial/by-id/ lists them).")
+        for key, cell in hw["load_cells"].items():
+            if cell.get("enabled") and not cell.get("scale"):
+                problems.append(f"load_cells.{key}.scale can't be 0.")
     return problems
 
 

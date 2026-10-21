@@ -15,15 +15,13 @@ import { useLiveData } from "../contexts/LiveContext";
 import {
   ApiError,
   cancelBatch,
-  demoAdd,
+  finishPump,
   getActiveBatch,
   getNextBatchId,
+  getProcessConfig,
   getRecommendedParametersForFfa,
   getSystemStatus,
   isOffline,
-  loadDemoOil,
-  markBatchCompleted,
-  pumpAction,
   purificationAction,
   saveBatchProgress,
   saveCompletedBatch,
@@ -32,10 +30,10 @@ import {
   startPump,
   startPurification,
   startStage,
+  stopPump as stopPumpRequest,
   type ActiveBatch,
   type Adsorbent,
   type BatchRecord,
-  type DrainValve,
   type PumpName,
   type PumpPhase,
   type PurificationPhase,
@@ -43,12 +41,12 @@ import {
   type StageStatus,
   type SystemStatus,
 } from "../lib/api";
-import { formatFfa, saveCompletedBatch as saveBatchInThisBrowser, type DemoBatch } from "../lib/greenovaData";
+import { formatFfa, type BatchData } from "../lib/greenovaData";
 import { useT, type TFunction } from "../lib/i18n";
 
 type DeviceState = "ready" | "checking" | "fault";
 type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-const PURIFYING: PurificationPhase[] = ["heating", "methanol", "magnesol", "contact", "drain"];
+const PURIFYING: PurificationPhase[] = ["heating", "methanol", "magnesol", "contact", "settle", "drain"];
 type ChemistrySettings = {
   oilMolarMass: number;
   ffaThreshold: number;
@@ -110,16 +108,26 @@ export const PROCESS_CONFIG = {
     stirring: { min: 400, max: 700, default: 500 },
     current: CURRENT_LIMITS,
   },
+  // Separation: time and speed are set per batch (Volume & Parameters); /api/config gives the
+  // defaults (Settings) and the centrifuge's maximum. It starts by itself after transesterification:
+  // 1 min settle in the reactor, then the reactor pump, the centrifuge and pumpin run together.
   separation: {
     timeMinutes: 60,
-    speedRpm: 2600,
+    speedRpm: 2500,
+    timeMin: 1,
+    timeMax: 180,
+    speedMin: 100,
+    speedMax: 2500,
+    settleSeconds: 60,
   },
   // Purification (dry wash with Magnesol or bentonite): fixed values, same as the backend's purification.py.
-  // The heater switches off at 90 °C and comes back on at 89 °C (holdTemperature - holdBand) during
-  // methanol removal. The drain has no time limit: it ends when the output is stable for 30 s.
+  // Methanol removal keeps it at 87–90 °C: the heater switches off at 90 °C and back on at 87 °C
+  // (holdTemperature - holdBand). After contact it settles for 1 min, then the valve and pumpout
+  // run until the output load cell is stable for 30 s.
   purification: {
     holdTemperature: 90,
-    holdBand: 1,
+    holdBand: 3,
+    settleSeconds: 60,
     maximumTemperature: 95,
     heatingTimeoutMinutes: 25,
     stirringSpeedRpm: 200,
@@ -149,6 +157,7 @@ const SAFETY_GROUPS = [
       ["Electronics", "Keep electronics protected from spills, liquid, and chemical vapors."],
       ["Monitoring", "Monitor voltage, current, and temperature during the reaction."],
       ["Hot purification tank", "The purification tank gets hot (90 °C): don't touch it, keep the area ventilated, no flames nearby."],
+      ["Pumps", "The oil pump and the dispensers run until you press Done: watch the container and press Done as soon as it is empty."],
       ["Attendance", "Never leave an operating batch unattended."],
       ["Interlocks", "Stop the process if an interlock or configured safety limit is triggered."],
     ],
@@ -246,15 +255,6 @@ function getChemistrySettings(): ChemistrySettings {
     stripMaxFfa: 5,
     // Esterification re-check passes at 3% or below.
     ffaTarget: 3,
-  };
-}
-
-/** Purification: the two editable times (Settings → Purification). There is no settling or cooling step. */
-function getPurificationSettings() {
-  const settings = readSettings();
-  return {
-    methanolRemovalMinutes: settingNumber(settings, "methanolRemovalTime", 10, 1),
-    contactMinutes: settingNumber(settings, "contactTime", 10, 1),
   };
 }
 
@@ -395,83 +395,6 @@ function calculateQuantityCards(
     adsorbentG: adsorbentGrams(oilVolumeMl, adsorbent, doses),
     adsorbentDosePct: adsorbentDose(adsorbent, doses),
   };
-}
-
-/** Local demonstration of the purification (no backend): same steps and rules as the Pi. */
-type LocalPurification = {
-  phase: PurificationPhase;
-  temperature: number;
-  highest: number;
-  heaterOn: boolean;
-  stirrerOn: boolean;
-  heatingSeconds: number;
-  methanolRemaining: number;
-  magnesolAdded: boolean;
-  contactRemaining: number;
-  drainElapsed: number;
-  stableSeconds: number;
-  anchorG: number | null;
-  outputG: number;
-  tankG: number;
-  oilG: number;
-  warning: string | null;
-  stopReason: string | null;
-};
-
-function stepLocalPurification(sim: LocalPurification) {
-  const p = PROCESS_CONFIG.purification;
-  const fault = (reason: string) => {
-    sim.phase = "fault";
-    sim.heaterOn = false;
-    sim.stirrerOn = false;
-    sim.stopReason = reason;
-  };
-  // the heater warms about 0.75 °C/s; without it the tank cools toward 27 °C
-  sim.temperature = Number((sim.heaterOn ? sim.temperature + 0.75 : sim.temperature - (sim.temperature - 27) * 0.002).toFixed(2));
-  sim.highest = Math.max(sim.highest, sim.temperature);
-  if (sim.temperature > p.maximumTemperature) return fault(`temperature exceeded ${p.maximumTemperature} °C`);
-  if (sim.phase === "heating") {
-    sim.heatingSeconds += 1;
-    if (sim.temperature >= p.holdTemperature) {
-      sim.heaterOn = false; // 90 °C reached: heater off, then methanol removal at 90 °C
-      sim.phase = "methanol";
-    } else if (sim.heatingSeconds >= p.heatingTimeoutMinutes * 60) fault(`${p.holdTemperature} °C not reached within ${p.heatingTimeoutMinutes} min`);
-  } else if (sim.phase === "methanol") {
-    if (sim.temperature >= p.holdTemperature) sim.heaterOn = false;
-    else if (sim.temperature <= p.holdTemperature - p.holdBand) sim.heaterOn = true;
-    sim.methanolRemaining = Math.max(sim.methanolRemaining - 1, 0);
-    if (sim.methanolRemaining === 0) {
-      sim.heaterOn = false;
-      sim.phase = "magnesol";
-    }
-  } else if (sim.phase === "magnesol") {
-    if (sim.magnesolAdded) sim.phase = "contact";
-  } else if (sim.phase === "contact") {
-    // stirred with the heater off: the biodiesel cools down
-    sim.contactRemaining = Math.max(sim.contactRemaining - 1, 0);
-    if (sim.contactRemaining === 0) {
-      sim.stirrerOn = false;
-      sim.phase = "drain"; // no settling, no cooling: the outlet opens right away
-    }
-  } else if (sim.phase === "drain") {
-    const moved = Math.min(sim.tankG, 3); // about 3 g/s through the outlet and filter
-    sim.tankG -= moved;
-    sim.outputG = Number((sim.outputG + moved).toFixed(1));
-    sim.drainElapsed += 1;
-    if (sim.anchorG !== null && Math.abs(sim.outputG - sim.anchorG) <= p.drainStableGrams) sim.stableSeconds += 1;
-    else {
-      sim.anchorG = sim.outputG;
-      sim.stableSeconds = 0;
-    }
-    // done only when the output load cell has been stable for 30 s (no time limit)
-    const started = sim.outputG > p.drainStableGrams;
-    if (started && sim.stableSeconds >= p.drainStableSeconds) {
-      sim.phase = "complete";
-      if (sim.oilG > 0 && sim.outputG < p.lowOutputFraction * sim.oilG) {
-        sim.warning = `Low output – check the polishing filter. ${sim.outputG.toFixed(0)} g collected from ${sim.oilG.toFixed(0)} g of oil.`;
-      }
-    }
-  }
 }
 
 function SectionHeader({
@@ -671,90 +594,132 @@ function StageControls({
 const PUMP_INFO: Record<PumpName, { label: string; tank: string }> = {
   catalyst: { label: "Pump A · NaOH/KOH + methanol", tank: "A" },
   acid: { label: "Pump B · H₂SO₄ + methanol", tank: "B" },
+  oil: { label: "Oil pump", tank: "Oil" },
 };
 
-type PumpView = { phase: PumpPhase; deliveredG: number; faultReason: string | null; byTime: boolean };
+/** Oil Loading with the automated oil input: the operator has measured the target volume into
+ * the oil container; the oil pump empties it into the reactor and runs until Done is pressed. */
+function OilPumpPanel({
+  volumeMl,
+  targetG,
+  run,
+  loaded,
+  onStart,
+  onDone,
+  onStop,
+}: {
+  volumeMl: number;
+  targetG: number;
+  run: PumpView | null;
+  loaded: boolean;
+  onStart: () => void;
+  onDone: () => void;
+  onStop: () => void;
+}) {
+  const t = useT();
+  const pumping = run?.phase === "pumping";
+  const problem = !loaded && !pumping && run !== null && (run.phase === "fault" || run.phase === "stopped");
+  return (
+    <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid="oil-pump">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="gv-label">{t("Oil pump")}</div>
+        <Status tone={loaded ? "green" : problem ? (run?.phase === "stopped" ? "yellow" : "red") : pumping ? "blue" : "yellow"}>
+          {loaded ? t("Oil loaded") : problem ? (run?.phase === "stopped" ? t("Stopped") : t("Pump problem")) : pumping ? t("Pumping") : t("Ready")}
+        </Status>
+      </div>
+      <p className="mt-3 text-sm text-gray-300">
+        {loaded
+          ? t("All {volume} mL of oil ({grams} g) is in the reactor.", { volume: volumeMl, grams: targetG.toFixed(1) })
+          : t("Measure exactly {volume} mL of oil ({grams} g) into the oil container. The oil pump empties it into the reactor: press Done when the container is empty.", { volume: volumeMl, grams: targetG.toFixed(1) })}
+      </p>
+      {pumping && run && <p className="mt-2 font-mono text-sm text-white" data-testid="pump-elapsed">{t("Pumping · {time}", { time: formatTimer(run.elapsedSeconds) })}</p>}
+      {problem && run?.faultReason && <p className="mt-3 text-sm text-red-400">{t(run.faultReason)}</p>}
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        {pumping && <Button onClick={onDone}>{t("Done – the oil container is empty")}</Button>}
+        {pumping && <Button variant="secondary" onClick={onStop}>{t("Stop pump")}</Button>}
+        {!loaded && !pumping && (
+          <Button onClick={onStart}>{run ? t("Start the oil pump again") : t("Start oil pump")}</Button>
+        )}
+        {!loaded && !pumping && !run && <span className="text-xs text-gray-500">{t("The pump starts by itself on this step. Check the oil container and the line to the reactor.")}</span>}
+      </div>
+    </div>
+  );
+}
 
-/** Before a reaction stage: the pump loads the dose by itself (by the reactor load cell), the
- * acetone is optional: the operator can pour it or explicitly continue without it. */
+type PumpView = { phase: PumpPhase; deliveredG: number; faultReason: string | null; elapsedSeconds: number };
+
+/** Before a reaction stage: the operator has measured the premix into the dispenser's container;
+ * the dispenser empties it into the reactor until Done is pressed. Acetone is optional: pour it
+ * through the inlet and confirm, or continue without it. The stage starts by itself after both. */
 function LoadingPanel({
   pump,
   premixParts,
+  premixMl,
   targetG,
   run,
-  deliveredG,
-  onRetry,
-  onSkip,
+  loaded,
+  onStart,
+  onDone,
+  onStop,
   acetone,
-  current,
-  currentByHand,
   status,
 }: {
   pump: PumpName;
   premixParts: string[];
+  premixMl: number;
   targetG: number;
   /** The pump run for this dose, when one is running or just ended. */
   run: PumpView | null;
-  /** Grams this dose has received so far (all runs). */
-  deliveredG: number;
-  onRetry: () => void;
-  onSkip?: () => void;
-  acetone?: { ml: number; g: number; addedG: number; skipped: boolean; onSkip: () => void; onDemoAdd?: () => void } | null;
-  current: number;
-  /** No current control on the Pi: the operator sets the power supply's current. */
-  currentByHand: boolean;
+  /** Done was pressed for this dose: it is all in the reactor. */
+  loaded: boolean;
+  onStart: () => void;
+  onDone: () => void;
+  onStop: () => void;
+  acetone?: { ml: number; choice: "added" | "skipped" | null; onAdded: () => void; onSkip: () => void } | null;
   /** loading: the stage starts by itself once loaded; loaded: start it with the button. */
   status: "loading" | "starting" | "loaded";
 }) {
   const t = useT();
   const info = PUMP_INFO[pump];
   const pumping = run?.phase === "pumping";
-  const loaded = deliveredG >= targetG - 1;
   const problem = !loaded && !pumping && run !== null && (run.phase === "fault" || run.phase === "stopped");
   return (
     <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5" data-testid={`dosing-${pump}`}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="gv-label">{t("Loading the reactor")}</div>
-        <Status tone={problem ? "red" : status === "loading" ? "blue" : "green"}>
-          {problem ? t("Pump problem") : status === "starting" ? t("Starting…") : status === "loaded" ? t("Dose loaded") : t("Starts by itself when loaded")}
+        <Status tone={problem ? (run?.phase === "stopped" ? "yellow" : "red") : status === "loading" ? "blue" : "green"}>
+          {problem ? (run?.phase === "stopped" ? t("Stopped") : t("Pump problem")) : status === "starting" ? t("Starting…") : status === "loaded" ? t("Dose loaded") : pumping ? t("Pumping") : t("Starts by itself when loaded")}
         </Status>
       </div>
       <div className="mt-3 space-y-4">
         <div>
-          <div className="flex items-baseline justify-between gap-3 text-sm">
-            <span className="text-gray-300">{t(info.label)} <span className="text-xs text-gray-500">({premixParts.join(" + ")})</span></span>
-            <span className="font-mono text-white">{deliveredG.toFixed(1)} / {targetG.toFixed(1)} g</span>
+          <div className="text-sm text-gray-300">{t(info.label)} <span className="text-xs text-gray-500">({premixParts.join(" + ")})</span></div>
+          <p className="mt-2 text-sm text-gray-400">
+            {loaded
+              ? t("The premix ({ml} mL, {grams} g) is in the reactor.", { ml: premixMl.toFixed(1), grams: targetG.toFixed(1) })
+              : t("Measure the premix into container {tank} ({ml} mL, {grams} g). The dispenser empties it into the reactor: press Done when the container is empty.", { tank: info.tank, ml: premixMl.toFixed(1), grams: targetG.toFixed(1) })}
+          </p>
+          {pumping && run && <p className="mt-2 font-mono text-sm text-white">{t("Pumping · {time}", { time: formatTimer(run.elapsedSeconds) })}</p>}
+          {problem && run?.faultReason && <p className="mt-2 text-sm text-red-400">{t(run.faultReason)}</p>}
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            {pumping && <Button onClick={onDone}>{t("Done – container {tank} is empty", { tank: info.tank })}</Button>}
+            {pumping && <Button variant="secondary" onClick={onStop}>{t("Stop pump")}</Button>}
+            {!loaded && !pumping && <Button variant={run ? "primary" : "secondary"} onClick={onStart}>{run ? t("Start the dispenser again") : t("Start the dispenser")}</Button>}
           </div>
-          <div className="mt-2"><Progress value={targetG > 0 ? (deliveredG / targetG) * 100 : 0} /></div>
-          {problem && (
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <span className="text-sm font-semibold text-red-400">{t("Pump problem – check the line")}</span>
-              <Button variant="secondary" onClick={onRetry}>{t("Retry")}</Button>
-            </div>
-          )}
-          {pumping && onSkip && <Button variant="secondary" className="mt-3" onClick={onSkip}>{t("Skip (demo)")}</Button>}
         </div>
         {acetone && (
-          // The pump doses by the reactor's weight gain, so nothing may be poured in while it runs.
           loaded ? (
             <div>
-              <div className="flex items-baseline justify-between gap-3 text-sm">
-                <span className="text-gray-300">{t("Optional acetone: pour {ml} mL through the inlet", { ml: acetone.ml.toFixed(1) })}</span>
-                <span className="font-mono text-white">{acetone.addedG.toFixed(1)} / {acetone.g.toFixed(1)} g</span>
-              </div>
-              <div className="mt-2"><Progress value={acetone.g > 0 ? (acetone.addedG / acetone.g) * 100 : 100} /></div>
+              <div className="text-sm text-gray-300">{t("Optional acetone: pour {ml} mL through the inlet", { ml: acetone.ml.toFixed(1) })}</div>
               <div className="mt-3 flex flex-wrap gap-3">
-                {acetone.onDemoAdd && acetone.addedG < acetone.g * 0.95 && !acetone.skipped && (
-                  <Button variant="secondary" onClick={acetone.onDemoAdd}>{t("Pour acetone (demo)")}</Button>
-                )}
-                {acetone.addedG < acetone.g * 0.95 && !acetone.skipped && (
-                  <Button variant="secondary" onClick={acetone.onSkip}>{t("Continue without acetone")}</Button>
-                )}
-                {acetone.skipped && <span className="self-center text-sm text-gray-500">{t("Continuing without acetone")}</span>}
+                {acetone.choice === null && <Button onClick={acetone.onAdded}>{t("Acetone added")}</Button>}
+                {acetone.choice === null && <Button variant="secondary" onClick={acetone.onSkip}>{t("Continue without acetone")}</Button>}
+                {acetone.choice === "added" && <span className="self-center text-sm text-green-400">{t("Acetone added")}</span>}
+                {acetone.choice === "skipped" && <span className="self-center text-sm text-gray-500">{t("Continuing without acetone")}</span>}
               </div>
             </div>
           ) : (
-            <p className="text-sm text-gray-500">{t("Acetone is optional. After the pump finishes, add it if you are using it, or continue without it.")}</p>
+            <p className="text-sm text-gray-500">{t("Acetone is optional. After the premix is in, pour it if you are using it, or continue without it.")}</p>
           )
         )}
       </div>
@@ -762,29 +727,16 @@ function LoadingPanel({
   );
 }
 
-/** A transfer outlet as the page shows it: open, closed, or about to open (the centrifuge outlet
- * waits for the centrifuge to stop). There is no drain time: an outlet opens when its process
- * finishes, the next process starts right away, and every valve closes when the batch is complete. */
-type ValveView = "open" | "closed" | "waiting";
-
-const DRAIN_INFO: Record<DrainValve, { label: string; to: string }> = {
-  reactor_outlet: { label: "Reactor outlet valve", to: "flowing to the centrifuge" },
-  centrifuge_outlet: { label: "Centrifuge outlet valve", to: "flowing to the purification tank" },
-};
-
-/** An outlet valve that opens by itself: only an Open / Closed indicator. */
-function ValveIndicator({ valve, view }: { valve: DrainValve; view: ValveView }) {
+/** A transfer pump or valve during separation / purification: On / Off. */
+function OutputIndicator({ label, on, detail }: { label: string; on: boolean; detail?: string }) {
   const t = useT();
-  const info = DRAIN_INFO[valve];
-  const open = view === "open";
   return (
-    <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.07] bg-gv-inset px-5 py-4" data-testid={`valve-${valve}`}>
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.07] bg-gv-inset px-5 py-4">
       <div className="text-sm text-gray-300">
-        <span className="font-semibold text-white">{t(info.label)}</span>
-        {open && <span> · {t(info.to)} · {t("stays open until the batch is complete")}</span>}
-        {view === "waiting" && <span> · {t("waiting for the centrifuge to stop")}</span>}
+        <span className="font-semibold text-white">{t(label)}</span>
+        {detail && <span> · {t(detail)}</span>}
       </div>
-      <Status tone={open ? "green" : view === "waiting" ? "yellow" : "neutral"}>{open ? t("OPEN") : t("CLOSED")}</Status>
+      <Status tone={on ? "green" : "neutral"}>{on ? t("ON") : t("OFF")}</Status>
     </div>
   );
 }
@@ -931,9 +883,7 @@ function ReactionStage({
   const t = useT();
   const isEsterification = kind === "Esterification";
   const totalSeconds = time * 60;
-  const elapsedSeconds = liveStage
-    ? liveStage.elapsedSeconds
-    : (state === "ready" ? 0 : state === "complete" ? time : Math.min(42, time)) * 60;
+  const elapsedSeconds = liveStage ? liveStage.elapsedSeconds : state === "complete" ? totalSeconds : 0;
   const remainingSeconds = liveStage ? liveStage.remainingSeconds : Math.max(totalSeconds - elapsedSeconds, 0);
   const title = isEsterification && esterStage > 1 ? t("Esterification · stage {stage}", { stage: esterStage }) : t(kind);
   const running = state === "running" || state === "paused" || state === "fault";
@@ -987,7 +937,7 @@ function ReactionStage({
               <Metric
                 label={t("Acetone")}
                 value={isEsterification && esterStage > 1 ? t("None") : transDose.acetoneMl === null ? t("Unavailable") : `${(isEsterification ? esterDose.acetoneMl : transDose.acetoneMl).toFixed(1)} mL`}
-                sub={isEsterification && esterStage > 1 ? t("Still in the reactor from stage 1") : t("Provisional 10% · poured by hand through the inlet")}
+                sub={isEsterification && esterStage > 1 ? t("Still in the reactor from stage 1") : t("Provisional 10% · optional · poured by hand through the inlet")}
               />
             </Card>
           </div>
@@ -1003,11 +953,11 @@ function ReactionStage({
 
       {running && (
         <LiveReadings source={sourceLabel} progress={(elapsedSeconds / totalSeconds) * 100} fault={liveStage?.faultReason}>
-          <Metric label={t("Time remaining")} value={liveStage ? formatTimer(remainingSeconds) : `${Math.round(remainingSeconds / 60)} min`} />
-          <Metric label={t("Voltage")} value={liveStage ? (liveStage.liveVoltage == null ? "—" : `${liveStage.liveVoltage.toFixed(1)} V`) : state === "running" ? `${voltage} V` : "0 V"} />
-          <Metric label={t("Current")} value={liveStage ? (liveStage.liveCurrent == null ? "—" : `${liveStage.liveCurrent.toFixed(2)} A`) : state === "running" ? `${(current * 0.9).toFixed(2)} A` : "0 A"} sub={t("limit {amps} A", { amps: current })} />
-          <Metric label={t("Stirrer")} value={liveStage ? (liveStage.liveRpm == null ? "—" : `${liveStage.liveRpm} RPM`) : state === "running" ? `${stirring} RPM` : "0 RPM"} />
-          <Metric label={t("Temperature")} value={liveStage ? (liveStage.liveTemperature == null ? "—" : `${liveStage.liveTemperature.toFixed(1)} °C`) : "27 °C"} />
+          <Metric label={t("Time remaining")} value={formatTimer(remainingSeconds)} />
+          <Metric label={t("Voltage")} value={liveStage?.liveVoltage == null ? "—" : `${liveStage.liveVoltage.toFixed(1)} V`} sub={t("setting {volts} V", { volts: voltage })} />
+          <Metric label={t("Current")} value={liveStage?.liveCurrent == null ? "—" : `${liveStage.liveCurrent.toFixed(2)} A`} sub={t("limit {amps} A", { amps: current })} />
+          <Metric label={t("Stirrer")} value={liveStage?.liveRpm == null ? "—" : `${liveStage.liveRpm} RPM`} sub={t("set speed {rpm} RPM", { rpm: stirring })} />
+          <Metric label={t("Temperature")} value={liveStage?.liveTemperature == null ? "—" : `${liveStage.liveTemperature.toFixed(1)} °C`} />
         </LiveReadings>
       )}
       <StageControls
@@ -1027,13 +977,12 @@ function ReactionStage({
   );
 }
 
-type LocalPump = { key: string; pump: PumpName; base: number; targetG: number; deliveredG: number; phase: PumpPhase; faultReason: string | null };
-/** Local demonstration: which transfer outlets are open (they stay open until the batch is complete). */
-type LocalValves = Record<DrainValve, boolean>;
-const ALL_CLOSED: LocalValves = { reactor_outlet: false, centrifuge_outlet: false };
 type DoseLoad = { completedG: number };
+type SeparationConfig = {
+  timeMinutes: number; speedRpm: number; timeMin: number; timeMax: number; speedMin: number; speedMax: number; settleSeconds: number;
+};
 
-/** What the Purification screen shows, from the Pi or from the local demonstration. */
+/** What the Purification screen shows (from the Raspberry Pi). */
 type PurificationView = {
   phase: PurificationPhase;
   temperature: number | null;
@@ -1055,6 +1004,8 @@ type PurificationView = {
   heatingSeconds: number;
   methanolSeconds: number;
   contactSeconds: number;
+  /** The 1 min settle after contact. */
+  settleSeconds: number;
   drainSeconds: number;
   /** Seconds the output load cell has stayed within ±2 g while draining (done at 30). */
   stableSeconds: number;
@@ -1064,7 +1015,7 @@ const READY_PURIFICATION: PurificationView = {
   phase: "ready", temperature: null, highest: null, heaterOn: false, stirrerOn: false, stirrerRpm: null,
   valveOpen: false, stepRemaining: null, outputG: 0, oilG: null, magnesolG: null, adsorbent: "Magnesol", warning: null, stopReason: null,
   stopOccurred: false, automatic: true, heatingSeconds: 0, methanolSeconds: 0, contactSeconds: 0,
-  drainSeconds: 0, stableSeconds: 0,
+  settleSeconds: 0, drainSeconds: 0, stableSeconds: 0,
 };
 
 const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
@@ -1072,12 +1023,13 @@ const PURIFICATION_STEPS: Array<[PurificationPhase, string]> = [
   ["methanol", "Methanol removal"],
   ["magnesol", "Add adsorbent"],   // shown as "Add Magnesol" or "Add Bentonite"
   ["contact", "Contact"],
+  ["settle", "Settling"],
   ["drain", "Draining"],
   ["complete", "Done"],
 ];
 
-/** Everything this page knows about the batch in progress. It is saved while the batch runs
- * (on the Raspberry Pi, or in this browser offline), so the batch is continued where it was after
+/** Everything this page knows about the batch in progress. It is saved on the Raspberry Pi while
+ * the batch runs, so the batch is continued where it was after
  * leaving the page, a reload, or on another device, instead of being started again. */
 type ProcessSnapshot = {
   version: 1;
@@ -1095,8 +1047,8 @@ type ProcessSnapshot = {
   recheckAbove: boolean;
   finalFfa: number | null;
   loads: Record<string, DoseLoad>;
-  acetoneBase: Record<string, number>;
-  acetoneSkipped: Record<string, boolean>;
+  /** Per dose: the optional acetone was poured ("added") or left out ("skipped"). */
+  acetone: Record<string, "added" | "skipped">;
   adsorbent: Adsorbent;
   ratio: number;
   catalyst: "NaOH" | "KOH";
@@ -1108,6 +1060,9 @@ type ProcessSnapshot = {
   transTime: string;
   transStirring: string;
   transCurrent: string;
+  /** The batch's separation: centrifuge time (min) and speed (RPM). */
+  sepTime: string;
+  sepSpeed: string;
   esterState: StageState;
   transState: StageState;
   separationState: StageState;
@@ -1119,21 +1074,15 @@ type ProcessSnapshot = {
   autoPumped: string[];
   autoStageStarted: string[];
   autoStarted: boolean;
-  autoSeparation: boolean;
-  // the local demonstration (no backend)
-  localPump: LocalPump | null;
-  localValves: LocalValves;
-  localPurification: LocalPurification | null;
 };
 
 export default function NewBatch() {
   const t = useT();
   const [step, setStep] = useState(0);
-  // Reactor load cell: the oil, then everything poured or pumped in (live, or the local demo).
+  // Reactor load cell (optional): the oil, then everything poured or pumped in. Without one it stays 0.
   const [reactorG, setReactorG] = useState(0);
   // The oil weight recorded when the oil loading is confirmed; the calculations use it from then on.
   const [confirmedOilG, setConfirmedOilG] = useState<number | null>(null);
-  const oilMassG = confirmedOilG ?? reactorG;
   const [targetVolume, setTargetVolume] = useState("2000");
   const [ffa, setFfa] = useState("");
   // The strip shows its darkest color: FFA is at least the strip's maximum (5%).
@@ -1151,14 +1100,8 @@ export default function NewBatch() {
   const accountedRuns = useRef(new Set<string>());
   const autoPumped = useRef(new Set<string>());
   const autoStageStarted = useRef(new Set<string>());
-  const [localPump, setLocalPump] = useState<LocalPump | null>(null);
-  // Local demonstration: the transfer outlets (open from the end of their process until the batch is complete)
-  const [localValves, setLocalValves] = useState<LocalValves>(ALL_CLOSED);
-  // Reactor weight when each dose's step opened, to show the acetone poured since.
-  const [acetoneBase, setAcetoneBase] = useState<Record<string, number>>({});
-  // Acetone remains available, but each reaction stage can explicitly continue without it.
-  const [acetoneSkipped, setAcetoneSkipped] = useState<Record<string, boolean>>({});
-  const purificationSettings = useMemo(getPurificationSettings, []);
+  // The optional acetone of each dose: poured ("added") or left out ("skipped") by the operator.
+  const [acetone, setAcetone] = useState<Record<string, "added" | "skipped">>({});
   const adsorbentSettings = useMemo(getAdsorbentSettings, []);
   // Dry wash adsorbent for this batch: Magnesol or bentonite (Volume & Parameters → Purification)
   const [adsorbent, setAdsorbent] = useState<Adsorbent>(adsorbentSettings.defaultAdsorbent);
@@ -1172,17 +1115,30 @@ export default function NewBatch() {
   const [transTime, setTransTime] = useState("120");
   const [transStirring, setTransStirring] = useState("500");
   const [transCurrent, setTransCurrent] = useState(String(CURRENT_LIMITS.default));
+  // Separation (centrifuge) for this batch: the defaults and limits come from /api/config.
+  const [separationConfig, setSeparationConfig] = useState<SeparationConfig>(PROCESS_CONFIG.separation);
+  const [sepTime, setSepTime] = useState(String(PROCESS_CONFIG.separation.timeMinutes));
+  const [sepSpeed, setSepSpeed] = useState(String(PROCESS_CONFIG.separation.speedRpm));
+  // Set once the batch's own separation values are known (from the config, or a continued batch).
+  const sepDefaultsApplied = useRef(false);
   const [esterState, setEsterState] = useState<StageState>("ready");
   const [transState, setTransState] = useState<StageState>("ready");
   const [separationState, setSeparationState] = useState<StageState>("ready");
   const [purification, setPurification] = useState<PurificationView>(READY_PURIFICATION);
-  const localPurification = useRef<LocalPurification | null>(null);
   const autoStarted = useRef(false);
   const [heaterConfirmed, setHeaterConfirmed] = useState(false); // only used without a level switch
   const [saved, setSaved] = useState(false);
-  // The Pi refused the batch record: offer to retry, or to keep it in this browser and finish.
+  // The Pi refused the batch record: offer to try again.
   const [saveFailed, setSaveFailed] = useState(false);
-  const { live, backend, mock, connecting } = useLiveData();
+  const { live, backend, connecting } = useLiveData();
+  // The machine has no reactor load cell (hardware.toml): the oil is measured by volume.
+  const byVolume = Boolean(live?.sensors.loadCellsFitted?.reactor === false);
+  const [oilPouredByVolume, setOilPouredByVolume] = useState(false);
+  // Automated oil input: the operator measures the target volume into the oil container and the
+  // oil pump empties it into the reactor on the Oil Loading step (until Done is pressed).
+  const oilPumpFitted = Boolean(live && "oil" in (live.sensors.pumps ?? {}));
+  const plannedOilG = /^\d+$/.test(targetVolume) ? Number(targetVolume) * PROCESS_CONFIG.oil.densityGPerMl : 0;
+  const oilMassG = confirmedOilG ?? (oilPumpFitted || byVolume ? plannedOilG : reactorG);
   const navigate = useNavigate();
   const [actionError, setActionError] = useState<string | null>(null);
   const [savedBatch, setSavedBatch] = useState<BatchRecord | null>(null);
@@ -1190,7 +1146,8 @@ export default function NewBatch() {
   // (never the current time, which would keep changing as the page updates).
   const [completedAt, setCompletedAt] = useState<Date | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [batchId, setBatchId] = useState(() => `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`);
+  // The next batch ID from the Raspberry Pi (its naming format); empty until it answers.
+  const [batchId, setBatchId] = useState("");
   const [processConfigCurrentControl, setProcessConfigCurrentControl] = useState(false);
   // Process handoffs continue automatically after each transfer; autoAdvance is a legacy DB field.
   // ----- one batch at a time -----
@@ -1210,8 +1167,10 @@ export default function NewBatch() {
   const [restoreCount, setRestoreCount] = useState(0);
 
   // The batch in progress, if there is one: this page continues it instead of starting another.
-  // Otherwise the next batch ID from the backend's naming format (local ID when offline).
+  // Otherwise the next batch ID from the Raspberry Pi's naming format. Asked once the Pi is connected
+  // (again after a connection problem, until it has answered).
   useEffect(() => {
+    if (!backend || ongoing !== undefined) return;
     let cancelled = false;
     getActiveBatch()
       .then(async (active) => {
@@ -1220,11 +1179,11 @@ export default function NewBatch() {
         if (!cancelled) setOngoing(active);
         if (!active) {
           const id = await getNextBatchId().catch(() => null);
-          if (!cancelled && id) setBatchId(id);
+          if (!cancelled && id) setBatchId((current) => current || id);
         }
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (cancelled || isOffline(error)) return;   // offline: asked again when the Pi is back
         setActionError(errorText(t, error));
         setOngoing(null);
       });
@@ -1232,21 +1191,26 @@ export default function NewBatch() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [backend, ongoing]);
   const chemistrySettings = useMemo(getChemistrySettings, []);
 
-  // Can the Pi set the power supply's current limit? (otherwise the operator sets it by hand)
+  // From the Pi: can it set the power supply's current limit (otherwise the operator sets it by
+  // hand), and the separation defaults and limits (Settings, and the centrifuge's maximum RPM).
   useEffect(() => {
-    if (!backend) {
-      setProcessConfigCurrentControl(false);
-      return;
-    }
+    if (!backend) return;
     let cancelled = false;
-    fetch("/api/config")
-      .then((response) => response.json())
-      .then((config: { powerSupply?: { currentControl?: boolean } }) => {
+    getProcessConfig()
+      .then((config) => {
         if (cancelled) return;
         setProcessConfigCurrentControl(Boolean(config.powerSupply?.currentControl));
+        if (config.separation) {
+          setSeparationConfig(config.separation);
+          if (!sepDefaultsApplied.current) {
+            sepDefaultsApplied.current = true;
+            setSepTime(String(Math.round(config.separation.timeMinutes)));
+            setSepSpeed(String(Math.round(config.separation.speedRpm)));
+          }
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -1254,60 +1218,9 @@ export default function NewBatch() {
     };
   }, [backend]);
 
-  /** Shows the local demonstration state on the screen. */
-  function showLocalPurification(sim: LocalPurification) {
-    const total = (minutes: number) => Math.round(minutes * 60);
-    setPurification({
-      phase: sim.phase,
-      temperature: sim.temperature,
-      highest: sim.highest,
-      heaterOn: sim.heaterOn,
-      stirrerOn: sim.stirrerOn,
-      // the stirrer's RPM reading is shown during contact only
-      stirrerRpm: sim.phase === "contact" ? (sim.stirrerOn ? PROCESS_CONFIG.purification.stirringSpeedRpm - 2 : 0) : null,
-      valveOpen: sim.phase === "drain",
-      stepRemaining:
-        sim.phase === "methanol" ? sim.methanolRemaining
-          : sim.phase === "contact" ? sim.contactRemaining
-            : null,
-      outputG: sim.outputG,
-      oilG: sim.oilG,
-      magnesolG: adsorbentGrams(oilVolumeMl, adsorbent, adsorbentSettings),
-      adsorbent,
-      warning: sim.warning,
-      stopReason: sim.stopReason,
-      stopOccurred: Boolean(sim.stopReason),
-      automatic: true,
-      heatingSeconds: sim.heatingSeconds,
-      methanolSeconds: total(purificationSettings.methanolRemovalMinutes) - sim.methanolRemaining,
-      contactSeconds: total(purificationSettings.contactMinutes) - sim.contactRemaining,
-      drainSeconds: sim.drainElapsed,
-      stableSeconds: sim.stableSeconds,
-    });
-  }
-
-  // No backend: run the purification as a local demonstration, one step per second.
+  // The Raspberry Pi's live readings and the state of its stages.
   useEffect(() => {
-    if (backend || !PURIFYING.includes(purification.phase)) return;
-    const timer = window.setInterval(() => {
-      const sim = localPurification.current;
-      if (!sim) return;
-      stepLocalPurification(sim);
-      showLocalPurification({ ...sim });
-    }, 1000);
-    return () => window.clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, purification.phase]);
-
-  // Local demonstration: when purification ends (done or stopped) every valve is closed.
-  useEffect(() => {
-    if (backend || (purification.phase !== "complete" && purification.phase !== "fault")) return;
-    setLocalValves(ALL_CLOSED);
-  }, [backend, purification.phase]);
-
-  // Backend connected: show its live readings and the state of its stages.
-  useEffect(() => {
-    if (!backend || !live) return;
+    if (!live) return;
     if (live.sensors.oilMassG !== null) setReactorG(live.sensors.oilMassG);
     const stage = live.stage;
     if (stage.stage && stage.batchId === batchId) {
@@ -1340,15 +1253,16 @@ export default function NewBatch() {
       heatingSeconds: p.heatingTimeSeconds,
       methanolSeconds: p.methanolTotalSeconds - p.methanolRemainingSeconds,
       contactSeconds: p.contactTotalSeconds - p.contactRemainingSeconds,
+      settleSeconds: (p.settleTotalSeconds ?? 0) - (p.settleRemainingSeconds ?? 0),
       drainSeconds: p.drainElapsedSeconds,
       stableSeconds: p.stableSeconds ?? 0,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, live, batchId]);
+  }, [live, batchId]);
 
-  // A pump run on the Pi has ended: add what it delivered to its dose (once).
+  // A pump run on the Pi has ended: Done adds the measured dose to it (once); Stop adds nothing.
   useEffect(() => {
-    if (!backend || !live) return;
+    if (!live) return;
     const p = live.pump;
     if (!p.startedAt || !p.stage || p.batchId !== batchId || accountedRuns.current.has(p.startedAt)) return;
     if (p.phase === "done" || p.phase === "fault" || p.phase === "stopped") {
@@ -1356,24 +1270,7 @@ export default function NewBatch() {
       const key = p.stage;
       setLoads((current) => ({ ...current, [key]: { completedG: (current[key]?.completedG ?? 0) + p.deliveredG } }));
     }
-  }, [backend, live, batchId]);
-
-  // Local demonstration of a pump: the dose arrives in about 5 seconds.
-  useEffect(() => {
-    if (backend || !localPump || localPump.phase !== "pumping") return;
-    const timer = window.setTimeout(() => {
-      const stepG = Math.min(localPump.targetG / 5, localPump.targetG - localPump.deliveredG);
-      const delivered = localPump.deliveredG + stepG;
-      setReactorG((grams) => grams + stepG);
-      if (delivered >= localPump.targetG - 0.01) {
-        setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
-        setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG } }));
-      } else {
-        setLocalPump({ ...localPump, deliveredG: delivered });
-      }
-    }, 1000);
-    return () => window.clearTimeout(timer);
-  }, [backend, localPump]);
+  }, [live, batchId]);
 
   const oilVolumeMl =
     PROCESS_CONFIG.oil.densityGPerMl > 0
@@ -1398,7 +1295,7 @@ export default function NewBatch() {
     !ffaError && ffaNumber > chemistrySettings.ffaThreshold;
   const measuredOilError =
     oilMassG <= 0 || oilVolumeMl === null
-      ? t("Load-cell reading is unavailable.")
+      ? oilPumpFitted || byVolume ? t("Enter the target batch volume.") : t("Load-cell reading is unavailable.")
       : oilVolumeMl < PROCESS_CONFIG.oil.minimumVolumeMl
         ? t("Minimum oil volume is 1500 mL.")
         : oilVolumeMl > PROCESS_CONFIG.oil.maximumVolumeMl
@@ -1416,11 +1313,17 @@ export default function NewBatch() {
     wholeNumberError(t, transStirring, PROCESS_CONFIG.transesterification.stirring),
     wholeNumberError(t, transCurrent, PROCESS_CONFIG.transesterification.current),
   ];
+  const sepLimits = {
+    time: { min: separationConfig.timeMin, max: separationConfig.timeMax },
+    speed: { min: separationConfig.speedMin, max: separationConfig.speedMax },
+  };
+  const sepErrors = [wholeNumberError(t, sepTime, sepLimits.time), wholeNumberError(t, sepSpeed, sepLimits.speed)];
   const parametersValid =
     !targetError &&
     !ffaError &&
     !measuredOilError &&
     !transErrors.some(Boolean) &&
+    !sepErrors.some(Boolean) &&
     (!requiresEsterification || !esterErrors.some(Boolean));
   const calculatorValues = calculateQuantityCards(
     oilMassG,
@@ -1494,45 +1397,40 @@ export default function NewBatch() {
     restoring.current = false;
   }, [restoreCount]);
 
+  const OIL_KEY = "Oil loading";
+  const oilRun = pumpRunFor(OIL_KEY);
+  const oilLoaded = oilPumpFitted && !targetError && doseLoaded(OIL_KEY, plannedOilG);
+  // An optional reactor load cell weighs the oil; without one the measured volume counts.
+  const hasReactorReading = live?.sensors.oilMassG != null;
+  const oilInReactorG = hasReactorReading ? reactorG : oilLoaded ? plannedOilG : 0;
   const targetReached =
     !targetError &&
-    oilVolumeMl !== null &&
-    Math.abs(oilVolumeMl - Number(targetVolume)) <= Math.max(Number(targetVolume) * 0.02, 5);
+    (oilPumpFitted
+      ? oilLoaded
+      : byVolume
+        ? oilPouredByVolume
+        : oilVolumeMl !== null &&
+          Math.abs(oilVolumeMl - Number(targetVolume)) <= Math.max(Number(targetVolume) * 0.02, 5));
   const loadingStatus =
-    oilMassG <= 0
+    oilPumpFitted
+      ? oilLoaded
+        ? t("Target quantity reached")
+        : oilRun?.phase === "pumping"
+          ? t("Pumping oil")
+          : t("Waiting for oil")
+      : byVolume && !oilPouredByVolume
+      ? t("Waiting for oil")
+      : oilMassG <= 0
       ? t("Waiting for oil")
       : measuredOilError
         ? t("Invalid quantity")
         : targetReached
           ? t("Target quantity reached")
           : t("Oil detected");
-  const systemTiles: Array<{
-    label: string;
-    value: string;
-    secondary?: string;
-    state?: DeviceState;
-  }> = [
-    { label: "Power Supply", value: "Ready", secondary: "Output off · 0–30 V DC" },
-    { label: "Electrodes", value: "Graphite – graphite", secondary: "Connected" },
-    { label: "Reactor Stirrer", value: "Ready", secondary: "Stopped · RPM sensor online" },
-    { label: "Centrifuge Motor", value: "Ready", secondary: "Stopped · RPM sensor online" },
-    { label: "Purification Stirrer", value: "Ready", secondary: "Stopped · RPM sensor online" },
-    { label: "Heater", value: "Ready", secondary: "Off · stops above 95 °C" },
-    { label: "Temperature Sensor", value: "Online", secondary: "27.0 °C · demonstration reading" },
-    { label: "Reactor Load Cell", value: "Online", secondary: `${reactorG.toFixed(1)} g in the reactor · demonstration mode` },
-    {
-      label: "Oil Input",
-      value: reactorG > 0 ? `${reactorG.toFixed(1)} g` : "No oil detected",
-      secondary: "Pour the oil through the first 5 µm filter",
-      state: "ready",
-    },
-    { label: "Dosing Pumps", value: "Ready", secondary: "A: NaOH/KOH + methanol · B: H₂SO₄ + methanol" },
-    { label: "Outlet Valves", value: "All closed", secondary: "Reactor, centrifuge and purification outlets" },
-    { label: "Output Load Cell", value: "Online", secondary: "0.0 g in the biodiesel container" },
-  ];
-  const tiles = systemStatus?.tiles ?? systemTiles;
+  // The device tiles come from the Raspberry Pi (nothing is shown until it has answered).
+  const tiles: Array<{ label: string; value: string; secondary?: string; state?: DeviceState }> = systemStatus?.tiles ?? [];
   const fault = tiles.find((tile) => tile.state === "fault");
-  const checking = tiles.find((tile) => tile.state === "checking");
+  const checking = !systemStatus || tiles.find((tile) => tile.state === "checking");
   const systemReady = !fault && !checking;
   const steps = useMemo(
     () => [
@@ -1567,159 +1465,89 @@ export default function NewBatch() {
   }, [backend, currentStage]);
 
   const liveStageFor = (kind: StageName) =>
-    backend && live && live.stage.stage === kind && live.stage.batchId === batchId ? live.stage : null;
+    live && live.stage.stage === kind && live.stage.batchId === batchId ? live.stage : null;
   const liveSeparation = liveStageFor("Separation");
-  const realHardware = backend && !mock;
-  const sourceLabel = backend ? (mock ? "Simulated by the Greenova backend (demo mode)" : "Live readings from the Raspberry Pi") : "Demonstration data — no hardware controller connected";
+  const sourceLabel = "Live readings from the Raspberry Pi";
 
-  async function loadDemoReading() {
-    setConfirmedOilG(null);
-    setActionError(null);
-    if (backend) {
-      try {
-        const sensors = await loadDemoOil(Number(targetVolume || 0));
-        if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
-    }
-    setReactorG(Number(targetVolume || 0) * PROCESS_CONFIG.oil.densityGPerMl);
-  }
-
-  // ----- dosing pumps: each stage's dose loads by itself -----
+  // ----- the oil pump and the dispensers: switched on by the page, stopped by the operator (Done) -----
   const doseKey = currentStage === "Esterification" ? `Esterification ${esterStage}` : currentStage === "Transesterification" ? "Transesterification" : null;
   const reactionDose = currentStage === "Esterification"
-    ? { pump: "acid" as PumpName, targetG: esterDoseNow.premixG, premixMl: esterDoseNow.premixMl, acetoneMl: esterDoseNow.acetoneMl, acetoneG: esterDoseNow.acetoneG, state: esterState }
+    ? { pump: "acid" as PumpName, targetG: esterDoseNow.premixG, premixMl: esterDoseNow.premixMl, acetoneMl: esterDoseNow.acetoneMl, state: esterState }
     : currentStage === "Transesterification"
-      ? { pump: "catalyst" as PumpName, targetG: transDoseNow.premixG, premixMl: transDoseNow.premixMl, acetoneMl: transDoseNow.acetoneMl ?? 0, acetoneG: transDoseNow.acetoneG, state: transState }
+      ? { pump: "catalyst" as PumpName, targetG: transDoseNow.premixG, premixMl: transDoseNow.premixMl, acetoneMl: transDoseNow.acetoneMl ?? 0, state: transState }
       : null;
 
   function pumpRunFor(key: string): PumpView | null {
-    if (backend) {
-      const p = live?.pump;
-      if (!p || p.phase === "idle" || p.batchId !== batchId || p.stage !== key) return null;
-      return { phase: p.phase, deliveredG: p.deliveredG, faultReason: p.faultReason, byTime: p.byTime };
-    }
-    if (!localPump || localPump.key !== key) return null;
-    return { phase: localPump.phase, deliveredG: localPump.deliveredG, faultReason: localPump.faultReason, byTime: false };
+    const p = live?.pump;
+    if (!p || p.phase === "idle" || p.batchId !== batchId || p.stage !== key) return null;
+    return { phase: p.phase, deliveredG: p.deliveredG, faultReason: p.faultReason, elapsedSeconds: p.elapsedSeconds };
   }
 
-  const pumpRunning = backend ? live?.pump.phase === "pumping" : localPump?.phase === "pumping";
+  const pumpRunning = live?.pump.phase === "pumping";
 
   function doseLoaded(key: string, targetG: number) {
     return (loads[key]?.completedG ?? 0) >= targetG - 1;
   }
 
-  /** The pump adds the dose (or what's left of it) and stops at its weight. */
+  /** Switches the pump on for this dose: it empties the container the operator filled with the
+   * computed amount, until Done (finishDose) or Stop. */
   async function loadDose(key: string, pump: PumpName, targetG: number, premixMl: number) {
     setActionError(null);
-    const base = loads[key]?.completedG ?? 0;
-    const remainingG = targetG - base;
-    if (remainingG <= 0.5) return;
-    const volumeMl = (premixMl * remainingG) / targetG;
-    if (backend) {
-      try {
-        await startPump({
-          pump,
-          targetG: Number(remainingG.toFixed(1)),
-          volumeMl: Number(Math.max(volumeMl, 0.1).toFixed(1)),
-          batchId,
-          stage: key,
-        });
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
-    }
-    setLocalPump({ key, pump, base, targetG: remainingG, deliveredG: 0, phase: "pumping", faultReason: null });
-  }
-
-  function skipPump() {
-    if (backend) {
-      pumpAction("skip").catch((error) => setActionError(errorText(t, error)));
-      return;
-    }
-    if (localPump?.phase === "pumping") {
-      setReactorG((grams) => grams + localPump.targetG - localPump.deliveredG);
-      setLocalPump({ ...localPump, deliveredG: localPump.targetG, phase: "done" });
-      setLoads((current) => ({ ...current, [localPump.key]: { completedG: localPump.base + localPump.targetG } }));
+    if (doseLoaded(key, targetG) || targetG <= 0.5) return;
+    try {
+      await startPump({
+        pump,
+        targetG: Number(targetG.toFixed(1)),
+        volumeMl: Number(Math.max(premixMl, 0.1).toFixed(1)),
+        batchId,
+        stage: key,
+      });
+    } catch (error) {
+      setActionError(errorText(t, error));
     }
   }
 
-  /** Demo: acetone poured through the inlet lands on the reactor load cell. */
-  async function pourDemoAcetone(grams: number) {
+  /** "Done": the container is empty, the whole measured amount is in the reactor. */
+  function finishDose() {
     setActionError(null);
-    if (grams < 0.5) return;
-    if (backend) {
-      try {
-        const sensors = await demoAdd(Number(grams.toFixed(1)));
-        if (sensors.oilMassG !== null) setReactorG(sensors.oilMassG);
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
-    }
-    setReactorG((current) => current + grams);
+    finishPump().catch((error) => setActionError(errorText(t, error)));
   }
 
-  // Remember the reactor weight when a dose's step opens: acetone poured since = the rise.
-  useEffect(() => {
-    if (!doseKey || acetoneBase[doseKey] !== undefined) return;
-    setAcetoneBase((current) => ({ ...current, [doseKey]: reactorG }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doseKey]);
-
-  /** Grams the pump has put in for this dose, including a run that just ended and isn't added up yet. */
-  function pumpedG(key: string) {
-    const completed = loads[key]?.completedG ?? 0;
-    if (backend) {
-      const p = live?.pump;
-      const running = p && p.startedAt && p.stage === key && p.batchId === batchId && !accountedRuns.current.has(p.startedAt);
-      return running ? completed + p.deliveredG : completed;
-    }
-    if (localPump && localPump.key === key) return Math.max(completed, localPump.base + localPump.deliveredG);
-    return completed;
+  /** "Stop pump": stops it now; start it again for the rest. */
+  function stopPump() {
+    setActionError(null);
+    stopPumpRequest().catch((error) => setActionError(errorText(t, error)));
   }
 
-  function acetonePouredG(key: string) {
-    return Math.max(reactorG - (acetoneBase[key] ?? reactorG) - pumpedG(key), 0);
-  }
-
-  // Without a reactor load cell reading the acetone can't be seen: then the stage doesn't wait for it.
-  const loadCellReading = backend ? (live?.sensors.oilMassG ?? null) !== null : true;
-  const acetoneNeeded = reactionDose !== null && reactionDose.acetoneG > 0 && !(currentStage === "Esterification" && esterStage > 1);
-  const acetoneOk = !doseKey || !acetoneNeeded || !loadCellReading || acetoneSkipped[doseKey] === true || acetonePouredG(doseKey) >= (reactionDose?.acetoneG ?? 0) * 0.95;
-  function continueWithoutAcetone(key: string) {
-    setAcetoneSkipped((current) => ({ ...current, [key]: true }));
+  // The optional acetone: the operator pours it through the inlet and confirms, or leaves it out.
+  const acetoneNeeded = reactionDose !== null && reactionDose.acetoneMl > 0 && !(currentStage === "Esterification" && esterStage > 1);
+  const acetoneOk = !doseKey || !acetoneNeeded || acetone[doseKey] !== undefined;
+  function chooseAcetone(key: string, choice: "added" | "skipped") {
+    setAcetone((current) => ({ ...current, [key]: choice }));
   }
   const doseIn = doseKey !== null && reactionDose !== null && doseLoaded(doseKey, reactionDose.targetG);
+  // The reactor pump is emptying the reactor (separation): nothing is pumped into it then.
+  const reactorPumpOn = Boolean(live?.sensors.reactorValveOpen);
 
-  // ----- transfer outlets -----
-  // No drain time: an outlet opens when its process finishes, the next process starts right away,
-  // and the outlets stay open until the batch's purification has finished (then every valve closes).
-  function valveView(valve: DrainValve): ValveView {
-    if (backend) {
-      const d = live?.drain;
-      if (d && d.valve === valve && d.phase === "waiting" && d.batchId === batchId) return "waiting";
-      return live?.sensors.valves?.[valve] ? "open" : "closed";
-    }
-    return localValves[valve] ? "open" : "closed";
-  }
-
-  const reactorOutletOpen = valveView("reactor_outlet") === "open";
-  const centrifugeOutletView = valveView("centrifuge_outlet");
-
-  // The dose loads by itself when its stage opens (once per dose; Retry after a pump problem).
+  // The oil pump switches on by itself when the Oil Loading step opens (once per batch).
   useEffect(() => {
-    if (!doseKey || !reactionDose || reactionDose.state !== "ready") return;
-    if (autoPumped.current.has(doseKey) || doseLoaded(doseKey, reactionDose.targetG) || pumpRunning || reactorOutletOpen) return;
+    if (currentStage !== "Oil Loading" || !oilPumpFitted || targetError || !backend) return;
+    if (autoPumped.current.has(OIL_KEY) || doseLoaded(OIL_KEY, plannedOilG) || pumpRunning || reactorPumpOn) return;
+    autoPumped.current.add(OIL_KEY);
+    loadDose(OIL_KEY, "oil", plannedOilG, Number(targetVolume));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStage, oilPumpFitted, backend, pumpRunning, reactorPumpOn]);
+
+  // The dispenser switches on by itself when its stage opens (once per dose; Start again after a stop).
+  useEffect(() => {
+    if (!doseKey || !reactionDose || reactionDose.state !== "ready" || !backend) return;
+    if (autoPumped.current.has(doseKey) || doseLoaded(doseKey, reactionDose.targetG) || pumpRunning || reactorPumpOn) return;
     autoPumped.current.add(doseKey);
     loadDose(doseKey, reactionDose.pump, reactionDose.targetG, reactionDose.premixMl);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doseKey, reactionDose?.state, pumpRunning, reactorOutletOpen]);
+  }, [doseKey, reactionDose?.state, backend, pumpRunning, reactorPumpOn]);
 
-  // ... and the stage starts by itself once the dose is loaded and acetone was poured or skipped.
+  // ... and the stage starts by itself once Done was pressed and the acetone was added or skipped.
   useEffect(() => {
     if (!doseKey || !reactionDose || reactionDose.state !== "ready" || !doseIn || !acetoneOk || pumpRunning) return;
     if (autoStageStarted.current.has(doseKey)) return;
@@ -1747,13 +1575,11 @@ export default function NewBatch() {
     if (!recheckNext) return;
     setActionError(null);
     recordEsterStage(recheckNext.ffa);
-    if (backend) {
-      try {
-        await stageAction("reset");
-      } catch (error) {
-        setActionError(errorText(t, error));
-        return;
-      }
+    try {
+      await stageAction("reset");
+    } catch (error) {
+      setActionError(errorText(t, error));
+      return;
     }
     setNextDoseFfa(recheckNext.ester.doseFfa);
     setEsterStage((current) => current + 1);
@@ -1769,26 +1595,18 @@ export default function NewBatch() {
     next();
   }
 
-  /** Stage buttons: the backend runs the stage when it's connected; otherwise the local demo. */
+  /** Stage buttons: the Raspberry Pi runs the stage. */
   async function controlStage(kind: StageName, nextState: StageState, current: StageState, setLocal: (state: StageState) => void) {
     setActionError(null);
-    if (!backend) {
-      setLocal(nextState);
-      // the outlet opens by itself after these stages and stays open (the Pi does this itself)
-      if (nextState === "complete" && kind === "Transesterification") {
-        setLocalValves((valves) => ({ ...valves, reactor_outlet: true }));
-        setReactorG(0); // the mixture flows into the centrifuge
-      }
-      if (nextState === "complete" && kind === "Separation") setLocalValves((valves) => ({ ...valves, centrifuge_outlet: true }));
-      if (nextState === "fault") setLocalValves(ALL_CLOSED); // emergency stop closes every valve
-      return;
-    }
     try {
       let result: StageStatus;
       if (nextState === "running" && current === "ready") {
+        // the batch's separation time and speed go with each start: the Pi starts the separation
+        // by itself after transesterification (and a Separation start uses them directly)
+        const separation = { separationTime: Number(sepTime), separationSpeed: Number(sepSpeed) };
         result = await startStage(
           kind === "Separation"
-            ? { stage: kind, batchId, oilMassG, adsorbent }
+            ? { stage: kind, batchId, oilMassG, adsorbent, ...separation }
             : {
                 stage: kind,
                 batchId,
@@ -1798,6 +1616,7 @@ export default function NewBatch() {
                 stirring: Number(kind === "Esterification" ? esterStirring : transStirring),
                 current: Number(kind === "Esterification" ? esterCurrent : transCurrent),
                 oilMassG,
+                ...separation,
               },
         );
       } else if (nextState === "running") {
@@ -1819,10 +1638,6 @@ export default function NewBatch() {
 
   async function resetStage(setLocal: (state: StageState) => void) {
     setActionError(null);
-    if (!backend) {
-      setLocal("ready");
-      return;
-    }
     try {
       setLocal((await stageAction("reset")).state);
     } catch (error) {
@@ -1831,118 +1646,50 @@ export default function NewBatch() {
   }
 
   // ----- purification -----
-  /** Starts purification now. The backend starts it automatically after transfer; the local demo
-   * starts it automatically when the Purification screen is reached. */
+  /** Starts purification by hand. The Pi normally starts it by itself when separation has finished
+   * (everything is in the purifier); this is for starting again after a stop. */
   async function startPurificationNow() {
     setActionError(null);
-    if (backend) {
-      try {
-        await startPurification({ heaterSubmerged: heaterConfirmed, batchId, oilVolumeMl: oilVolumeMl ?? undefined, adsorbent });
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
+    try {
+      await startPurification({ heaterSubmerged: heaterConfirmed, batchId, oilVolumeMl: oilVolumeMl ?? undefined, adsorbent });
+    } catch (error) {
+      setActionError(errorText(t, error));
     }
-    const temperature = purification.temperature ?? 27;
-    const sim: LocalPurification = {
-      phase: "heating",
-      temperature,
-      highest: temperature,
-      heaterOn: true,
-      stirrerOn: true,
-      heatingSeconds: 0,
-      methanolRemaining: Math.round(purificationSettings.methanolRemovalMinutes * 60),
-      magnesolAdded: false,
-      contactRemaining: Math.round(purificationSettings.contactMinutes * 60),
-      drainElapsed: 0,
-      stableSeconds: 0,
-      anchorG: null,
-      outputG: 0,
-      tankG: oilMassG * 0.85,
-      oilG: oilMassG,
-      warning: null,
-      stopReason: null,
-    };
-    localPurification.current = sim;
-    showLocalPurification({ ...sim });
   }
 
   async function confirmMagnesol() {
     setActionError(null);
-    if (backend) {
-      try {
-        await purificationAction("magnesol-added");
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
+    try {
+      await purificationAction("magnesol-added");
+    } catch (error) {
+      setActionError(errorText(t, error));
     }
-    const sim = localPurification.current;
-    if (sim && sim.phase === "magnesol") {
-      sim.magnesolAdded = true;
-      sim.phase = "contact";
-      showLocalPurification({ ...sim });
-    }
-  }
-
-  /** "Skip timer (demo)": finishes the current step now (not the Magnesol: that's the operator's). */
-  function skipPurificationPhase() {
-    if (backend) {
-      purificationAction("skip").catch((error) => setActionError(errorText(t, error)));
-      return;
-    }
-    const sim = localPurification.current;
-    if (!sim) return;
-    if (sim.phase === "heating") sim.temperature = PROCESS_CONFIG.purification.holdTemperature;
-    else if (sim.phase === "methanol") sim.methanolRemaining = 1;
-    else if (sim.phase === "contact") sim.contactRemaining = 1;
-    else if (sim.phase === "drain") {
-      sim.outputG = Number((sim.outputG + sim.tankG).toFixed(1));
-      sim.tankG = 0;
-      sim.anchorG = sim.outputG;
-      sim.stableSeconds = PROCESS_CONFIG.purification.drainStableSeconds;
-    }
-    showLocalPurification({ ...sim });
   }
 
   async function stopPurification() {
     setActionError(null);
-    if (backend) {
-      try {
-        await purificationAction("abort");
-      } catch (error) {
-        setActionError(errorText(t, error));
-      }
-      return;
-    }
-    const sim = localPurification.current;
-    if (sim) {
-      sim.phase = "fault";
-      sim.heaterOn = false;
-      sim.stirrerOn = false;
-      sim.stopReason = "stopped by operator";
-      showLocalPurification({ ...sim });
+    try {
+      await purificationAction("abort");
+    } catch (error) {
+      setActionError(errorText(t, error));
     }
   }
 
   async function acknowledgeSafetyStop() {
     setActionError(null);
-    if (backend) {
-      try {
-        await purificationAction("acknowledge");
-      } catch (error) {
-        setActionError(errorText(t, error));
-        return;
-      }
+    try {
+      await purificationAction("acknowledge");
+    } catch (error) {
+      setActionError(errorText(t, error));
+      return;
     }
-    localPurification.current = null;
     setPurification((current) => ({ ...READY_PURIFICATION, temperature: current.temperature, stopOccurred: true }));
     setHeaterConfirmed(false);
   }
 
   // ----- going straight on to the next process -----
-  // Transesterification done: the reactor outlet opens and separation starts at once (no drain
-  // time). The backend starts the machine stage itself; the page follows.
+  // Transesterification done: the Pi lets the mixture settle in the reactor for 1 minute, then
+  // starts the separation by itself (reactor pump + centrifuge + pumpin). The page follows.
   const goToSeparation = currentStage === "Transesterification" && transState === "complete";
   useEffect(() => {
     if (!goToSeparation) return;
@@ -1951,33 +1698,21 @@ export default function NewBatch() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [goToSeparation]);
 
-  // The separation starts by itself as soon as the reactor outlet opens. With the backend the
-  // Raspberry Pi starts it (so it goes on even if this page is closed); the local demonstration
-  // starts it here.
-  const autoSeparation = useRef(false);
-  const startSeparationHere = !backend && currentStage === "Separation" && separationState === "ready";
-  useEffect(() => {
-    if (!startSeparationHere || autoSeparation.current) return;
-    const timer = window.setTimeout(() => {
-      autoSeparation.current = true;
-      controlStage("Separation", "running", "ready", setSeparationState);
-    }, 1000);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startSeparationHere]);
-  // If the Pi hasn't started it a few seconds later (for example, a fault), expose the Start
-  // control instead of leaving the page stuck.
+  // If the Pi hasn't started the separation a few seconds after this step opened (for example, a
+  // fault), show the Start control instead of leaving the page stuck.
   const [separationWaitOver, setSeparationWaitOver] = useState(false);
-  const waitingForPi = backend && currentStage === "Separation" && separationState === "ready";
+  const waitingForPi = currentStage === "Separation" && separationState === "ready";
   useEffect(() => {
     if (!waitingForPi) return;
     const timer = window.setTimeout(() => setSeparationWaitOver(true), 8000);
     return () => window.clearTimeout(timer);
   }, [waitingForPi]);
-  const separationStartsByItself =
-    separationState === "ready" && (backend ? !separationWaitOver : !autoSeparation.current);
+  const separationStartsByItself = separationState === "ready" && !separationWaitOver;
+  const separationPhase = liveSeparation?.phase ?? null;
+  const settleTotal = liveSeparation?.settleTotalSeconds ?? separationConfig.settleSeconds;
+  const settleRemaining = liveSeparation?.settleRemainingSeconds ?? settleTotal;
 
-  // Purification done (drained until the output was stable; every valve is now closed): the batch is
+  // Purification done (drained until the output was stable; everything is switched off): the batch is
   // saved and the process finishes by itself (Process Complete shows the result and any low-output warning).
   const autoFinished = useRef(false);
   const finishNow = currentStage === "Purification" && purification.phase === "complete" && !saved;
@@ -1999,36 +1734,26 @@ export default function NewBatch() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStage, separationState]);
 
-  // Local demonstration: purification starts by itself on the Purification screen (once per batch),
-  // as soon as the centrifuge outlet is open. With the backend, the Raspberry Pi starts it itself.
-  useEffect(() => {
-    if (backend || currentStage !== "Purification" || autoStarted.current || purification.phase !== "ready") return;
-    autoStarted.current = true;
-    startPurificationNow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backend, currentStage, purification.phase]);
-
-  const levelSwitch = backend && live ? live.sensors.heaterSubmerged : null;
-  const autoStartPending = backend && live !== null && live.purificationAutoStart === batchId;
-  const centrifugeOutletWaiting = centrifugeOutletView === "waiting";
-  const showManualStart =
-    purification.phase === "ready" && !purification.stopReason && !centrifugeOutletWaiting && (!backend || !autoStartPending);
+  const levelSwitch = live ? live.sensors.heaterSubmerged : null;
+  const autoStartPending = live !== null && live.purificationAutoStart === batchId;
+  // The Pi starts purification by itself when separation ends; the Start button is for afterwards
+  // (a stop), or when it couldn't start by itself.
+  const showManualStart = purification.phase === "ready" && !purification.stopReason && !autoStartPending
+    && separationState !== "running" && separationState !== "paused";
 
   /** The batch record the website saves. The Pi adds what it measured itself (temperatures, energy,
    * purification, output weight and yield). Every number goes through num(), so no field is ever
    * missing or NaN (a missing value used to stop the save with "Field required"). */
-  function batchRecord(): Partial<DemoBatch> & { id: string } {
+  function batchRecord(): Partial<BatchData> & { id: string } {
     const totalReactionTime = num(Number(transTime)) + (requiresEsterification ? num(Number(esterTime)) * esterStagesRun : 0);
     const oilVolume = Number(num(oilVolumeMl).toFixed(1));
-    // Offline the website works out the yield itself from the output load cell; the Pi does it on its own.
-    const localOutputMl = !backend && purification.outputG > 0 ? Number((purification.outputG / 0.88).toFixed(1)) : undefined;
+    // The yield comes from the Pi (output load cell): it fills it in when the batch is saved.
     return {
       id: batchId,
       date: new Date().toISOString().slice(0, 10),
       oilVolume,
-      yield: localOutputMl && oilVolume ? Number(((localOutputMl / oilVolume) * 100).toFixed(1)) : 0,
-      biodieselOutputMl: localOutputMl,
-      duration: totalReactionTime + PROCESS_CONFIG.separation.timeMinutes,
+      yield: 0,
+      duration: totalReactionTime + num(Number(sepTime)),
       energy: 0,
       status: "Completed",
       labResult: "Pending",
@@ -2057,9 +1782,8 @@ export default function NewBatch() {
         holdTimeSeconds: num(purification.methanolSeconds),
         drainTimeSeconds: num(purification.drainSeconds),
         contactTimeSeconds: num(purification.contactSeconds),
-        // no settling or cooling step
-        settlingTimeSeconds: 0,
-        coolingTimeSeconds: 0,
+        settlingTimeSeconds: num(purification.settleSeconds),
+        coolingTimeSeconds: 0,   // no cooling step
         magnesolG: num(magnesolG),
         adsorbent: purification.adsorbent,
         adsorbentG: num(magnesolG),
@@ -2095,20 +1819,6 @@ export default function NewBatch() {
     next();
   }
 
-  /** The Pi refused the record: keep it in this browser, so the operator is never stuck at the end. */
-  function finishInThisBrowser() {
-    const record = batchRecord();
-    saveBatchInThisBrowser(record as DemoBatch);
-    // the Pi's row must not stay "In Progress" (it would block the next batch)
-    if (backend) markBatchCompleted(batchId).catch(() => undefined);
-    setSavedBatch(record as BatchRecord);
-    setCompletedAt((current) => current ?? new Date());
-    setSaved(true);
-    setSaveFailed(false);
-    setActionError(null);
-    next();
-  }
-
   // ----- one batch at a time: continue the batch in progress, save where it is -----
   /** Puts the page back where the batch in progress was (its saved snapshot). */
   function applySnapshot(active: ActiveBatch) {
@@ -2134,8 +1844,12 @@ export default function NewBatch() {
     setRecheckAbove(s.recheckAbove ?? false);
     setFinalFfa(s.finalFfa ?? null);
     setLoads(s.loads ?? {});
-    setAcetoneBase(s.acetoneBase ?? {});
-    setAcetoneSkipped(s.acetoneSkipped ?? {});
+    // (an older snapshot had acetoneSkipped: a skipped acetone stays skipped)
+    const olderSkipped = (s as { acetoneSkipped?: Record<string, boolean> }).acetoneSkipped ?? {};
+    setAcetone({
+      ...Object.fromEntries(Object.entries(olderSkipped).filter(([, skipped]) => skipped).map(([key]) => [key, "skipped" as const])),
+      ...(s.acetone ?? {}),
+    });
     if (s.adsorbent) setAdsorbent(s.adsorbent);
     if (s.ratio) setRatio(s.ratio);
     if (s.catalyst) setCatalyst(s.catalyst);
@@ -2147,21 +1861,19 @@ export default function NewBatch() {
     if (s.transTime) setTransTime(s.transTime);
     if (s.transStirring) setTransStirring(s.transStirring);
     if (s.transCurrent) setTransCurrent(s.transCurrent);
+    if (s.sepTime) setSepTime(s.sepTime);
+    if (s.sepSpeed) setSepSpeed(s.sepSpeed);
+    if (s.sepTime || s.sepSpeed) sepDefaultsApplied.current = true;   // the batch keeps its own values
     setEsterState(s.esterState ?? "ready");
     setTransState(s.transState ?? "ready");
     setSeparationState(s.separationState ?? "ready");
     setSeparationWaitOver(s.separationWaitOver ?? false);
-    // (a snapshot saved by an older version may still have settling/cooling fields: they are ignored)
     setPurification({ ...READY_PURIFICATION, ...(s.purification ?? {}) });
     setHeaterConfirmed(s.heaterConfirmed ?? false);
     accountedRuns.current = new Set(s.accountedRuns ?? []);
     autoPumped.current = new Set(s.autoPumped ?? []);
     autoStageStarted.current = new Set(s.autoStageStarted ?? []);
     autoStarted.current = s.autoStarted ?? false;
-    autoSeparation.current = s.autoSeparation ?? false;
-    setLocalPump(s.localPump ?? null);
-    setLocalValves({ ...ALL_CLOSED, ...(s.localValves ?? {}) });
-    localPurification.current = s.localPurification ?? null;
     setStep(Math.max(s.step ?? 1, 1));
   }
 
@@ -2180,10 +1892,10 @@ export default function NewBatch() {
     if (step > steps.length - 1) setStep(steps.length - 1);
   }, [step, steps.length]);
 
-  // The Raspberry Pi goes on by itself, also while this page is closed (separation as soon as the
-  // reactor outlet opens, purification after separation): catch up with it.
+  // The Raspberry Pi goes on by itself, also while this page is closed (separation after
+  // transesterification, purification after separation): catch up with it.
   useEffect(() => {
-    if (!backend || !live || !restored || !batchStarted || saved) return;
+    if (!live || !restored || !batchStarted || saved) return;
     const separationStep = steps.indexOf("Separation");
     const purificationStep = steps.indexOf("Purification");
     const purificationHere =
@@ -2196,7 +1908,7 @@ export default function NewBatch() {
       setTransState("complete");
       setStep(separationStep);
     }
-  }, [backend, live, restored, batchStarted, saved, batchId, step, steps]);
+  }, [live, restored, batchStarted, saved, batchId, step, steps]);
 
   /** "Start Batch": records the batch as In Progress. Refused while another batch is in progress
    * (only one at a time): then that batch is continued here instead. */
@@ -2204,18 +1916,16 @@ export default function NewBatch() {
     setActionError(null);
     setStarting(true);
     try {
-      const started = await startBatch(batchId);
+      const started = await startBatch(batchId || undefined);   // no ID yet: the Pi gives the next one
       setBatchId(started.id);
       // Fresh batch: no dosing/acetone choice or automatic-stage marker may leak from the last run.
       setLoads({});
-      setAcetoneBase({});
-      setAcetoneSkipped({});
+      setAcetone({});
+      setOilPouredByVolume(false);
       accountedRuns.current.clear();
       autoPumped.current.clear();
       autoStageStarted.current.clear();
       autoStarted.current = false;
-      autoSeparation.current = false;
-      setLocalValves(ALL_CLOSED);
       setBatchStarted(true);
       next();
     } catch (error) {
@@ -2228,13 +1938,9 @@ export default function NewBatch() {
   }
 
   // The machine is working for this batch: it can't be cancelled until that step is stopped.
-  // (Open outlets alone don't count: cancelling the batch closes them.)
-  const machineBusy = backend
-    ? live !== null && (
-      live.stage.state === "running" || live.stage.state === "paused" || live.pump.phase === "pumping" ||
-      live.drain.phase === "waiting" || PURIFYING.includes(live.purification.phase))
-    : localPump?.phase === "pumping" || PURIFYING.includes(purification.phase) ||
-      [esterState, transState, separationState].some((state) => state === "running" || state === "paused");
+  const machineBusy = live !== null && (
+    live.stage.state === "running" || live.stage.state === "paused" || live.pump.phase === "pumping" ||
+    PURIFYING.includes(live.purification.phase));
   const canCancel = batchStarted && !saved && !batchClosed && currentStage !== "Process Complete";
 
   /** Cancels the batch in progress (it stays in Batch History as Cancelled); a new one can start. */
@@ -2258,15 +1964,15 @@ export default function NewBatch() {
   const persisting = batchStarted && restored && !saved && !batchClosed;
   const snapshot: ProcessSnapshot = {
     version: 1, step, stage: currentStage, reactorG, confirmedOilG, targetVolume, ffa, ffaAboveStrip, esterStage,
-    esterRecords, nextDoseFfa, recheckValue, recheckAbove, finalFfa, loads, acetoneBase, acetoneSkipped, adsorbent, ratio, catalyst,
+    esterRecords, nextDoseFfa, recheckValue, recheckAbove, finalFfa, loads, acetone, adsorbent, ratio, catalyst,
     esterVoltage, esterTime, esterStirring, esterCurrent, transVoltage, transTime, transStirring, transCurrent,
-    esterState, transState, separationState, separationWaitOver, purification, heaterConfirmed,
+    sepTime, sepSpeed, esterState, transState, separationState, separationWaitOver, purification, heaterConfirmed,
     accountedRuns: [...accountedRuns.current], autoPumped: [...autoPumped.current],
     autoStageStarted: [...autoStageStarted.current], autoStarted: autoStarted.current,
-    autoSeparation: autoSeparation.current, localPump, localValves, localPurification: localPurification.current,
   };
-  const changeKey = JSON.stringify(backend ? { ...snapshot, reactorG: 0, purification: purification.phase } : snapshot);
-  const latest = useRef({ batchId, stage: currentStage, snapshot, changeKey, record: {} as Partial<DemoBatch> });
+  // Live readings that change every second aren't a reason to save (the Pi has them itself).
+  const changeKey = JSON.stringify({ ...snapshot, reactorG: 0, purification: purification.phase });
+  const latest = useRef({ batchId, stage: currentStage, snapshot, changeKey, record: {} as Partial<BatchData> });
   latest.current = { batchId, stage: currentStage, snapshot, changeKey, record: batchRecord() };
   const persistingRef = useRef(false);
   persistingRef.current = persisting;
@@ -2282,7 +1988,7 @@ export default function NewBatch() {
     saving.current = saving.current.then(() =>
       saveBatchProgress(current.batchId, current.stage, current.snapshot, current.record).catch((error) => {
         lastSaved.current = "";   // try again at the next save
-        if (isOffline(error) || closedRef.current) return;   // completed or cancelled here meanwhile
+        if (isOffline(error) || closedRef.current) return;   // offline: saved again when the Pi is back
         if (error instanceof ApiError && (error.status === 404 || error.status === 409)) setBatchClosed(true);
         setActionError(errorText(t, error));
       }),
@@ -2308,6 +2014,27 @@ export default function NewBatch() {
   const stepLabel = purificationStepIndex >= 0 ? PURIFICATION_STEPS[purificationStepIndex][1] : null;
   const stepText = purification.phase === "magnesol" ? t("Add {adsorbent}", { adsorbent: t(adsorbentName) }) : stepLabel ? t(stepLabel) : "";
 
+  // The machine is run by the Raspberry Pi: without it nothing can be done here. (A running batch
+  // goes on on the Pi; this page catches up as soon as the connection is back.)
+  if (!backend) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <div className="section-kicker">{batchStarted ? t("Batch {id}", { id: batchId }) : t("Production workflow")}</div>
+          <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Process")}</Heading>
+        </div>
+        <Card className="p-8 text-center" data-testid="pi-offline">
+          <div className="font-display text-lg font-semibold text-white">{connecting ? t("Connecting to the Raspberry Pi…") : t("The Raspberry Pi can't be reached")}</div>
+          {!connecting && (
+            <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-gray-500">
+              {t("The machine is controlled by the Raspberry Pi (with the ESP32 on its USB port). Check that the Pi is on and on the same network, and that the Greenova service is running. This page reconnects by itself; a batch that is running carries on, on the Pi.")}
+            </p>
+          )}
+        </Card>
+      </div>
+    );
+  }
+
   // Nothing can be done before it is known whether a batch is already in progress.
   if (!restored) {
     return (
@@ -2325,7 +2052,7 @@ export default function NewBatch() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <div className="section-kicker">{t("Batch {id}", { id: batchId })}</div>
+          <div className="section-kicker">{batchId ? t("Batch {id}", { id: batchId }) : t("New batch")}</div>
           <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Process")}</Heading>
           <p className="mt-2 text-sm text-gray-500">{t("Guided electrochemical biodiesel production workflow.")}</p>
         </div>
@@ -2387,10 +2114,11 @@ export default function NewBatch() {
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <Heading as="h2" className="text-lg font-semibold">{t("System Status")}</Heading>
-                <p className="mt-1 text-sm text-gray-500">{t("Read-only prototype channels update automatically.")}</p>
+                <p className="mt-1 text-sm text-gray-500">{t("Live from the Raspberry Pi and the ESP32 controller. It updates automatically.")}</p>
               </div>
-              <Status tone={realHardware ? "green" : "yellow"}>{backend ? (mock ? t("Demonstration backend") : t("Live hardware")) : t("Demonstration mode")}</Status>
+              <Status tone="green">{t("Live hardware")}</Status>
             </div>
+            {!systemStatus && <p className="mt-6 text-sm text-gray-500">{t("Reading the devices…")}</p>}
             <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {tiles.map((tile) => <ReadOnlyTile key={tile.label} {...tile} />)}
             </div>
@@ -2454,18 +2182,17 @@ export default function NewBatch() {
           <div className="grid gap-6 xl:grid-cols-2">
             <Card className="p-6 sm:p-8">
               <Heading as="h2" className="text-lg font-semibold">{t("1. Oil Input")}</Heading>
-              <p className="mt-1 text-sm text-gray-500">{t("Pour the oil through the first 5 µm filter. The reactor load cell is authoritative for the actual oil mass.")}</p>
+              <p className="mt-1 text-sm text-gray-500">{oilPumpFitted ? t("Measure the target volume of oil into the oil container. On the Oil Loading step the oil pump empties it into the reactor; press Done when the container is empty.") : byVolume ? t("Pour the target volume of oil through the first 5 µm filter, measured by volume.") : t("Pour the oil through the first 5 µm filter. The reactor load cell is authoritative for the actual oil mass.")}</p>
               <div className="mt-6 grid gap-4 sm:grid-cols-2">
-                <ReadOnlyTile label="Live oil mass" value={`${oilMassG.toFixed(1)} g`} secondary={realHardware ? "Reactor load cell · live" : "Reactor load cell · demonstration channel"} state={oilMassG > 0 ? "ready" : "checking"} />
+                <ReadOnlyTile label={oilPumpFitted ? "Oil to load" : byVolume ? "Oil mass (by volume)" : "Live oil mass"} value={`${oilMassG.toFixed(1)} g`} secondary={oilPumpFitted ? "Measured by the operator · oil pump until Done" : byVolume ? "No reactor load cell · target volume × density" : "Reactor load cell · live"} state={oilMassG > 0 ? "ready" : "checking"} />
                 <ReadOnlyTile label="Converted volume" value={oilVolumeMl === null ? "Unavailable" : `${oilVolumeMl.toFixed(1)} mL`} secondary={t("Configured density: {density} g/mL · assumed", { density: PROCESS_CONFIG.oil.densityGPerMl })} state={oilMassG > 0 ? "ready" : "checking"} />
               </div>
               <div className="mt-5">
-                <Field label={t("Target batch volume")} inputMode="numeric" pattern="[0-9]*" value={targetVolume} onChange={wholeInput((value) => { setTargetVolume(value); setConfirmedOilG(null); })} unit="mL" aria-invalid={Boolean(targetError)} />
+                <Field label={t("Target batch volume")} inputMode="numeric" pattern="[0-9]*" value={targetVolume} onChange={wholeInput((value) => { setTargetVolume(value); setConfirmedOilG(null); setOilPouredByVolume(false); })} unit="mL" aria-invalid={Boolean(targetError)} />
                 <p className={`mt-2 text-xs ${targetError ? "text-red-400" : "text-gray-600"}`}>{targetError || t("Target batch volume: 1,500–5,000 mL.")}</p>
               </div>
               <div className="mt-5 flex flex-wrap items-center gap-3">
-                {!realHardware && <Button variant="secondary" disabled={Boolean(targetError)} onClick={loadDemoReading}>{t("Load demonstration sensor reading")}</Button>}
-                {realHardware ? <Status>{t("Live load cell")}</Status> : <Status tone="yellow">{t("Not live hardware")}</Status>}
+                {oilPumpFitted ? <Status tone="blue">{t("Oil pump · stopped with Done")}</Status> : byVolume ? <Status tone="blue">{t("Oil measured by volume")}</Status> : <Status>{t("Live load cell")}</Status>}
               </div>
               {measuredOilError && <p className="mt-3 text-xs text-red-400">{measuredOilError}</p>}
             </Card>
@@ -2641,34 +2368,81 @@ export default function NewBatch() {
                 : t("Set the power supply's current limit to the current setting before each stage. The electrodes stop if the measured current goes above it.")}
             </p>
           </Card>
+
+          <Card className="p-6 sm:p-8" data-testid="separation-parameters">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <Heading as="h2" className="text-lg font-semibold">{t("5. Separation (centrifuge)")}</Heading>
+                <p className="mt-1 text-sm text-gray-500">{t("Set the centrifuge time and speed for this batch. After transesterification the mixture settles in the reactor for {seconds} s, then the reactor pump, the centrifuge and pumpin run together for this time, so the biodiesel goes straight on to the purifier.", { seconds: separationConfig.settleSeconds })}</p>
+              </div>
+              <Status tone="blue">{t("Set by the operator")}</Status>
+            </div>
+            <div className="mt-6 grid gap-5 sm:grid-cols-2">
+              <ParameterField label="Separation time" value={sepTime} setValue={setSepTime} unit="min" limits={sepLimits.time} />
+              <ParameterField label="Centrifuge speed" value={sepSpeed} setValue={setSepSpeed} unit="RPM" limits={sepLimits.speed} />
+            </div>
+            <p className="mt-4 text-xs leading-5 text-gray-500">{t("There is no RPM sensor: the centrifuge is driven at this speed (open loop) and the website shows it as the RPM reading. Purification starts by itself when the separation time is over.")}</p>
+          </Card>
           <div className="flex justify-end"><Button disabled={!parametersValid} onClick={next}>{t("Continue to Oil Loading")} →</Button></div>
         </div>
       )}
 
       {currentStage === "Oil Loading" && (
         <Card className="p-6 sm:p-8">
-          <SectionHeader eyebrow={t("Manual stage")} title={t("Oil Loading")} description={t("Pour the oil through the first 5 µm filter while the reactor load cell weighs it.")} />
+          <SectionHeader
+            eyebrow={oilPumpFitted ? t("Automatic oil input") : t("Manual stage")}
+            title={t("Oil Loading")}
+            description={oilPumpFitted
+              ? t("The oil pump switches on by itself and empties the measured oil into the reactor. Press Done when the oil container is empty.")
+              : t("Pour the oil through the first 5 µm filter.")}
+          />
           <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <Card className="p-5"><Metric label={t("Target oil volume")} value={`${Number(targetVolume).toFixed(1)} mL`} /></Card>
-            <Card className="p-5"><Metric label={t("Live measured mass")} value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? t("Live load-cell data") : t("Demonstration load-cell data")} /></Card>
+            <Card className="p-5">{oilPumpFitted
+              ? <Metric label={t("Oil in the reactor")} value={hasReactorReading || oilLoaded ? `${oilInReactorG.toFixed(1)} g` : "—"} sub={hasReactorReading ? t("Live load-cell data") : oilLoaded ? t("Measured by the operator") : t("Counted when Done is pressed")} />
+              : <Metric label={byVolume ? t("Oil mass (by volume)") : t("Live measured mass")} value={`${oilMassG.toFixed(1)} g`} sub={byVolume ? t("No reactor load cell") : t("Live load-cell data")} />}</Card>
             <Card className="p-5"><Metric label={t("Converted volume")} value={oilVolumeMl === null ? t("Unavailable") : `${oilVolumeMl.toFixed(1)} mL`} sub={t("Using configured assumed density")} /></Card>
             <Card className="p-5"><Metric label={t("Loading status")} value={loadingStatus} accent={targetReached} /></Card>
           </div>
+          {oilPumpFitted ? (
+            <OilPumpPanel
+              targetG={plannedOilG}
+              volumeMl={Number(targetVolume)}
+              run={oilRun}
+              loaded={oilLoaded}
+              onStart={() => loadDose(OIL_KEY, "oil", plannedOilG, Number(targetVolume))}
+              onDone={finishDose}
+              onStop={stopPump}
+            />
+          ) : (
           <div className="mt-6 rounded-xl border border-white/[0.07] bg-gv-inset p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <div className="gv-label">{t("Load-cell status")}</div>
-                <p className="text-sm text-gray-300">{targetReached ? t("Required quantity detected within ±2% tolerance.") : t("Continue loading until the target quantity is detected.")}</p>
+                <div className="gv-label">{byVolume ? t("Oil by volume") : t("Load-cell status")}</div>
+                <p className="text-sm text-gray-300">
+                  {byVolume
+                    ? oilPouredByVolume
+                      ? t("Confirmed: {volume} mL of oil poured.", { volume: Number(targetVolume) })
+                      : t("There is no reactor load cell: pour {volume} mL of oil through the inlet filter, measured by volume, then confirm.", { volume: Number(targetVolume) })
+                    : targetReached ? t("Required quantity detected within ±2% tolerance.") : t("Continue loading until the target quantity is detected.")}
+                </p>
               </div>
-              <Status tone={targetReached ? "green" : measuredOilError ? "red" : "yellow"}>{loadingStatus}</Status>
+              {byVolume ? (
+                <Button variant={oilPouredByVolume ? "secondary" : "primary"} disabled={Boolean(targetError)} onClick={() => setOilPouredByVolume((done) => !done)}>
+                  {oilPouredByVolume ? t("Undo") : t("I poured {volume} mL", { volume: Number(targetVolume) })}
+                </Button>
+              ) : (
+                <Status tone={targetReached ? "green" : measuredOilError ? "red" : "yellow"}>{loadingStatus}</Status>
+              )}
             </div>
           </div>
+          )}
           <div className="mt-7 flex flex-wrap gap-3">
-            {!targetReached && !realHardware && <Button variant="secondary" onClick={loadDemoReading}>{t("Simulate target reading")}</Button>}
             <Button
-              disabled={!targetReached}
+              disabled={!targetReached || oilRun?.phase === "pumping"}
               onClick={() => {
-                setConfirmedOilG(reactorG);
+                // the oil the batch's quantities use: the reactor load cell's reading, or the measured volume
+                setConfirmedOilG(hasReactorReading && !byVolume ? reactorG : plannedOilG);
                 next();
               }}
             >
@@ -2711,21 +2485,19 @@ export default function NewBatch() {
               <LoadingPanel
                 pump="acid"
                 premixParts={[`${esterDoseNow.methanolMl.toFixed(1)} mL ${t("methanol")}`, `${esterDoseNow.sulfuricAcidMl.toFixed(2)} mL H₂SO₄`]}
+                premixMl={esterDoseNow.premixMl}
                 targetG={esterDoseNow.premixG}
                 run={run}
-                deliveredG={pumpedG(key)}
-                onRetry={() => loadDose(key, "acid", esterDoseNow.premixG, esterDoseNow.premixMl)}
-                onSkip={realHardware ? undefined : skipPump}
+                loaded={doseIn}
+                onStart={() => loadDose(key, "acid", esterDoseNow.premixG, esterDoseNow.premixMl)}
+                onDone={finishDose}
+                onStop={stopPump}
                 acetone={acetoneNeeded ? {
                   ml: esterDoseNow.acetoneMl,
-                  g: esterDoseNow.acetoneG,
-                  addedG: acetonePouredG(key),
-                  skipped: acetoneSkipped[key] === true,
-                  onSkip: () => continueWithoutAcetone(key),
-                  onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(esterDoseNow.acetoneG - acetonePouredG(key)),
+                  choice: acetone[key] ?? null,
+                  onAdded: () => chooseAcetone(key, "added"),
+                  onSkip: () => chooseAcetone(key, "skipped"),
                 } : null}
-                current={Number(esterCurrent)}
-                currentByHand={!processConfigCurrentControl}
                 status={autoUsed ? "loaded" : doseIn && acetoneOk ? "starting" : "loading"}
               />
             }
@@ -2779,31 +2551,26 @@ export default function NewBatch() {
               <LoadingPanel
                 pump="catalyst"
                 premixParts={[`${transDoseNow.catalystToWeighG.toFixed(2)} g ${catalyst}`, `${transDoseNow.methanolMl.toFixed(1)} mL ${t("methanol")}`]}
+                premixMl={transDoseNow.premixMl}
                 targetG={transDoseNow.premixG}
                 run={run}
-                deliveredG={pumpedG(key)}
-                onRetry={() => loadDose(key, "catalyst", transDoseNow.premixG, transDoseNow.premixMl)}
-                onSkip={realHardware ? undefined : skipPump}
+                loaded={doseIn}
+                onStart={() => loadDose(key, "catalyst", transDoseNow.premixG, transDoseNow.premixMl)}
+                onDone={finishDose}
+                onStop={stopPump}
                 acetone={acetoneNeeded ? {
                   ml: transDoseNow.acetoneMl ?? 0,
-                  g: transDoseNow.acetoneG,
-                  addedG: acetonePouredG(key),
-                  skipped: acetoneSkipped[key] === true,
-                  onSkip: () => continueWithoutAcetone(key),
-                  onDemoAdd: realHardware ? undefined : () => pourDemoAcetone(transDoseNow.acetoneG - acetonePouredG(key)),
+                  choice: acetone[key] ?? null,
+                  onAdded: () => chooseAcetone(key, "added"),
+                  onSkip: () => chooseAcetone(key, "skipped"),
                 } : null}
-                current={Number(transCurrent)}
-                currentByHand={!processConfigCurrentControl}
                 status={autoUsed ? "loaded" : doseIn && acetoneOk ? "starting" : "loading"}
               />
             }
             footer={transState === "complete" ? (
-              <>
-                <ValveIndicator valve="reactor_outlet" view={valveView("reactor_outlet")} />
-                <p className="mt-4 text-sm text-green-400" data-testid="auto-next">
-                  {t("The reactor outlet is open and the mixture flows into the centrifuge. Going on to separation…")}
-                </p>
-              </>
+              <p className="mt-4 text-sm text-green-400" data-testid="auto-next">
+                {t("Transesterification is complete. The mixture settles in the reactor for {seconds} s, then the reactor pump, the centrifuge and pumpin start by themselves. Going on to separation…", { seconds: separationConfig.settleSeconds })}
+              </p>
             ) : null}
           />
         );
@@ -2812,31 +2579,54 @@ export default function NewBatch() {
       {currentStage === "Separation" && (
         <Card className="p-6 sm:p-8">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <SectionHeader eyebrow={t("Batch {id}", { id: batchId })} title={t("Separation")} description={t("Separating biodiesel and glycerol.")} />
-            <Status tone={separationState === "complete" ? "green" : separationState === "fault" ? "red" : "blue"}>{t({ ready: "READY", running: "RUNNING", paused: "PAUSED", complete: "COMPLETE", fault: "FAULT" }[separationState])}</Status>
+            <SectionHeader
+              eyebrow={t("Batch {id}", { id: batchId })}
+              title={t("Separation")}
+              description={t("The mixture settles in the reactor for {seconds} s. Then the reactor pump, the centrifuge and pumpin run together: the biodiesel goes straight on to the purifier while the centrifuge separates the glycerol.", { seconds: separationConfig.settleSeconds })}
+            />
+            <Status tone={separationState === "complete" ? "green" : separationState === "fault" ? "red" : separationPhase === "settling" ? "yellow" : "blue"}>
+              {separationPhase === "settling" && separationState === "running" ? t("SETTLING") : t({ ready: "READY", running: "RUNNING", paused: "PAUSED", complete: "COMPLETE", fault: "FAULT" }[separationState])}
+            </Status>
           </div>
           {separationState === "ready" && (
-            <div className="mt-8 grid gap-4 sm:grid-cols-2">
-              <Card className="p-5"><Metric label={t("Configured duration")} value={`${PROCESS_CONFIG.separation.timeMinutes} min`} /></Card>
-              <Card className="p-5"><Metric label={t("Configured speed")} value={`${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} /></Card>
+            <div className="mt-8 grid gap-4 sm:grid-cols-3">
+              <Card className="p-5"><Metric label={t("Settling in the reactor")} value={`${separationConfig.settleSeconds} s`} sub={t("everything off")} /></Card>
+              <Card className="p-5"><Metric label={t("Separation time")} value={`${sepTime} min`} sub={t("set in Volume & Parameters")} /></Card>
+              <Card className="p-5"><Metric label={t("Centrifuge speed")} value={`${Number(sepSpeed).toLocaleString()} RPM`} sub={t("set in Volume & Parameters")} /></Card>
             </div>
           )}
-          {separationState !== "ready" && (
-            <LiveReadings
-              source={sourceLabel}
-              progress={liveSeparation && liveSeparation.timeMinutes ? (liveSeparation.elapsedSeconds / (liveSeparation.timeMinutes * 60)) * 100 : separationState === "complete" ? 100 : 60}
-              fault={liveSeparation?.faultReason}
-            >
-              <Metric label={t("Time remaining")} value={liveSeparation ? formatTimer(liveSeparation.remainingSeconds) : separationState === "complete" ? "0 min" : "4 min"} />
-              <Metric label={t("Centrifuge")} value={liveSeparation && liveSeparation.liveRpm != null ? `${liveSeparation.liveRpm.toLocaleString()} / ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM` : `${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
+          {separationState !== "ready" && separationPhase === "settling" && (
+            <LiveReadings source={sourceLabel} progress={settleTotal ? ((settleTotal - settleRemaining) / settleTotal) * 100 : 0} fault={liveSeparation?.faultReason}>
+              <Metric label={t("Settling in the reactor")} value={formatTimer(settleRemaining)} sub={t("then the pumps and the centrifuge start")} />
+              <Metric label={t("Separation time")} value={`${liveSeparation?.timeMinutes ?? sepTime} min`} />
+              <Metric label={t("Centrifuge speed")} value={`${(liveSeparation?.speedRpm ?? Number(sepSpeed)).toLocaleString()} RPM`} />
             </LiveReadings>
           )}
-          <p className="mt-4 text-xs leading-5 text-gray-500">{t("The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When separation finishes and the centrifuge has stopped, its outlet valve opens and the biodiesel flows to the purification tank; purification starts right away. The outlet valves stay open until the batch is complete, then every valve closes.")}</p>
-          {reactorOutletOpen && <ValveIndicator valve="reactor_outlet" view="open" />}
-          {separationStartsByItself && (
-            <p className="mt-6 text-sm text-blue-400" data-testid="separation-auto">{t("Starting the centrifuge…")}</p>
+          {separationState !== "ready" && separationPhase !== "settling" && (
+            <LiveReadings
+              source={sourceLabel}
+              progress={liveSeparation && liveSeparation.timeMinutes ? (liveSeparation.elapsedSeconds / (liveSeparation.timeMinutes * 60)) * 100 : separationState === "complete" ? 100 : 0}
+              fault={liveSeparation?.faultReason}
+            >
+              <Metric label={t("Time remaining")} value={liveSeparation ? formatTimer(liveSeparation.remainingSeconds) : separationState === "complete" ? "00:00" : "—"} />
+              <Metric
+                label={t("Centrifuge")}
+                value={liveSeparation && liveSeparation.liveRpm != null ? `${liveSeparation.liveRpm.toLocaleString()} RPM` : "—"}
+                sub={t("set speed {rpm} RPM · no RPM sensor", { rpm: (liveSeparation?.speedRpm ?? Number(sepSpeed)).toLocaleString() })}
+              />
+            </LiveReadings>
           )}
-          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={backend ? t("Start centrifuge") : t("Record centrifuge start")} onContinue={next} continueLabel={t("Continue to Purification")} onReset={() => resetStage(setSeparationState)} hideStart={separationStartsByItself} />
+          {separationState !== "ready" && separationState !== "complete" && (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <OutputIndicator label="Reactor pump" on={Boolean(live?.sensors.reactorValveOpen)} detail="reactor → centrifuge" />
+              <OutputIndicator label="Pumpin" on={Boolean(live?.sensors.centrifugeValveOpen)} detail="centrifuge → purifier" />
+            </div>
+          )}
+          <p className="mt-4 text-xs leading-5 text-gray-500">{t("The centrifuge controller must verify lid interlock, balance, and required safety conditions before operation. When the separation time is over, the reactor pump, the centrifuge and pumpin stop and purification starts by itself.")}</p>
+          {separationStartsByItself && (
+            <p className="mt-6 text-sm text-blue-400" data-testid="separation-auto">{t("Waiting for the Raspberry Pi to start the separation…")}</p>
+          )}
+          <StageControls state={separationState} setState={(nextState) => controlStage("Separation", nextState, separationState, setSeparationState)} startLabel={t("Start separation now")} onContinue={next} continueLabel={t("Continue to Purification")} onReset={() => resetStage(setSeparationState)} hideStart={separationStartsByItself} />
         </Card>
       )}
 
@@ -2846,7 +2636,7 @@ export default function NewBatch() {
             <SectionHeader
               eyebrow={t("Batch {id}", { id: batchId })}
               title={t("Purification")}
-              description={t("Dry wash with {adsorbent}. It runs by itself: you only add the {adsorbent} when asked. It is done when the output load cell has been stable for 30 s; then every valve closes, the batch is saved and the process finishes by itself.", { adsorbent: t(adsorbentName) })}
+              description={t("Dry wash with {adsorbent}. It runs by itself: you only add the {adsorbent} when asked. After contact it settles for 1 minute, then the valve opens and pumpout sends the biodiesel to the output container. It is done when the output load cell has been stable for 30 s; then everything switches off, the batch is saved and the process finishes by itself.", { adsorbent: t(adsorbentName) })}
             />
             <Status tone={purification.phase === "complete" ? "green" : purification.phase === "fault" ? "red" : purifying ? "yellow" : "neutral"}>
               {purification.phase === "ready" ? t("WAITING") : purification.phase === "fault" ? t("STOPPED") : stepText.toUpperCase()}
@@ -2869,8 +2659,8 @@ export default function NewBatch() {
             </div>
           </div>
 
-          {(purification.phase === "ready" || PURIFYING.includes(purification.phase)) && centrifugeOutletView !== "closed" && (
-            <ValveIndicator valve="centrifuge_outlet" view={centrifugeOutletView} />
+          {purification.phase === "ready" && separationState !== "complete" && (separationState === "running" || separationState === "paused") && (
+            <p className="mt-6 text-sm text-gray-400">{t("The centrifuge is still running and pumpin fills the purifier. Purification starts by itself when the separation time is over.")}</p>
           )}
 
           {(purification.phase === "heating" || purification.phase === "methanol") && (
@@ -2894,10 +2684,12 @@ export default function NewBatch() {
                   purification.phase === "heating"
                     ? t("heater off at {value} °C", { value: p.holdTemperature })
                     : purification.phase === "methanol"
-                      ? t("held at {value} °C", { value: p.holdTemperature })
+                      ? t("kept at {low}–{high} °C", { low: p.holdTemperature - p.holdBand, high: p.holdTemperature })
                       : purification.phase === "contact"
-                        ? t("heater off · cooling down")
-                        : undefined
+                        ? t("heater off")
+                        : purification.phase === "settle"
+                          ? t("stirrer off · settling")
+                          : undefined
                 }
               />
               {/* The stirrer's RPM reading is shown during contact only. */}
@@ -2905,7 +2697,7 @@ export default function NewBatch() {
                 <Metric label={t("Stirrer")} value={purification.stirrerOn ? `${purification.stirrerRpm ?? "—"} / ${p.stirringSpeedRpm} RPM` : t("Off")} />
               )}
               <Metric label={t("Heater")} value={purification.heaterOn ? t("On") : t("Off")} />
-              <Metric label={t("Outlet valve")} value={purification.valveOpen ? t("Open") : t("Closed")} />
+              <Metric label={t("Valve + pumpout")} value={purification.valveOpen ? t("On") : t("Off")} sub={t("to the output container")} />
               {purification.phase === "drain" ? (
                 <>
                   <Metric label={t("Collected")} value={`${purification.outputG.toFixed(1)} g`} sub={t("output load cell")} />
@@ -2937,7 +2729,7 @@ export default function NewBatch() {
           {purification.stopReason && purification.phase === "fault" && (
             <div className="mt-6 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-5">
               <div className="font-display font-semibold text-red-400">{t("Heater stopped:")} {t(purification.stopReason)}</div>
-              <p className="mt-1 text-xs text-gray-500">{t("Heater OFF · stirrer OFF · valves CLOSED")}</p>
+              <p className="mt-1 text-xs text-gray-500">{t("Heater OFF · stirrer OFF · valve and pumpout OFF")}</p>
               <Button className="mt-4" variant="danger" onClick={acknowledgeSafetyStop}>{t("Acknowledge")}</Button>
             </div>
           )}
@@ -2947,8 +2739,8 @@ export default function NewBatch() {
               <div className="font-display font-semibold text-green-400">{t("Purification complete")}</div>
               <p className="mt-1 text-sm text-gray-400">
                 {saveFailed
-                  ? t("The batch couldn't be saved on the Raspberry Pi (see the message above). Try again, or keep the record in this browser and finish.")
-                  : t("The output load cell was stable for 30 s and every valve is closed. Saving the batch and finishing…")}
+                  ? t("The batch couldn't be saved on the Raspberry Pi (see the message above). Try again.")
+                  : t("The output load cell was stable for 30 s and everything is switched off. Saving the batch and finishing…")}
               </p>
             </div>
           )}
@@ -2958,30 +2750,24 @@ export default function NewBatch() {
           <div className="mt-6 flex flex-wrap items-center gap-4">
             {showManualStart && (
               <>
-                {backend && levelSwitch === null && (
+                {levelSwitch === null && (
                   <label className="flex items-center gap-2 text-sm text-gray-300">
                     <input className="gv-checkbox" type="checkbox" checked={heaterConfirmed} onChange={(event) => setHeaterConfirmed(event.target.checked)} />
                     {t("No level switch installed: I checked that the heater is fully submerged")}
                   </label>
                 )}
                 <Button
-                  disabled={(backend && levelSwitch === null && !heaterConfirmed) || (backend && levelSwitch === false)}
+                  disabled={(levelSwitch === null && !heaterConfirmed) || levelSwitch === false}
                   onClick={startPurificationNow}
                 >
                   {purification.stopOccurred ? t("Start purification again") : t("Start purification")}
                 </Button>
-                {backend && levelSwitch === false && <span className="text-xs text-amber-400">{t("The level switch doesn't detect biodiesel at the heater.")}</span>}
+                {levelSwitch === false && <span className="text-xs text-amber-400">{t("The level switch doesn't detect biodiesel at the heater.")}</span>}
               </>
             )}
             {purifying && <Button variant="danger" onClick={stopPurification}>{t("Stop")}</Button>}
-            {purifying && purification.phase !== "magnesol" && !realHardware && (
-              <Button variant="secondary" onClick={skipPurificationPhase}>{t("Skip timer (demo)")}</Button>
-            )}
             {purification.phase === "complete" && saveFailed && (
-              <>
-                <Button onClick={completeBatch}>{t("Try saving again")}</Button>
-                <Button variant="secondary" onClick={finishInThisBrowser}>{t("Finish and keep the record in this browser")} →</Button>
-              </>
+              <Button onClick={completeBatch}>{t("Try saving again")}</Button>
             )}
           </div>
         </Card>
@@ -2992,7 +2778,7 @@ export default function NewBatch() {
           <div className="border-b border-green-500/10 bg-green-500/[0.04] p-8 text-center">
             <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-gv-green text-2xl font-bold text-black">✓</div>
             <Heading as="h1" className="mt-5 text-3xl font-bold">{t("Process Complete")}</Heading>
-            <p className="mt-2 text-sm text-gray-500">{savedBatch?.createdAt ? t("The batch has been saved on the Raspberry Pi, together with the values it measured.") : t("The recorded batch information has been saved to local history.")}</p>
+            <p className="mt-2 text-sm text-gray-500">{t("The batch has been saved on the Raspberry Pi, together with the values it measured.")}</p>
             <p className="mt-3 text-sm text-amber-400">{t("Lab result pending. Record it in Batch History when the lab certificate arrives.")}</p>
             {purification.warning && <p className="mx-auto mt-3 max-w-xl rounded-lg border border-amber-400/25 bg-amber-400/[0.05] px-3 py-2 text-sm text-amber-400">{t(purification.warning)}</p>}
           </div>
@@ -3000,7 +2786,7 @@ export default function NewBatch() {
             <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
               <Metric label={t("Batch ID")} value={batchId} accent />
               <Metric label={t("Oil volume")} value={oilVolumeMl === null ? t("Not available") : `${oilVolumeMl.toFixed(1)} mL`} sub={t("Converted using configured density")} />
-              <Metric label={t("Oil mass")} value={`${oilMassG.toFixed(1)} g`} sub={realHardware ? t("Load-cell record") : t("Demonstration load-cell record")} />
+              <Metric label={t("Oil mass")} value={`${oilMassG.toFixed(1)} g`} sub={oilPumpFitted || byVolume ? t("Measured by the operator") : t("Load-cell record")} />
               <Metric label={t("FFA percentage")} value={formatFfa({ ffa: ffaNumber, ffaAboveStrip })} sub={ffaAboveStrip ? t("Strip's darkest color · operator entered") : t("Test strip · operator entered")} />
               <Metric label={t("Reaction pathway")} value={requiresEsterification ? `${t("Esterification")}${esterStagesRun > 1 ? ` (${t("{count} stages", { count: esterStagesRun })})` : ""} → ${t("Transesterification")}` : t("Transesterification")} />
               {requiresEsterification && (
@@ -3015,17 +2801,17 @@ export default function NewBatch() {
               <Metric label={t("Methanol-to-oil ratio")} value={`${ratio}:1`} sub={t("Molar convention")} />
               <Metric label={t("Methanol")} value={`${(transDoseNow.methanolMl + esterMethanolTotal).toFixed(1)} mL`} sub={requiresEsterification ? t("Esterification + transesterification · loaded by the pumps") : t("Loaded by pump A")} />
               <Metric label={catalyst} value={`${transExact ? "" : t("Up to") + " "}${transDoseNow.catalystToWeighG.toFixed(2)} g`} sub={t("Including neutralization · {purity}% purity", { purity: transDoseNow.purity }) + (transExact ? ` · ${t("exact")}` : "")} />
-              <Metric label={t("Acetone")} value={transDoseNow.acetoneMl === null ? t("Unavailable") : `${acetoneTotalMl.toFixed(1)} mL`} sub={t("Per reaction stage · provisional · poured by hand")} />
+              <Metric label={t("Acetone")} value={Object.values(acetone).includes("added") ? `${acetoneTotalMl.toFixed(1)} mL` : t("Not used")} sub={t("Optional · provisional · poured by hand")} />
               {requiresEsterification && <Metric label={t("Sulfuric acid")} value={`${esterAcidTotal.toFixed(2)} mL`} sub={t("98% · in the pump B premix")} />}
-              <Metric label={t("Separation")} value={`${PROCESS_CONFIG.separation.timeMinutes} min · ${PROCESS_CONFIG.separation.speedRpm.toLocaleString()} RPM`} />
+              <Metric label={t("Separation")} value={`${sepTime} min · ${Number(sepSpeed).toLocaleString()} RPM`} sub={t("after a {seconds} s settle · reactor pump + centrifuge + pumpin", { seconds: separationConfig.settleSeconds })} />
               <Metric
                 label={t("Purification")}
                 value={purification.phase === "complete" || saved ? t("{adsorbent} {grams} g · {temp} °C", { adsorbent: t(adsorbentName), grams: magnesolG.toFixed(1), temp: p.holdTemperature }) : t("Not recorded")}
-                sub={t("{methanol} methanol removal · {contact} contact · {drain} drain", { methanol: formatMinutes(purification.methanolSeconds), contact: formatMinutes(purification.contactSeconds), drain: formatTimer(purification.drainSeconds) })}
+                sub={t("{methanol} methanol removal · {contact} contact · {settle} settle · {drain} drain", { methanol: formatMinutes(purification.methanolSeconds), contact: formatMinutes(purification.contactSeconds), settle: formatMinutes(purification.settleSeconds), drain: formatTimer(purification.drainSeconds) })}
               />
               <Metric label={t("Biodiesel output")} value={savedBatch?.biodieselOutputMl ? t("{ml} mL · {pct}% yield", { ml: savedBatch.biodieselOutputMl.toFixed(1), pct: savedBatch.yield }) : t("Not measured")} sub={savedBatch?.biodieselOutputMl ? `${t("Output load cell")}${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
-              {savedBatch?.createdAt && <Metric label={t("Average reaction temperature")} value={`${savedBatch.temperature} °C`} sub={t("Measured during transesterification")} />}
-              {savedBatch?.createdAt && <Metric label={t("Energy used")} value={`${savedBatch.energy} kWh`} sub={t("Electrodes (plus heater, if configured)")} />}
+              {savedBatch && <Metric label={t("Average reaction temperature")} value={`${savedBatch.temperature} °C`} sub={t("Measured during transesterification")} />}
+              {savedBatch && <Metric label={t("Energy used")} value={`${savedBatch.energy} kWh`} sub={t("Electrodes (plus heater, if configured)")} />}
               <Metric label={t("Completion date")} value={completedAt ? completedAt.toLocaleString() : "—"} />
             </div>
             <div className="mt-7 flex flex-wrap gap-3">

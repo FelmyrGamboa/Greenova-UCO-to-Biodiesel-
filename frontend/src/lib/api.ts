@@ -1,17 +1,16 @@
 /**
- * Greenova backend client (FastAPI on the Raspberry Pi).
+ * Greenova backend client (FastAPI on the Raspberry Pi that drives the machine).
  *
- * The batch functions have the same names as src/lib/greenovaData.ts, but return Promises.
- * When the backend can't be reached, they fall back to the browser's local demo data, so the
- * website still works without the Pi.
+ * Everything comes from the Raspberry Pi: the batches, the settings and the machine. There is no
+ * demo or offline mode: when the Pi can't be reached, the calls fail with an "offline" ApiError
+ * (isOffline) and the pages say so.
  *
  * Leave VITE_API_URL unset in the usual setups: in development, vite.config.ts forwards /api to
  * the backend on localhost:8000, and on the Pi the backend serves the website itself. Set it
  * only to call a backend somewhere else, for example http://192.168.1.50:8000.
  */
 import { useEffect, useRef, useState } from "react";
-import * as local from "./greenovaData";
-import type { DemoBatch } from "./greenovaData";
+import type { BatchData } from "./greenovaData";
 
 export const API_BASE = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
@@ -21,22 +20,20 @@ export type Catalyst = "NaOH" | "KOH";
 export type Adsorbent = "Magnesol" | "Bentonite";
 export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-/** Dry wash with Magnesol or bentonite: heating (heater off at 90 °C) → methanol removal at 90 °C →
- * add the adsorbent (operator; the phase is still called "magnesol") → contact (stirred, heater off)
- * → drain (until the output load cell is stable for 30 s) → complete. No settling, no cooling. */
+/** Dry wash with Magnesol or bentonite: heating (heater off at 90 °C) → methanol removal (kept at
+ * 87–90 °C) → add the adsorbent (operator; the phase is still called "magnesol") → contact (stirred
+ * at 200 RPM, heater off) → settle (1 min, stirrer off) → drain (valve + pumpout, until the output
+ * load cell is stable for 30 s) → complete. */
 export type PurificationPhase =
-  | "ready" | "heating" | "methanol" | "magnesol" | "contact" | "drain" | "complete" | "fault";
+  | "ready" | "heating" | "methanol" | "magnesol" | "contact" | "settle" | "drain" | "complete" | "fault";
 export type TileState = "ready" | "checking" | "fault";
-/** Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H₂SO₄ in methanol. */
-export type PumpName = "catalyst" | "acid";
+/** Pump A ("catalyst", dispenser 1) = NaOH/KOH dissolved in methanol. Pump B ("acid", dispenser 2) =
+ * H₂SO₄ in methanol. "oil" = the oil pump. Each runs until the operator presses Done. */
+export type PumpName = "catalyst" | "acid" | "oil";
+/** "done" = the operator pressed Done (everything pumped in); "stopped" = Stop (start it again). */
 export type PumpPhase = "idle" | "pumping" | "done" | "fault" | "stopped";
-/** Transfer outlets that open by themselves: after transesterification and after separation. They
- * stay open (no drain time) until the batch's purification has finished, then every valve closes. */
-export type DrainValve = "reactor_outlet" | "centrifuge_outlet";
-/** "waiting" = the centrifuge outlet waits for the centrifuge to stop; "open" = opened and left open. */
-export type DrainPhase = "idle" | "waiting" | "open" | "closed" | "stopped" | "fault";
 
-export type BatchRecord = DemoBatch & {
+export type BatchRecord = BatchData & {
   oilMassG?: number | null;
   catalystToWeighG?: number | null;
   esterificationStages?: Array<{
@@ -62,7 +59,16 @@ export type BatchProgress = { stage: string; state: Record<string, unknown> | nu
 /** The batch in progress. Only one batch can be processed at a time. */
 export type ActiveBatch = BatchRecord & { progress: BatchProgress | null };
 
-export type RecommendedParameters = NonNullable<ReturnType<typeof local.getRecommendedParametersForFfa>>;
+/** The best parameters for an FFA range, from the batches with a passed lab result. */
+export type RecommendedParameters = {
+  esterificationVoltage?: number | null;
+  esterificationTime?: number | null;
+  esterificationStirring?: number | null;
+  transesterificationVoltage: number;
+  transesterificationTime: number;
+  transesterificationStirring: number;
+  methanolRatio: number;
+};
 
 /** Same keys as calculateQuantityCards() in NewBatch.tsx, plus a few extras. */
 export type QuantityCards = {
@@ -134,11 +140,22 @@ export type Sensors = {
   centrifugeValveOpen: boolean;
   valves: Record<string, boolean>;
   motorDuty: Record<string, number>;
-  pumps: Record<PumpName, boolean>;
+  /** The pumps this machine has ("oil" only with the automated oil input). */
+  pumps: Partial<Record<PumpName, boolean>>;
   timestamp: number;
+  /** ESP32 hardware mode only: the USB link to the ESP32 controller. */
+  controllerOnline?: boolean;
+  controllerError?: string | null;
+  controllerPort?: string | null;
+  /** ESP32 mode: the RPMs are worked out from the speed setting (no RPM sensors). */
+  rpmEstimated?: boolean;
+  /** ESP32 mode: which HX711 load cells hardware.toml enables. */
+  loadCellsFitted?: { reactor: boolean; output: boolean };
 };
 
-/** A dose being loaded by pump A or B. It stops when the reactor load cell has gained targetG. */
+/** The oil pump or a dispenser emptying its container into the reactor. The operator measured the
+ * computed amount (targetG / volumeMl) into the container; the pump runs until Done (deliveredG =
+ * targetG) or Stop. It stops by itself with a fault after maxSeconds. */
 export type PumpStatus = {
   pump: PumpName | null;
   phase: PumpPhase;
@@ -147,26 +164,10 @@ export type PumpStatus = {
   targetG: number;
   volumeMl: number;
   deliveredG: number;
-  startWeightG: number | null;
-  /** No load cell reading: dosed by time at the pump's rate. */
-  byTime: boolean;
   elapsedSeconds: number;
   maxSeconds: number;
   faultReason: string | null;
   /** When this run started: tells it apart from the previous run. */
-  startedAt: string | null;
-};
-
-/** The transfer outlets. valve/phase: the outlet opened last ("waiting" = for the centrifuge to stop).
- * openValves: the transfer outlets open right now. */
-export type DrainStatus = {
-  valve: DrainValve | null;
-  phase: DrainPhase;
-  batchId: string | null;
-  waitingFor: string | null;
-  waitedSeconds: number;
-  openValves: DrainValve[];
-  faultReason: string | null;
   startedAt: string | null;
 };
 
@@ -191,6 +192,11 @@ export type StageStatus = {
   averageTemperature: number | null;
   energyKwh: number;
   faultReason: string | null;
+  /** Separation only: "settling" (in the reactor, 1 min, everything off), then "separating" (the
+   * reactor pump, the centrifuge and pumpin run together). */
+  phase?: "settling" | "separating" | null;
+  settleTotalSeconds?: number;
+  settleRemainingSeconds?: number;
 };
 
 /** Automatic purification (dry wash with Magnesol). The step timer is stepRemainingSeconds. */
@@ -199,7 +205,7 @@ export type PurificationStatus = {
   batchId: string | null;
   /** Started by itself after separation (level switch), rather than by hand. */
   automatic: boolean;
-  /** Fixed: heater off at 90 °C (back on at 89 °C), safety cutoff above 95 °C. */
+  /** Fixed: heater off at 90 °C (back on at 87 °C), safety cutoff above 95 °C. */
   targetTemperature: number;
   maximumTemperature: number;
   liveTemperature: number | null;
@@ -217,6 +223,9 @@ export type PurificationStatus = {
   magnesolWaitSeconds: number;
   contactTotalSeconds: number;
   contactRemainingSeconds: number;
+  /** The 1 min settle after contact (stirrer off). */
+  settleTotalSeconds?: number;
+  settleRemainingSeconds?: number;
   drainElapsedSeconds: number;
   /** Seconds the output weight has stayed within ±2 g; the run completes at stableTargetSeconds (30). */
   stableSeconds: number;
@@ -242,20 +251,18 @@ export type PurificationStatus = {
 };
 
 export type LiveData = {
-  mock: boolean;
   timestamp: string;
   sensors: Sensors;
   alarm: string | null;
   stage: StageStatus;
   purification: PurificationStatus;
   pump: PumpStatus;
-  drain: DrainStatus;
   /** Batch ID waiting for purification to start by itself (after separation), or null. */
   purificationAutoStart: string | null;
 };
 
 export type SystemStatus = {
-  mode: "demonstration" | "live";
+  mode: "live";
   ready: boolean;
   readiness: number;
   tiles: Array<{ label: string; value: string; secondary: string; state: TileState }>;
@@ -280,17 +287,19 @@ export type ProcessConfig = {
   acetone: { volumeFractionDefault: number; provisional: boolean };
   esterification: StageLimits & { sulfuricAcidMlPerGramFfa: number; designFfa: number; stripMaxFfa: number };
   transesterification: StageLimits;
-  separation: { timeMinutes: number; speedRpm: number };
+  /** Separation time and speed are set per batch (Volume & Parameters): these are the defaults and
+   * limits. It starts by itself after transesterification and a settle of settleSeconds. */
+  separation: { timeMinutes: number; speedRpm: number; timeMin: number; timeMax: number; speedMin: number;
+    speedMax: number; settleSeconds: number };
   purification: { holdTemperature: number; holdBand: number; maximumTemperature: number; heatingTimeoutMinutes: number;
-    methanolRemovalMinutes: number; contactMinutes: number;
+    methanolRemovalMinutes: number; contactMinutes: number; settleSeconds: number;
     stirringSpeedRpm: number; drainStableGrams: number; drainStableSeconds: number;
     lowOutputFraction: number; magnesolGramsPerMlOil: number; bentoniteGramsPerMlOil?: number; adsorbents?: Adsorbent[];
     defaultAdsorbent?: Adsorbent; magnesolDosePct?: number; bentoniteDosePct?: number; thermalFuseRating: number | null; automatic: boolean };
   /** currentControl: the Pi sets the power supply's current limit (otherwise the operator does). */
   powerSupply: { currentControl: boolean };
-  pumps: { catalystRateMlPerMinute: number; acidRateMlPerMinute: number; noFlowSeconds: number };
-  /** The outlets have no drain time: they stay open until the batch is complete. */
-  drains: { stayOpenUntilComplete: boolean; centrifugeSpinDownSeconds: number };
+  /** The oil pump and the dispensers run until the operator presses Done (stopStyle "manual"). */
+  pumps: { oilPump: boolean; stopStyle: "manual"; maxRunMinutes: number };
   reactionMaximumTemperature: number;
 };
 
@@ -435,152 +444,57 @@ function send<T>(method: "POST" | "PUT" | "PATCH", path: string, body?: unknown)
   return request<T>(path, { method, body: body === undefined ? undefined : JSON.stringify(body) });
 }
 
-async function withLocalFallback<T>(remote: () => Promise<T>, fallback: () => T): Promise<T> {
-  try {
-    return await remote();
-  } catch (error) {
-    if (isOffline(error)) return fallback();
-    throw error;
-  }
-}
-
-// ---------- same functions as greenovaData.ts ----------
-/** This browser's batches, with the Process page stage of the one in progress. */
-function localBatches(): BatchRecord[] {
-  const progress = local.getLocalProgress();
-  return local.getBatches().map((batch) =>
-    batch.status === "In Progress" ? { ...batch, currentStage: progress?.id === batch.id ? progress.stage : null } : batch,
-  );
-}
-
+// ---------- batches (stored in MySQL by the Raspberry Pi) ----------
 export function getBatches(): Promise<BatchRecord[]> {
-  return withLocalFallback(() => get<BatchRecord[]>("/api/batches"), localBatches);
+  return get<BatchRecord[]>("/api/batches");
 }
 
 export function getBatch(id: string): Promise<BatchRecord | undefined> {
-  return withLocalFallback(
-    () => get<BatchRecord>(`/api/batches/${encodeURIComponent(id)}`),
-    () => local.getBatches().find((batch) => batch.id === id),
-  );
+  return get<BatchRecord>(`/api/batches/${encodeURIComponent(id)}`);
 }
 
 /** Saves a finished batch. The backend fills in what the Pi measured (temperature, energy,
  * purification, output weight and yield) for the same batch ID. */
-export function saveCompletedBatch(batch: Partial<DemoBatch>): Promise<BatchRecord> {
-  return withLocalFallback(
-    () => send<BatchRecord>("POST", "/api/batches", batch),
-    () => {
-      local.saveCompletedBatch(batch as DemoBatch);
-      return batch as BatchRecord;
-    },
-  );
+export function saveCompletedBatch(batch: Partial<BatchData>): Promise<BatchRecord> {
+  return send<BatchRecord>("POST", "/api/batches", batch);
 }
 
 /** Records or changes the batch's lab result (its one lab result row is updated). testedAt is
  * when the operator recorded it: this device's clock, sent along so the time is never missing. */
 export function updateBatchLabResult(id: string, labResult: "Passed" | "Failed", labReference?: string): Promise<BatchRecord | undefined> {
   const testedAt = new Date().toISOString();
-  return withLocalFallback(
-    () => send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/lab-result`, { labResult, labReference, testedAt }),
-    () => local.updateBatchLabResult(id, labResult, labReference, testedAt),
-  );
+  return send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/lab-result`, { labResult, labReference, testedAt });
 }
 
 export function getRecommendedParametersForFfa(ffa: number): Promise<RecommendedParameters | null> {
-  return withLocalFallback(
-    () => get<RecommendedParameters | null>(`/api/analytics/recommended?ffa=${encodeURIComponent(ffa)}`),
-    () => local.getRecommendedParametersForFfa(ffa),
-  );
+  return get<RecommendedParameters | null>(`/api/analytics/recommended?ffa=${encodeURIComponent(ffa)}`);
 }
 
-function localBatchId(): string {
-  return `B-${new Date().getFullYear()}-${String(Date.now()).slice(-3)}`;
-}
-
-export function getNextBatchId(): Promise<string> {
-  return withLocalFallback(async () => (await get<{ id: string }>("/api/batches/next-id")).id, localBatchId);
+export async function getNextBatchId(): Promise<string> {
+  return (await get<{ id: string }>("/api/batches/next-id")).id;
 }
 
 // ---------- the batch in progress (only one at a time) ----------
-/** Batch fields the Process page saves while the batch runs (its setup so far, not its results). */
-const PROGRESS_FIELDS = [
-  "oilVolume", "oilMassG", "ffa", "ffaAboveStrip", "esterificationRun", "esterificationVoltage", "esterificationTime",
-  "esterificationStirring", "esterificationCurrent", "reactionTime", "stirringSpeed", "voltage", "current",
-  "methanolRatio", "catalystType", "adsorbent", "catalystToWeighG",
-] as const;
-
-function activeMessage(id: string) {
-  return `Batch ${id} is still in progress. Only one batch can be processed at a time: continue it, or cancel it, before starting a new one.`;
-}
-
-function localActiveBatch(): ActiveBatch | null {
-  const batch = localBatches().find((item) => item.status === "In Progress");
-  if (!batch) return null;
-  const progress = local.getLocalProgress();
-  const own = progress?.id === batch.id ? progress : null;
-  return { ...batch, progress: own ? { stage: own.stage, state: own.state, updatedAt: own.updatedAt } : null };
-}
-
 /** The batch in progress, with where the Process page is, or null when no batch is running. */
 export function getActiveBatch(): Promise<ActiveBatch | null> {
-  return withLocalFallback(() => request<ActiveBatch | null>("/api/batches/active", { timeoutMs: 5000 }), localActiveBatch);
+  return request<ActiveBatch | null>("/api/batches/active", { timeoutMs: 5000 });
 }
 
 /** "Start batch": records the batch as In Progress (shown in Batch History at once). Fails with
  * 409 while another batch is in progress: only one batch can be processed at a time. */
 export function startBatch(id?: string): Promise<ActiveBatch> {
-  return withLocalFallback(
-    () => send<ActiveBatch>("POST", "/api/batches/start", { id }),
-    () => {
-      const active = localActiveBatch();
-      if (active && active.id === id) return active;
-      if (active) throw new ApiError(409, activeMessage(active.id));
-      const taken = new Set(local.getBatches().map((batch) => batch.id));
-      let batchId = id && !taken.has(id) ? id : localBatchId();
-      while (taken.has(batchId)) batchId = `${batchId}-1`;
-      return { ...local.startLocalBatch(batchId), currentStage: null, progress: null };
-    },
-  );
+  return send<ActiveBatch>("POST", "/api/batches/start", { id });
 }
 
 /** Saves where the ongoing batch is (stage + the page's state) and its setup so far, so it can be
  * continued later, from the Dashboard or on another device. */
-/** Offline: the batch in progress in this browser, or (when it is the Pi's batch) the offline
- * error again, so the page tries later instead of losing the batch. */
-function localOngoing(id: string, offline: unknown) {
-  const current = local.getBatches().find((item) => item.id === id && item.status === "In Progress");
-  if (!current) throw offline;
-  return current;
-}
-
-export async function saveBatchProgress(id: string, stage: string, state: Record<string, unknown>, batch?: Partial<DemoBatch>): Promise<void> {
-  try {
-    await send("PUT", `/api/batches/${encodeURIComponent(id)}/progress`, { stage, state, batch });
-  } catch (error) {
-    if (!isOffline(error)) throw error;
-    localOngoing(id, error);
-    const setup = Object.fromEntries(PROGRESS_FIELDS.filter((key) => batch?.[key] !== undefined).map((key) => [key, batch?.[key]]));
-    local.updateLocalBatch(id, setup as Partial<DemoBatch>);
-    local.setLocalProgress({ id, stage, state, updatedAt: new Date().toISOString() });
-  }
+export async function saveBatchProgress(id: string, stage: string, state: Record<string, unknown>, batch?: Partial<BatchData>): Promise<void> {
+  await send("PUT", `/api/batches/${encodeURIComponent(id)}/progress`, { stage, state, batch });
 }
 
 /** Cancels the batch in progress (it stays in Batch History as Cancelled). */
-export async function cancelBatch(id: string): Promise<BatchRecord> {
-  try {
-    return await send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/cancel`);
-  } catch (error) {
-    if (!isOffline(error)) throw error;
-    localOngoing(id, error);
-    local.setLocalProgress(null);
-    return local.updateLocalBatch(id, { status: "Cancelled", labResult: "Not tested" }) as BatchRecord;
-  }
-}
-
-/** Marks the ongoing batch Completed on the backend without its full record (used when the Pi
- * refused the record and the operator kept it in this browser), so it doesn't stay "In Progress". */
-export function markBatchCompleted(id: string): Promise<BatchRecord> {
-  return send<BatchRecord>("PATCH", `/api/batches/${encodeURIComponent(id)}`, { status: "Completed" });
+export function cancelBatch(id: string): Promise<BatchRecord> {
+  return send<BatchRecord>("POST", `/api/batches/${encodeURIComponent(id)}/cancel`);
 }
 
 /** The batch in progress for a page, checked again every few seconds (another device may start,
@@ -611,27 +525,32 @@ export function useActiveBatch(refreshMs = 4000): { active: ActiveBatch | null; 
   return { active, loaded };
 }
 
-/** Batches for a page: shows the local data at once, then the backend's when it answers. */
-export function useBatches(): { batches: BatchRecord[]; source: "backend" | "local"; reload: () => void } {
-  const [batches, setBatches] = useState<BatchRecord[]>(localBatches);
-  const [source, setSource] = useState<"backend" | "local">("local");
+/** The batches for a page, from the Raspberry Pi. source: "loading" until the first answer,
+ * "offline" while the Pi can't be reached (then the list is empty; it tries again every 5 s). */
+export function useBatches(): { batches: BatchRecord[]; source: "loading" | "backend" | "offline"; reload: () => void } {
+  const [batches, setBatches] = useState<BatchRecord[]>([]);
+  const [source, setSource] = useState<"loading" | "backend" | "offline">("loading");
   const [version, setVersion] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    get<BatchRecord[]>("/api/batches")
-      .then((rows) => {
-        if (cancelled) return;
-        setBatches(rows);
-        setSource("backend");
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setBatches(localBatches());
-        setSource("local");
-      });
+    let retry: number | undefined;
+    const load = () =>
+      getBatches()
+        .then((rows) => {
+          if (cancelled) return;
+          setBatches(rows);
+          setSource("backend");
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setSource("offline");
+          retry = window.setTimeout(load, 5000);
+        });
+    load();
     return () => {
       cancelled = true;
+      window.clearTimeout(retry);
     };
   }, [version]);
 
@@ -667,31 +586,71 @@ export async function syncSettingsFromBackend(): Promise<void> {
   }
 }
 
-export function getSettings(): Promise<Settings> {
-  return withLocalFallback(
-    () => get<Settings>("/api/settings"),
-    () => readLocalSettings() as Settings,
-  );
+/** The settings from the Raspberry Pi (and copied to this browser, where the pages read them). */
+export async function getSettings(): Promise<Settings> {
+  const settings = await get<Settings>("/api/settings");
+  writeLocalSettings(settings);
+  return settings;
 }
 
-/** Saves some or all settings to the backend (which keeps the keys you leave out) and to
- * localStorage, so the pages see them right away. */
-export function saveSettings(changes: Partial<Settings>): Promise<Settings> {
-  return withLocalFallback(
-    async () => {
-      const saved = await send<Settings>("PUT", "/api/settings", changes);
-      writeLocalSettings(saved);
-      return saved;
-    },
-    () => {
-      writeLocalSettings(changes);
-      return readLocalSettings() as Settings;
-    },
-  );
+/** Saves some or all settings on the Raspberry Pi (which keeps the keys you leave out) and copies
+ * them to this browser, so the pages see them right away. Fails while the Pi is offline. */
+export async function saveSettings(changes: Partial<Settings>): Promise<Settings> {
+  const saved = await send<Settings>("PUT", "/api/settings", changes);
+  writeLocalSettings(saved);
+  return saved;
 }
 
 export const getProcessConfig = () => get<ProcessConfig>("/api/config");
 export const getSystemStatus = () => get<SystemStatus>("/api/system/status");
+
+// ---------- hardware (Settings -> Hardware) ----------
+export type LoadCellInfo = {
+  key: "reactor" | "output" | string;
+  label: string;
+  enabled: boolean;
+  dataPin: number;
+  clockPin: number;
+  grams: number | null;
+  ok: boolean;
+  raw?: number | null;
+  offset?: number;
+  scale?: number;
+  busy?: boolean;
+  calibratedAt?: string | null;
+  taredAt?: string | null;
+};
+
+export type HardwareInfo = {
+  /** "esp32" (ESP32 controller + the Pi's centrifuge and load cell) or "gpio" (older all-Pi wiring). */
+  backend: "esp32" | "gpio";
+  /** Why the output controller can't be trusted right now, or null. */
+  fault: string | null;
+  controller: null | {
+    online: boolean;
+    port: string | null;
+    error: string | null;
+    temperature: number | null;
+    maxRpm: number | null;
+    leaseSeconds: number;
+    devices: Array<{ id: string; label: string; type: "relay" | "motor" | null; on: boolean; rpm: number | null; used: boolean }>;
+    messages: string[];
+  };
+  /** Greenova job -> the ESP32 output(s) that do it (hardware.toml [esp32.devices]). */
+  roles: Array<{ role: string; label: string; devices: string[]; on: boolean; rpm: number | null;
+    maxOnSeconds: number | null; controllerOn: Array<boolean | null> }>;
+  centrifuge: null | { targetRpm: number; rpm: number; duty: number; maxRpm: number; error: string | null };
+  loadCells: LoadCellInfo[];
+};
+
+export const getHardware = () => get<HardwareInfo>("/api/hardware");
+/** Zero the load cell: nothing on it (or only the empty container). Takes about 3 s. */
+export const tareLoadCell = (key: string) =>
+  send<{ result: { offset: number }; loadCells: LoadCellInfo[] }>("POST", `/api/hardware/load-cells/${key}/tare`);
+/** A known weight (grams) is on the tared load cell: works out its scale. Takes about 3 s. */
+export const calibrateLoadCell = (key: string, grams: number) =>
+  send<{ result: { scale: number; resolutionG: number }; loadCells: LoadCellInfo[] }>(
+    "POST", `/api/hardware/load-cells/${key}/calibrate`, { grams });
 /** This computer's addresses on the local network, for "Open on phone". */
 export const getNetworkAddresses = async () => (await get<{ addresses: string[] }>("/api/network")).addresses;
 export const getLive = () => get<LiveData>("/api/live");
@@ -704,32 +663,23 @@ export const calculateQuantities = (input: { oilMassG: number; ffa: number; meth
 export const calculateAfterEsterification = (input: { oilMassG: number; ffaAfter: number; stageDone: number; methanolRatio?: number; catalyst: Catalyst }) =>
   send<AfterEsterification>("POST", "/api/calculate/after-esterification", input);
 
-export const readFfaStrip = () => send<{ ffa: number; warnings: string[] }>("POST", "/api/strip/read");
-
-/** "Load demonstration sensor reading" (demo mode only). */
-export const loadDemoOil = (volumeMl: number) => send<Sensors>("POST", "/api/demo/load-oil", { volumeMl });
-
-/** Demo mode: something poured by hand lands on a simulated load cell (e.g. acetone). */
-export const demoAdd = (grams: number, place: "reactor" | "purificationTank" = "reactor") =>
-  send<Sensors>("POST", "/api/demo/add", { place, grams });
-
-// ---------- dosing pumps and outlet valves ----------
-/** "Load": the pump adds one premixed dose and stops when the reactor has gained targetG. */
+// ---------- the oil pump and the dispensers (stopped by the operator) ----------
+/** Switches the pump on: it empties the container the operator filled (targetG / volumeMl, the
+ * computed amount) into the reactor until finishPump (Done) or stopPump. */
 export const startPump = (input: { pump: PumpName; targetG: number; volumeMl: number; batchId?: string; stage?: string }) =>
   send<PumpStatus>("POST", "/api/process/pump/start", input);
 
-export const pumpAction = (action: "stop" | "skip") => send<PumpStatus>("POST", `/api/process/pump/${action}`);
+/** "Done": the container is empty, everything is in the reactor; the pump stops. */
+export const finishPump = () => send<PumpStatus>("POST", "/api/process/pump/finish");
 
-/** Opens a transfer outlet by hand (when it didn't open by itself) and goes on to the next process.
- * It stays open until the batch is complete. */
-export const startDrain = (valve: DrainValve, batchId?: string) =>
-  send<DrainStatus>("POST", "/api/process/drain/start", { valve, batchId });
-
-/** stop: close the reactor and centrifuge outlets now; skip (demo): the transfer finishes at once. */
-export const drainAction = (action: "stop" | "skip") => send<DrainStatus>("POST", `/api/process/drain/${action}`);
+/** Stops the pump now (it can be started again for the rest). */
+export const stopPump = () => send<PumpStatus>("POST", "/api/process/pump/stop");
 
 // ---------- process stages ----------
-export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number; current?: number; oilMassG?: number; adsorbent?: Adsorbent }) =>
+/** separationTime / separationSpeed: the batch's separation (Volume & Parameters), sent with the
+ * Transesterification start (the Pi starts the separation by itself after it) and with a Separation start. */
+export const startStage = (input: { stage: StageName; batchId?: string; voltage?: number; time?: number; stirring?: number;
+  current?: number; oilMassG?: number; adsorbent?: Adsorbent; separationTime?: number; separationSpeed?: number }) =>
   send<StageStatus>("POST", "/api/process/stage/start", input);
 
 export const stageAction = (action: "pause" | "resume" | "complete" | "emergency-stop" | "reset") =>
@@ -741,7 +691,7 @@ export const startPurification = (input: { heaterSubmerged?: boolean; batchId?: 
   send<PurificationStatus>("POST", "/api/process/purification/start", input);
 
 /** "magnesol-added" = the operator's Confirm after adding the adsorbent (Magnesol or bentonite). */
-export const purificationAction = (action: "skip" | "abort" | "acknowledge" | "magnesol-added") =>
+export const purificationAction = (action: "abort" | "acknowledge" | "magnesol-added") =>
   send<PurificationStatus>("POST", `/api/process/purification/${action}`);
 
 /** Emergency stop for everything: stage, pumps, purification, heater, valves and motors. */

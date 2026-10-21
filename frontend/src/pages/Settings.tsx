@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Field, Heading, SelectField, Status } from "../components/ui";
+import HardwarePanel from "../components/HardwarePanel";
 import { useLiveData } from "../contexts/LiveContext";
 import { useTheme } from "../contexts/ThemeContext";
 import { getBatches, getSystemStatus, isOffline, saveSettings, type SystemStatus } from "../lib/api";
@@ -54,13 +55,12 @@ export default function Settings() {
   const [ffaThreshold] = useState("3");
   const [oilMinimumVolumeMl, setOilMinimumVolumeMl] = useState(numberSetting("oilMinimumVolumeMl", 1500));
   const [oilMaximumVolumeMl, setOilMaximumVolumeMl] = useState(numberSetting("oilMaximumVolumeMl", 5000));
+  // Separation defaults: each batch sets its own time and speed (Volume & Parameters), starting from these.
   const [separationTime, setSeparationTime] = useState(numberSetting("separationTime", 60));
+  const [separationSpeed, setSeparationSpeed] = useState(String(Math.min(Number(numberSetting("separationSpeed", 2500)), 2500)));
   const [heaterPowerWatts, setHeaterPowerWatts] = useState(numberSetting("heaterPowerWatts", 900));
   const [esterificationDesignFfa, setEsterificationDesignFfa] = useState(numberSetting("esterificationDesignFfa", 10));
   const [stripMaxFfa] = useState("5");
-  const [pumpCatalystRate, setPumpCatalystRate] = useState(numberSetting("pumpCatalystRate", 100));
-  const [pumpAcidRate, setPumpAcidRate] = useState(numberSetting("pumpAcidRate", 100));
-  const [centrifugeSpinDownTime, setCentrifugeSpinDownTime] = useState(numberSetting("centrifugeSpinDownTime", 30));
   const [provenBatchCount, setProvenBatchCount] = useState(whole(initialSettings.provenBatchCount || 3, 3));
   const [provenYieldTolerance, setProvenYieldTolerance] = useState(whole(initialSettings.provenYieldTolerance || 2, 2));
   const [oilPrice, setOilPrice] = useState(whole(initialSettings.oilPrice || 45, 45));
@@ -98,9 +98,8 @@ export default function Settings() {
     // Every number on this page is a whole number (no decimals).
     const numbers: Array<[string, string]> = [
       ["Methanol removal time", methanolRemovalTime], ["Contact time", contactTime],
-      ["Transesterification FFA limit", ffaThreshold], ["Minimum batch volume", oilMinimumVolumeMl], ["Maximum batch volume", oilMaximumVolumeMl], ["Separation time limit", separationTime], ["Heater power", heaterPowerWatts], ["Design FFA for the dose", esterificationDesignFfa],
-      ["Strip maximum (darkest color)", stripMaxFfa], ["Pump A rate (NaOH/KOH + methanol)", pumpCatalystRate],
-      ["Pump B rate (H₂SO₄ + methanol)", pumpAcidRate], ["Centrifuge spin-down wait", centrifugeSpinDownTime],
+      ["Transesterification FFA limit", ffaThreshold], ["Minimum batch volume", oilMinimumVolumeMl], ["Maximum batch volume", oilMaximumVolumeMl], ["Default separation time", separationTime], ["Default centrifuge speed", separationSpeed], ["Heater power", heaterPowerWatts], ["Design FFA for the dose", esterificationDesignFfa],
+      ["Strip maximum (darkest color)", stripMaxFfa],
       ["Batches required for Proven", provenBatchCount], ["Yield tolerance", provenYieldTolerance], ["Oil price", oilPrice],
       ["Methanol price", methanolPrice], ["KOH price", kohPrice], ["NaOH price", naohPrice],
       ["Sulfuric acid price", sulfuricAcidPrice], ["Acetone price", acetonePrice], ["Bentonite price", bentonitePrice],
@@ -110,6 +109,14 @@ export default function Settings() {
     const notWhole = numbers.filter(([, value]) => !/^\d+$/.test(value.trim())).map(([label]) => t(label));
     if (notWhole.length) {
       setSaveError(t("Use whole numbers only (no decimals): {fields}.", { fields: notWhole.join(", ") }));
+      return;
+    }
+    if (Number(separationTime) < 1 || Number(separationTime) > 180) {
+      setSaveError(t("Default separation time must be between 1 and 180 min."));
+      return;
+    }
+    if (Number(separationSpeed) < 100 || Number(separationSpeed) > 2500) {
+      setSaveError(t("Default centrifuge speed must be between 100 and 2500 RPM (the centrifuge's maximum)."));
       return;
     }
     const changes = {
@@ -124,12 +131,10 @@ export default function Settings() {
       oilMinimumVolumeMl: Number(oilMinimumVolumeMl),
       oilMaximumVolumeMl: Number(oilMaximumVolumeMl),
       separationTime: Number(separationTime),
+      separationSpeed: Number(separationSpeed),
       heaterPowerWatts: Number(heaterPowerWatts),
       esterificationDesignFfa: Number(esterificationDesignFfa),
       stripMaxFfa: Number(stripMaxFfa),
-      pumpCatalystRate: Number(pumpCatalystRate),
-      pumpAcidRate: Number(pumpAcidRate),
-      centrifugeSpinDownTime: Number(centrifugeSpinDownTime),
       ffaRangeBoundaries,
       provenBatchCount: Number(provenBatchCount),
       provenYieldTolerance: Number(provenYieldTolerance),
@@ -148,10 +153,10 @@ export default function Settings() {
       defaultAdsorbent: defaultAdsorbent as "Magnesol" | "Bentonite",
     };
     try {
-      // Saves to the Raspberry Pi and to this browser; offline, only to this browser.
+      // Saved on the Raspberry Pi (and copied to this browser)
       await saveSettings(changes);
     } catch (error) {
-      setSaveError(isOffline(error) ? t("Backend offline.") : t(error instanceof Error ? error.message : String(error)));
+      setSaveError(isOffline(error) ? t("The Raspberry Pi is offline, so nothing was saved. Try again when it is connected.") : t(error instanceof Error ? error.message : String(error)));
       return;
     }
     setSaved(true);
@@ -210,13 +215,15 @@ export default function Settings() {
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Process Defaults")}</Heading>
         <p className="mt-1 text-sm text-gray-500">{t("Validated values can be entered once approved by the project team.")}</p>
+        <p className="mt-1 text-xs text-gray-600">{t("Separation time and centrifuge speed are set for each batch in Volume & Parameters; these are the values a new batch starts with (speed at most 2500 RPM).")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-5">
           <Field label={t("Temperature")} placeholder={t("Project-defined")} unit="°C" />
           <Field label={t("Reaction time")} placeholder={t("Project-defined")} unit="min" />
           <Field label={t("Stirring speed")} placeholder={t("Project-defined")} unit="RPM" />
           <Field label={t("Target batch volume (1,500–5,000 mL)")} value={oilMinimumVolumeMl} onChange={wholeInput(setOilMinimumVolumeMl)} inputMode="numeric" pattern="[0-9]*" unit="mL" />
           <Field label={t("Maximum batch volume")} value={oilMaximumVolumeMl} onChange={wholeInput(setOilMaximumVolumeMl)} inputMode="numeric" pattern="[0-9]*" unit="mL" />
-          <Field label={t("Separation time limit")} value={separationTime} onChange={wholeInput(setSeparationTime)} inputMode="numeric" pattern="[0-9]*" unit="min" />
+          <Field label={t("Default separation time")} value={separationTime} onChange={wholeInput(setSeparationTime)} inputMode="numeric" pattern="[0-9]*" unit="min" />
+          <Field label={t("Default centrifuge speed")} value={separationSpeed} onChange={wholeInput(setSeparationSpeed)} inputMode="numeric" pattern="[0-9]*" unit="RPM" />
           <Field label={t("Heater power")} value={heaterPowerWatts} onChange={wholeInput(setHeaterPowerWatts)} inputMode="numeric" pattern="[0-9]*" unit="W" />
           <Field label={t("Batch naming format")} value={format} placeholder={DEFAULT_BATCH_FORMAT} onChange={(event) => setFormat(event.target.value)} />
         </div>
@@ -229,18 +236,15 @@ export default function Settings() {
           <Field label={t("Direct and post-esterification FFA limit")} inputMode="numeric" pattern="[0-9]*" value="3" readOnly unit="%" />
           <Field label={t("Design FFA for the dose")} inputMode="numeric" pattern="[0-9]*" value={esterificationDesignFfa} onChange={wholeInput(setEsterificationDesignFfa)} unit="%" />
           <Field label={t("Strip maximum (darkest color; fixed at 5%)")} inputMode="numeric" value={stripMaxFfa} readOnly unit="%" />
-          <Field label={t("Pump A rate (NaOH/KOH + methanol)")} inputMode="numeric" pattern="[0-9]*" value={pumpCatalystRate} onChange={wholeInput(setPumpCatalystRate)} unit="mL/min" />
-          <Field label={t("Pump B rate (H₂SO₄ + methanol)")} inputMode="numeric" pattern="[0-9]*" value={pumpAcidRate} onChange={wholeInput(setPumpAcidRate)} unit="mL/min" />
-          <Field label={t("Centrifuge spin-down wait")} inputMode="numeric" pattern="[0-9]*" value={centrifugeSpinDownTime} onChange={wholeInput(setCentrifugeSpinDownTime)} unit="s" />
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          {t("Uniform dose per 100 mL of oil at {design}% design FFA: {methanol} mL methanol and {acid} mL H₂SO₄. The pumps stop when the reactor load cell has gained the dose's weight; their rate only sets the time limit (and the dose time if the load cell has no reading). There is no drain time: each outlet valve opens when its process finishes, the next process starts right away, and every valve closes when the batch is complete. The centrifuge outlet opens once the centrifuge has stopped; the spin-down wait is used only when the centrifuge has no RPM reading.", { design: designFfa, methanol: ((92 * designFfa) / 100 * 2.84).toFixed(1), acid: ((92 * designFfa) / 100 * 0.027).toFixed(2) })}
+          {t("Uniform dose per 100 mL of oil at {design}% design FFA: {methanol} mL methanol and {acid} mL H₂SO₄. The operator measures the oil and each premix into its container; the oil pump and the dispensers empty them into the reactor and run until Done is pressed. After transesterification the mixture settles for 1 minute, then the reactor pump, the centrifuge and pumpin run together for the batch's separation time.", { design: designFfa, methanol: ((92 * designFfa) / 100 * 2.84).toFixed(1), acid: ((92 * designFfa) / 100 * 0.027).toFixed(2) })}
         </p>
       </Card>
 
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Purification")}</Heading>
-        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: heating to 90 °C (heater off there), methanol removal at 90 °C, add the adsorbent, contact (stirred, heater off), then draining until the output load cell is stable for 30 s.")}</p>
+        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: heating to 90 °C (heater off there), methanol removal at 87–90 °C, add the adsorbent, contact (stirred at 200 RPM, heater off), settle for 1 minute, then the valve opens and pumpout runs until the output load cell is stable for 30 s.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
           <Field label={t("Methanol removal time")} inputMode="numeric" pattern="[0-9]*" value={methanolRemovalTime} onChange={wholeInput(setMethanolRemovalTime)} unit="min" />
           <Field label={t("Contact time")} inputMode="numeric" pattern="[0-9]*" value={contactTime} onChange={wholeInput(setContactTime)} unit="min" />
@@ -252,7 +256,7 @@ export default function Settings() {
           </SelectField>
         </div>
         <p className="mt-3 text-xs leading-5 text-gray-600">
-          {t("Methanol removal: 5–30 min. Doses: 1–10% of the oil weight (Magnesol 1% = oil volume × 0.0092 g; bentonite 2% = oil volume × 0.0184 g). Fixed: heater off at 90 °C and held there (back on at 89 °C), heater cutoff 95 °C, stirrer 200 RPM. No settling or cooling step: the outlet opens right after contact.")}
+          {t("Methanol removal: 5–30 min. Doses: 1–10% of the oil weight (Magnesol 1% = oil volume × 0.0092 g; bentonite 2% = oil volume × 0.0184 g). Fixed: heater off at 90 °C, back on at 87 °C, heater cutoff 95 °C, stirrer 200 RPM, 1 min settle before the valve and pumpout.")}
         </p>
       </Card>
 
@@ -263,26 +267,16 @@ export default function Settings() {
             <p className="mt-1 text-sm text-gray-500">{t("Current Raspberry Pi, sensor, and relay connections.")}</p>
           </div>
           {systemStatus ? (
-            <Status tone={systemStatus.mode === "live" ? "green" : "yellow"}>{systemStatus.mode === "live" ? t("Connected") : t("Demonstration backend")}</Status>
+            <Status tone="green">{t("Connected")}</Status>
           ) : (
-            <Status tone="neutral">{t("Backend offline · demo values")}</Status>
+            <Status tone="red">{t("Raspberry Pi offline")}</Status>
           )}
         </div>
+        {!systemStatus && (
+          <p className="mt-4 text-sm text-gray-500">{t("The Raspberry Pi can't be reached. Check that it is on and on the same network, and that the Greenova service is running.")}</p>
+        )}
         <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {(systemStatus?.devices.map((device) => [device.label, device.status]) ?? [
-            ["Raspberry Pi", "Connected"],
-            ["Temperature sensor", "Connected"],
-            ["Power relay", "Ready"],
-            ["Stirrer relay", "Ready"],
-            ["Centrifuge controller", "Ready"],
-            ["Pump A (NaOH/KOH + methanol)", "Ready"],
-            ["Pump B (H₂SO₄ + methanol)", "Ready"],
-            ["Reactor outlet valve", "Closed"],
-            ["Centrifuge outlet valve", "Closed"],
-            ["Dry wash stirrer", "Ready"],
-            ["Purification outlet valve", "Closed"],
-            ["Output load cell", "0.0 g"],
-          ]).map(([device, state]) => (
+          {(systemStatus?.devices.map((device) => [device.label, device.status]) ?? []).map(([device, state]) => (
             <div key={device} className="flex items-center justify-between rounded-xl border border-white/[0.07] bg-gv-inset p-4">
               <span className="text-sm text-gray-400">{t(device)}</span><Status tone={["Fault", "No reading"].includes(state) ? "red" : "green"}>{t(state)}</Status>
             </div>
@@ -290,14 +284,16 @@ export default function Settings() {
         </div>
       </Card>
 
+      <HardwarePanel backend={backend} />
+
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Data")}</Heading>
         <div className="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <div className="text-sm font-medium text-gray-300">{backend ? t("Raspberry Pi batch storage") : t("Local batch storage")}</div>
-            <p className="mt-1 text-xs text-gray-600">{backend ? t("Batch records and settings are stored on the Raspberry Pi (a copy of the settings stays in this browser).") : t("Batch records and settings are stored in this browser.")}</p>
+            <div className="text-sm font-medium text-gray-300">{t("Raspberry Pi batch storage")}</div>
+            <p className="mt-1 text-xs text-gray-600">{t("Batch records and settings are stored on the Raspberry Pi (a copy of the settings stays in this browser).")}</p>
           </div>
-          <Button variant="secondary" onClick={async () => {
+          <Button variant="secondary" disabled={!backend} onClick={async () => {
             const batches = await getBatches().catch(() => []);
             const blob = new Blob([JSON.stringify(batches, null, 2)], { type: "application/json" });
             const url = URL.createObjectURL(blob);
@@ -312,7 +308,7 @@ export default function Settings() {
 
       <div className="flex items-center gap-3">
         <Button onClick={save}>{t("Save Settings")}</Button>
-        {saved && <span className="text-sm text-green-400">{backend ? t("Settings saved to the Raspberry Pi.") : t("Settings saved.")}</span>}
+        {saved && <span className="text-sm text-green-400">{t("Settings saved to the Raspberry Pi.")}</span>}
         {saveError && <span className="text-sm text-red-400">{t("Not saved:")} {saveError}</span>}
       </div>
     </div>

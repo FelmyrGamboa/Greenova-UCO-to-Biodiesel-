@@ -7,7 +7,8 @@ import pytest
 
 pytest.importorskip("pymysql")
 
-from app import config, db, seed  # noqa: E402
+from app import config, db  # noqa: E402
+from tests import sample_batches as seed  # noqa: E402
 from app.models import Batch, Settings  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("mysql_db")

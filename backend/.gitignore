@@ -5,3 +5,6 @@ frontend/dist/
 # your MySQL password (copy .env.example to .env)
 .env
 !.env.example
+# load cell Tare / Calibrate from the website (this machine's calibration)
+loadcell_calibration.json
+loadcell_calibration.json.tmp

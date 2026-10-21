@@ -18,7 +18,7 @@ const greenovaApiProxy = {
     changeOrigin: true,
     ws: true,
     configure: (proxy: any) => {
-      // Backend not running: answer "offline" so the website falls back to its demo data.
+      // Backend not running: answer "offline" so the website says the Raspberry Pi can't be reached.
       proxy.on('error', (_error: unknown, _request: unknown, response: any) => {
         if (response && typeof response.writeHead === 'function' && !response.headersSent) {
           response.writeHead(503, { 'Content-Type': 'application/json', 'X-Greenova-Offline': '1' })

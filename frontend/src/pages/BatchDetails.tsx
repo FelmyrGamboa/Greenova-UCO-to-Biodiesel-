@@ -1,28 +1,16 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 import { batchTone, Button, Card, Field, Heading, Metric, Status } from "../components/ui";
-import { formatFfa, getBatches } from "../lib/greenovaData";
-import { getBatch, isOffline, updateBatchLabResult, type BatchRecord } from "../lib/api";
+import { formatFfa } from "../lib/greenovaData";
+import { ApiError, getBatch, isOffline, updateBatchLabResult, type BatchRecord } from "../lib/api";
 import { useT } from "../lib/i18n";
-
-const demoTimeline = [
-  ["Start", "09:02 AM"],
-  ["Preparation", "09:08 AM"],
-  ["Volume & Parameters", "09:17 AM"],
-  ["Oil Loading", "09:28 AM"],
-  ["Reaction Started", "09:35 AM"],
-  ["Reaction Completed", "10:35 AM"],
-  ["Separation Started", "10:40 AM"],
-  ["Dry Wash (Magnesol)", "11:02 AM"],
-  ["Draining", "11:19 AM"],
-  ["Complete", "11:16 AM"],
-];
 
 export default function BatchDetails() {
   const t = useT();
   const { batchId } = useParams();
-  const [batch, setBatch] = useState<BatchRecord>(() => getBatches().find((item) => item.id === batchId) ?? getBatches()[0]);
-  const [fromBackend, setFromBackend] = useState(false);
+  // The batch from the Raspberry Pi (null until it answers).
+  const [batch, setBatch] = useState<BatchRecord | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "loaded" | "missing" | "offline">("loading");
   const [labReference, setLabReference] = useState("");
   const [error, setError] = useState<string | null>(null);
   // A recorded result (Passed or Failed) can be changed: the same lab result is updated.
@@ -32,19 +20,47 @@ export default function BatchDetails() {
   useEffect(() => {
     if (!batchId) return;
     let cancelled = false;
-    getBatch(batchId)
-      .then((found) => {
-        if (cancelled || !found) return;
-        setBatch(found);
-        setFromBackend(Boolean(found.createdAt || found.timeline));
-      })
-      .catch(() => undefined);
+    let retry: number | undefined;
+    const load = () =>
+      getBatch(batchId)
+        .then((found) => {
+          if (cancelled) return;
+          setBatch(found ?? null);
+          setLoadState(found ? "loaded" : "missing");
+        })
+        .catch((problem) => {
+          if (cancelled) return;
+          if (problem instanceof ApiError && problem.status === 404) {
+            setLoadState("missing");
+          } else {
+            setLoadState("offline");
+            retry = window.setTimeout(load, 5000);   // the Pi may come back
+          }
+        });
+    load();
     return () => {
       cancelled = true;
+      window.clearTimeout(retry);
     };
   }, [batchId]);
 
+  if (!batch) {
+    return (
+      <div className="space-y-6">
+        <Link to="/batches" className="text-sm text-gray-500 hover:text-green-400">← {t("Back to Batch History")}</Link>
+        <Card className="p-8 text-center text-sm text-gray-500">
+          {loadState === "missing"
+            ? t("Batch {id} was not found on the Raspberry Pi.", { id: batchId ?? "" })
+            : loadState === "offline"
+              ? t("The Raspberry Pi can't be reached. Check that it is on and on the same network, and that the Greenova service is running.")
+              : t("Loading the batch…")}
+        </Card>
+      </div>
+    );
+  }
+
   async function recordLabResult(result: "Passed" | "Failed") {
+    if (!batch) return;
     setError(null);
     setSavingLab(true);
     try {
@@ -53,7 +69,7 @@ export default function BatchDetails() {
       setChangingLab(false);
       setLabReference("");
     } catch (problem) {
-      setError(isOffline(problem) ? t("Backend offline.") : t(problem instanceof Error ? problem.message : String(problem)));
+      setError(isOffline(problem) ? t("The Raspberry Pi is offline: the lab result was not saved.") : t(problem instanceof Error ? problem.message : String(problem)));
     } finally {
       setSavingLab(false);
     }
@@ -63,9 +79,8 @@ export default function BatchDetails() {
   const showLabForm = batch.status === "Completed" && (batch.labResult === "Pending" || changingLab);
 
   const running = batch.status === "In Progress";
-  const timeline: Array<[string, string]> = batch.timeline?.length
-    ? batch.timeline.map((event) => [t(event.label), new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })])
-    : demoTimeline.map(([label, time]) => [t(label), time]);
+  const timeline: Array<[string, string]> = (batch.timeline ?? []).map((event) =>
+    [t(event.label), new Date(event.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })]);
 
   return (
     <div className="space-y-6">
@@ -75,7 +90,7 @@ export default function BatchDetails() {
           <div>
             <div className="section-kicker">{t("Batch record")}</div>
             <Heading as="h1" className="mt-2 text-3xl font-bold">{batch.id}</Heading>
-            <p className="mt-2 text-sm text-gray-500">{t(running ? "Started {date}" : "Completed {date}", { date: new Date(batch.date).toLocaleDateString() })} · {fromBackend ? t("Raspberry Pi record") : t("Prototype record")}</p>
+            <p className="mt-2 text-sm text-gray-500">{t(running ? "Started {date}" : "Completed {date}", { date: new Date(batch.date).toLocaleDateString() })} · {t("Raspberry Pi record")}</p>
           </div>
           <Status tone={batchTone(batch.status)}>{t(batch.status)}{running && batch.currentStage ? ` · ${t(batch.currentStage)}` : ""}</Status>
         </div>
@@ -138,6 +153,7 @@ export default function BatchDetails() {
         <Card className="p-6">
           <Heading as="h2" className="text-lg font-semibold">{t("Batch Timeline")}</Heading>
           <div className="mt-6">
+            {timeline.length === 0 && <p className="text-sm text-gray-500">{t("No timeline events recorded for this batch.")}</p>}
             {timeline.map(([label, time], index) => (
               <div key={`${index}-${label}`} className="relative flex gap-4 pb-6 last:pb-0">
                 {index < timeline.length - 1 && <div className="absolute left-[7px] top-4 h-full w-px bg-green-500/20" />}

@@ -167,6 +167,10 @@ class Settings(CamelModel):
             raise ValueError("methanolRemovalTime must be between 5 and 30 min.")
         if not 1 <= self.contact_time <= 60:
             raise ValueError("contactTime must be between 1 and 60 min.")
+        if not 1 <= self.separation_time <= 180:
+            raise ValueError("separationTime must be between 1 and 180 min.")
+        if self.separation_speed <= 0:
+            raise ValueError("separationSpeed must be more than 0 RPM.")
         if not 0 <= self.settling_time <= 60:
             raise ValueError("settlingTime must be between 0 and 60 min.")
         if not 30 <= self.max_drain_temperature <= 85:
@@ -192,7 +196,7 @@ class Settings(CamelModel):
         return sorted(set(values))
 
 
-# ---------- batches (same fields as DemoBatch, plus a few backend extras) ----------
+# ---------- batches (same fields as BatchData on the website, plus a few backend extras) ----------
 class Materials(CamelModel):
     oil_l: float
     methanol_l: float
@@ -362,6 +366,10 @@ class StageStart(CamelModel):
     current: Optional[WholeNumber] = None    # A, the power supply's current limit
     oil_mass_g: Optional[float] = None  # measured oil; sets the adsorbent amount and the low-output check
     adsorbent: Optional[Adsorbent] = None   # the batch's dry wash adsorbent (used when purification starts by itself)
+    # the batch's separation (Volume & Parameters): sent with the Separation start, and with the
+    # Transesterification start for the separation that starts by itself after it
+    separation_time: Optional[WholeNumber] = None    # minutes the centrifuge runs
+    separation_speed: Optional[WholeNumber] = None   # centrifuge RPM (set speed, open loop)
 
 
 class PurificationStart(CamelModel):
@@ -371,35 +379,19 @@ class PurificationStart(CamelModel):
     adsorbent: Optional[Adsorbent] = None   # else the one sent with the batch's stages, else defaultAdsorbent
 
 
-class DemoOilIn(CamelModel):
-    volume_ml: float = Field(gt=0, le=2000)
-
-
-class DemoAddIn(CamelModel):
-    """Demo mode: put something on a simulated load cell (e.g. acetone poured into the reactor)."""
-    place: Literal["reactor", "purificationTank"] = "reactor"
-    grams: float = Field(gt=0, le=3000)
-
-
 class PumpStart(CamelModel):
-    """Load one dose with a dosing pump. The pump stops when the reactor load cell has risen by
-    target_g (or, without a load cell, after volume_ml at the pump's rate)."""
-    pump: Literal["catalyst", "acid"]
-    target_g: float = Field(gt=0, le=2500)
-    volume_ml: float = Field(gt=0, le=3000)
+    """Switch on the oil pump or a dispenser (pump A / B) to empty its container, which the operator
+    has filled with the computed amount (target_g / volume_ml, for the record). It runs until the
+    operator presses Done (/process/pump/finish) or Stop."""
+    pump: Literal["catalyst", "acid", "oil"]
+    target_g: float = Field(gt=0, le=6000)
+    volume_ml: float = Field(gt=0, le=6000)
     batch_id: Optional[str] = None
     stage: Optional[str] = None
 
 
-class DrainStart(CamelModel):
-    """Open a transfer outlet by hand and go on to the next process (when it didn't open by itself).
-    It stays open until the batch is complete."""
-    valve: Literal["reactor_outlet", "centrifuge_outlet"]
-    batch_id: Optional[str] = None
-
-
 class PumpIn(CamelModel):
-    name: Literal["catalyst", "acid"]
+    name: Literal["catalyst", "acid", "oil"]
     on: bool
 
 
@@ -415,3 +407,8 @@ class ValveIn(CamelModel):
 class MotorIn(CamelModel):
     name: str
     duty: float = Field(ge=0, le=1)
+
+
+class LoadCellCalibrateIn(CamelModel):
+    """Settings -> Hardware: the known weight now on the load cell, in grams."""
+    grams: float = Field(gt=0, le=100_000)

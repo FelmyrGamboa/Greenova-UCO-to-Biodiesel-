@@ -12,15 +12,14 @@ Wants=network-online.target
 [Service]
 User=__USER__
 WorkingDirectory=__BACKEND__
-# Demo mode (simulated process, no physical outputs). Use this until wiring and interlocks
-# are finalized and bench-tested. The website is still served live on the Pi over Wi-Fi.
+# The website drives the real machine (hardware.toml: the ESP32 controller on USB + the Pi's
+# centrifuge and load cell). There is no demo mode.
 # The MySQL login defaults to greenova@localhost (greenova_db_ver2.sql); override it in __BACKEND__/.env.
-Environment=GREENOVA_MOCK=1
 ExecStart=__BACKEND__/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 # Also restarts when MySQL wasn't reachable yet at boot.
 Restart=on-failure
 RestartSec=5
-# If later configured for hardware mode, the backend shutdown handler must switch outputs off.
+# Time for the shutdown handler to switch every output off (the ESP32 also stops by itself within 5 s).
 TimeoutStopSec=15
 
 [Install]

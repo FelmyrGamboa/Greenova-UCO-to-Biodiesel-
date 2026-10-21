@@ -1,8 +1,8 @@
-"""Greenova backend. Start it from the backend folder with any of:
+"""Greenova backend, on the Raspberry Pi wired to the machine (ESP32 on USB, centrifuge, load cell).
+Normally the greenova service runs it (setup-pi.sh). By hand, from the backend folder:
     python main.py                                (simplest: uses .venv by itself, restarts on edits)
     python -m uvicorn app.main:app --reload       (development, restarts when you edit the code)
     python -m app.main                            (or: python app/main.py)
-    start-backend.bat                             (Windows: also installs the packages the first time)
 """
 if __name__ == "__main__" and not __package__:
     # Started as "python app/main.py": make the "from . import ..." lines below work.
@@ -22,18 +22,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import config, db
-from .api import auto_start_purification, router, stop_transfers
+from .api import auto_start_purification, emergency_stop_all, machine_active, router, stop_transfers
 from .hardware import create_hardware
 from .purification import MAXIMUM_TEMPERATURE_C, PurificationRunner
 from .stages import StageRunner
-from .transfers import DrainRunner, PumpRunner
+from .transfers import PumpRunner
 
 log = logging.getLogger("greenova")
 
 
 async def sensor_loop(app: FastAPI) -> None:
     """Reads the sensors every second and runs the heater and electrode watchdog."""
-    interval = 1.0 / config.TIME_SCALE
+    interval = 1.0 / getattr(app.state.hw, "time_scale", 1.0)   # 1 s (the tests' simulated machine runs faster)
     while True:
         try:
             await asyncio.to_thread(app.state.hw.refresh)
@@ -42,6 +42,14 @@ async def sensor_loop(app: FastAPI) -> None:
             if alarm:
                 app.state.alarm = alarm
                 log.warning(alarm)
+            # ESP32 controller lost (cable, power, reset) or an output that didn't follow its command:
+            # stop every process and switch everything off. The ESP32's own 5 s timers already stop
+            # its outputs when the Pi can't reach it.
+            fault = app.state.hw.link_fault
+            if fault and machine_active(app):
+                log.error("%s: stopping every process", fault)
+                await emergency_stop_all(app, fault)
+                app.state.alarm = f"{fault}. Every process was stopped and every output switched off."
             auto_start_purification(app)
         except Exception:
             log.exception("Sensor loop error")
@@ -65,15 +73,15 @@ async def lifespan(app: FastAPI):
         raise
     app.state.hw = create_hardware()
     app.state.hw.all_off()                       # always start in the safe state
-    app.state.purification = PurificationRunner(app.state.hw, config.TIME_SCALE)
-    app.state.stage = StageRunner(app.state.hw, config.TIME_SCALE)
-    app.state.pump = PumpRunner(app.state.hw, config.TIME_SCALE)     # dosing pumps A and B
-    app.state.drain = DrainRunner(app.state.hw, config.TIME_SCALE)   # reactor and centrifuge outlets
+    scale = getattr(app.state.hw, "time_scale", 1.0)   # 1 on the machine (only the tests' simulator runs faster)
+    app.state.purification = PurificationRunner(app.state.hw, scale)
+    app.state.stage = StageRunner(app.state.hw, scale)      # the reaction stages and separation
+    app.state.pump = PumpRunner(app.state.hw, scale)        # oil pump, pumps A and B (stopped by the operator)
     app.state.records = {}                       # measurements for batches not saved yet
     app.state.alarm = None
     app.state.purification_armed = None          # batch waiting to start purification by itself
     task = asyncio.create_task(sensor_loop(app))
-    log.info("Greenova backend started (%s mode)", "demo" if config.MOCK else "hardware")
+    log.info("Greenova backend started (%s outputs)", config.actuator_backend(config.HARDWARE))
     yield
     await stop_transfers(app, "backend shutting down")
     await app.state.purification.abort("backend shutting down")

@@ -17,7 +17,7 @@ import {
   YAxis,
 } from "recharts";
 import { batchTone, Card, Heading, Metric, SelectField, Status } from "../components/ui";
-import { ffaBoundaries, formatFfa, type DemoBatch } from "../lib/greenovaData";
+import { ffaBoundaries, formatFfa, type BatchData } from "../lib/greenovaData";
 import { useBatches } from "../lib/api";
 import { useT, type TFunction } from "../lib/i18n";
 
@@ -101,7 +101,7 @@ function inRange(ffa: number, range: FfaRange) {
   return ffa >= range.min && (range.max === null || ffa < range.max);
 }
 
-function parameterSignature(batch: DemoBatch) {
+function parameterSignature(batch: BatchData) {
   return [
     batch.esterificationRun ? batch.esterificationVoltage ?? 20 : "none",
     batch.esterificationRun ? batch.esterificationTime ?? 120 : "none",
@@ -113,7 +113,7 @@ function parameterSignature(batch: DemoBatch) {
   ].join("|");
 }
 
-function parameterDescription(t: TFunction, batch?: DemoBatch) {
+function parameterDescription(t: TFunction, batch?: BatchData) {
   if (!batch) return t("Using defaults");
   const esterification = batch.esterificationRun
     ? `${t("Esterification")} ${batch.esterificationVoltage ?? 20} V · ${batch.esterificationTime ?? 120} min · ${batch.esterificationStirring ?? 500} RPM · ${t("2 stages")}`
@@ -121,11 +121,11 @@ function parameterDescription(t: TFunction, batch?: DemoBatch) {
   return `${esterification}; ${t("Transesterification")} ${batch.voltage ?? 30} V · ${batch.reactionTime} min · ${batch.stirringSpeed} RPM · ${batch.methanolRatio ?? 7}:1`;
 }
 
-function buildRangeRows(tested: DemoBatch[], settings: AnalyticsSettings) {
+function buildRangeRows(tested: BatchData[], settings: AnalyticsSettings) {
   return settings.ranges.map((range) => {
     const rangeBatches = tested.filter((batch) => inRange(batch.ffa, range));
     const passed = rangeBatches.filter((batch) => batch.labResult === "Passed");
-    const groups = new Map<string, DemoBatch[]>();
+    const groups = new Map<string, BatchData[]>();
     passed.forEach((batch) => {
       const signature = parameterSignature(batch);
       groups.set(signature, [...(groups.get(signature) || []), batch]);
@@ -161,7 +161,7 @@ function buildRangeRows(tested: DemoBatch[], settings: AnalyticsSettings) {
   });
 }
 
-function calculateCostPerLiter(batch: DemoBatch, settings: AnalyticsSettings) {
+function calculateCostPerLiter(batch: BatchData, settings: AnalyticsSettings) {
   if (!batch.materials || !batch.biodieselOutputMl || batch.biodieselOutputMl <= 0) return null;
   const materialCost =
     batch.materials.oilL * settings.prices.oil +
@@ -181,7 +181,7 @@ function ChartTooltip({
   label,
 }: {
   active?: boolean;
-  payload?: Array<{ name: string; value: number; unit?: string; payload?: DemoBatch }>;
+  payload?: Array<{ name: string; value: number; unit?: string; payload?: BatchData }>;
   label?: string;
 }) {
   const t = useT();
@@ -196,7 +196,7 @@ function ChartTooltip({
   );
 }
 
-function ResultMarker(props: { cx?: number; cy?: number; payload?: DemoBatch }) {
+function ResultMarker(props: { cx?: number; cy?: number; payload?: BatchData }) {
   const { cx = 0, cy = 0, payload } = props;
   const passed = payload?.labResult === "Passed";
   return <circle cx={cx} cy={cy} r={5} fill={passed ? chartColors.green : "transparent"} stroke={passed ? chartColors.green : chartColors.red} strokeWidth={2} />;
@@ -257,17 +257,17 @@ export default function BatchHistory() {
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Card className="p-5"><Metric label={t("Total batches")} value={batches.length} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
+        <Card className="p-5"><Metric label={t("Total batches")} value={batches.length} sub={source === "offline" ? t("Raspberry Pi offline") : t("Raspberry Pi records")} /></Card>
         <Card className="p-5"><Metric label={t("Completion rate")} value={`${completionRate.toFixed(1)}%`} sub={t("{done} of {total} completed", { done: completed.length, total: finished.length })} accent /></Card>
         <Card className="p-5"><Metric label={t("Lab pass rate")} value={labPassRate === null ? "—" : `${labPassRate.toFixed(1)}%`} sub={tested.length ? t("{passed} of {tested} tested", { passed: passed.length, tested: tested.length }) : t("No lab results yet")} accent={labPassRate !== null} /></Card>
-        <Card className="p-5"><Metric label={t("Average yield")} value={`${(completed.reduce((sum, item) => sum + item.yield, 0) / Math.max(completed.length, 1)).toFixed(1)}%`} sub={source === "backend" ? t("Raspberry Pi records") : t("Sample prototype data")} /></Card>
+        <Card className="p-5"><Metric label={t("Average yield")} value={`${(completed.reduce((sum, item) => sum + item.yield, 0) / Math.max(completed.length, 1)).toFixed(1)}%`} sub={source === "offline" ? t("Raspberry Pi offline") : t("Raspberry Pi records")} /></Card>
       </div>
 
       {tab === "history" ? (
         <Card className="overflow-hidden">
           <div className="border-b border-white/[0.06] px-6 py-5">
             <Heading as="h2" className="text-lg font-semibold">{t("All batches")}</Heading>
-            <p className="mt-1 text-xs text-gray-600">{source === "backend" ? t("Stored on the Raspberry Pi") : t("Locally stored prototype records")}</p>
+            <p className="mt-1 text-xs text-gray-600">{source === "offline" ? t("The Raspberry Pi can't be reached: the batches show again when it is connected.") : t("Stored on the Raspberry Pi")}</p>
           </div>
           <div className="overflow-x-auto">
             <table className="gv-table min-w-[1080px]">

@@ -1,18 +1,21 @@
 # Greenova Website
 
-This is the Figma Make website, connected to the Greenova FastAPI backend. When the backend can't be reached, the website still works on its own sample data, as before.
+This is the Figma Make website for the Greenova machine. It always works with the Greenova backend on the Raspberry Pi that drives the machine (the ESP32 controller and the Pi's centrifuge and load cell). There is no demo mode and no sample data: when the Pi can't be reached, the website says so.
+
+On the machine you don't run this folder at all: build it once (`npm run build`) and the backend on the Pi serves `dist` at `http://<pi-address>:8000` (section "Put it on the Raspberry Pi"). The steps below are for changing the website on a laptop.
 
 ## Run it (Windows)
 
-You need **Node.js 22** (from nodejs.org). Start the backend first. See `backend/README.md`, section 1.
-
-Double-click `start-website.bat`, or in Command Prompt:
+You need **Node.js 22** (from nodejs.org) and the Raspberry Pi running the backend on the same network. Point the website at the Pi, then start it (Command Prompt):
 
 ```bat
 cd frontend
+set GREENOVA_API=http://192.168.1.50:8000
 npm install
 npm run dev
 ```
+
+(Use the Pi's address; in PowerShell: `$env:GREENOVA_API="http://192.168.1.50:8000"`.) `start-website.bat` does the same once `GREENOVA_API` is set.
 
 `npm install` is only needed the first time. Then open **http://localhost:8443**.
 
@@ -20,7 +23,7 @@ npm run dev
 
 The phone and this computer must be on the same Wi-Fi.
 
-1. Start the backend (`python main.py`) and the website (`npm run dev`).
+1. Start the website (`npm run dev`, with `GREENOVA_API` pointing at the Pi).
 2. Scan the QR code that `npm run dev` prints in its window. You can also click **Open on phone** at the bottom of the sidebar, which shows the same QR code.
 3. The address looks like `http://192.168.1.23:8443`. Your computer's number will be different.
 
@@ -41,11 +44,7 @@ All text goes through `t()` from `src/lib/i18n.tsx`, with the English text as th
 
 Switch with the Light / Dark buttons at the bottom of the sidebar, or in **Settings → Interface theme**. The choice is remembered in the browser. All colors are CSS variables in `src/index.css` (one block for dark, one for light), so a color changes everywhere when you edit it there. The landing page always stays dark.
 
-The dev server forwards every `/api` request to the backend at `http://localhost:8000`. To use a backend on the Raspberry Pi instead, run this before `npm run dev`:
-
-```bat
-set GREENOVA_API=http://192.168.1.50:8000
-```
+The dev server forwards every `/api` request to `GREENOVA_API` (default `http://localhost:8000`, i.e. when you run `npm run dev` on the Pi itself).
 
 ## What the System badge means
 
@@ -53,9 +52,9 @@ The badge is at the bottom of the sidebar.
 
 | Badge | Meaning |
 |---|---|
-| **Backend · demo** | The backend is running in demo mode, so the machine is simulated |
-| **Connected** | The backend is running on the Pi with the real hardware |
-| **Local demo** | The backend isn't reachable, so the website uses its own sample data |
+| **Connected** | The Raspberry Pi answers: the website drives the real machine |
+| **Connecting…** | The page has just opened |
+| **Pi offline** | The Pi can't be reached: the Process page says so and nothing can be started (a running batch carries on on the Pi) |
 
 ## What is connected
 
@@ -63,14 +62,14 @@ The badge is at the bottom of the sidebar.
 |---|---|
 | All pages | Settings are loaded at startup. Live readings come once per second over `/api/ws/live`. A red banner shows safety alarms. |
 | Dashboard | The batches, the current batch and stage, and the device status |
-| Process | Batch ID, System Status tiles, the live reactor load cell and temperature, and recommended parameters. **Whole numbers only** for every input (FFA, volume, voltage, current 1–2 A, time, stirring). **FFA ≤ 3%** goes straight to transesterification; above 3% gets the uniform first esterification dose (for 10% FFA) and an FFA re-check. A post-esterification re-check of ≤ 3% is accepted; above 3% triggers another stage. FFA input is capped at 5%; for a darkest-color strip (5% or more), use the checkbox instead of typing a higher value. The calculator shows the **dry wash adsorbent**, Magnesol (oil volume × 0.0092 g) or bentonite (× 0.0184 g), chosen per batch. Each reaction stage's pump loads its dose by itself and the stage starts once the dose and acetone are in. **Default mode:** each transfer outlet closes after its configured timer, then the next process starts. **Optional manual-drain mode:** check “Keep transfer outlet open until flow stops” before starting the process; the reactor outlet after transesterification and the centrifuge outlet after separation stay open until the operator confirms flow has stopped. The outlet then closes before the next process. A 30-minute safety timeout faults and closes the valve if no confirmation arrives. The purification outlet behavior is unchanged. The operator only adds the adsorbent when asked. Without the backend, the same sequence runs as a local demonstration. Full description: `docs/WEBSITE_GUIDE.md`. |
+| Process | Batch ID, System Status tiles, live readings and recommended parameters. **Whole numbers only** for every input. **FFA ≤ 3%** goes straight to transesterification; above 3% gets the uniform first esterification dose and an FFA re-check. Volume & Parameters also sets the batch's **separation time and centrifuge speed**. The **oil pump and the dispensers** switch on by themselves on their step and run until the operator presses **Done** (the container, filled with the computed amount, is empty); then the optional acetone (**Acetone added** / **Continue without acetone**) and the reaction starts by itself. After transesterification: 1 min settle, then the reactor pump, the centrifuge and pumpin together for the separation time; then purification by itself (87–90 °C methanol removal, Magnesol, contact, 1 min settle, valve + pumpout until the output is stable for 30 s). Full description: `docs/WEBSITE_GUIDE.md`. |
 | Batch History | The batches and analytics, from the Pi's records |
 | Batch Details | The record and its timeline. Lab results are saved to the Pi. |
-| Settings | Saving writes to the Pi (whole numbers only). Device Status comes from the Pi. Purification: methanol removal, contact and settling times, max drain temperature, Magnesol and bentonite doses, default adsorbent. Esterification and Dosing: drain times (centrifuge 2 min) and **After each drain** (go on by itself, or wait for Start). |
+| Settings | Saving writes to the Pi (whole numbers only; not possible while it is offline). Device Status and Hardware come from the Pi. Default separation time and centrifuge speed; purification times, doses and default adsorbent. |
 
 The connection code:
 
-- `src/lib/api.ts`: all backend calls, plus the fallback to local data.
+- `src/lib/api.ts`: all backend calls (no local fallback).
 - `src/contexts/LiveContext.tsx`: live readings.
 - `vite.config.ts`: the `/api` forwarding.
 

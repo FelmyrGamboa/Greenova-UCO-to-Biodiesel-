@@ -1,54 +1,84 @@
 # Supplied Raspberry Pi / ESP32 wiring map
 
-This note records the GPIO assignments in the operator-supplied Raspberry Pi and ESP32 sketches. It does **not** mean the current Greenova backend is already driving these pins: the present `PiHardware` implementation still drives most process outputs directly from Pi GPIO, while the `[actuators].backend = "esp32"` configuration is not yet connected to a hybrid ESP32/Pi driver. Keep `GREENOVA_MOCK=1` until the controller mapping and interlocks have been integrated and bench-tested.
+This records the wiring in the operator-supplied Pi control panel (`app.py`, `config.json`) and ESP32
+sketch (`esp32_process_control.ino`), and how the Greenova backend uses it (`[actuators] backend =
+"esp32"`, the default; see `RASPBERRY_PI_SETUP.md`). There is no demo mode: the website always drives
+this machine. The sketch is in
+`firmware/esp32_process_control/`, unchanged. Greenova replaces the Flask control panel.
 
-## Raspberry Pi (BCM numbering)
+## Raspberry Pi (BCM numbering), driven by the Greenova backend
 
-| Device | BCM GPIO |
-|---|---:|
-| BTS7960 `L_EN` | 23 |
-| BTS7960 `R_EN` | 24 |
-| BTS7960 `LPWM` | 25 |
-| BTS7960 `RPWM` | 21 |
-| HX711 `DT` | 17 |
-| HX711 `SCK` | 27 |
+| Device | BCM GPIO | hardware.toml |
+|---|---:|---|
+| BTS7960 `L_EN` | 23 | `[centrifuge] l_en` |
+| BTS7960 `R_EN` | 24 | `[centrifuge] r_en` |
+| BTS7960 `LPWM` | 25 | `[centrifuge] lpwm` |
+| BTS7960 `RPWM` | 21 | `[centrifuge] rpwm` |
+| HX711 `DT` | 17 | `[load_cells.output] data_pin` |
+| HX711 `SCK` | 27 | `[load_cells.output] clock_pin` |
 
-The supplied Pi sketch controls the centrifuge locally through the BTS7960 and reads one HX711 load cell. The Greenova backend currently expects both reactor and output-container load cells; no second HX711 pin assignment was included in the supplied sketch.
+Centrifuge: open loop, 0–2500 RPM (`max_rpm`), PWM 1 kHz on RPWM (forward), 3 s soft start and stop,
+as in the control panel. Load cell: the control panel's calibration (`offset` 41028.54,
+`calibration_factor` 145759) is used as the starting point; that factor is counts per **kg**, so
+Greenova's `scale` (counts per gram) is 145.759. Re-calibrate from Settings → Hardware.
 
-### Pi GPIO conflicts that must be resolved
+The supplied wiring has one HX711. Greenova uses it as the **output** load cell (purification ends on
+its stable reading). The reactor load cell is optional (suggested DT GPIO5 / SCK GPIO6) and not
+needed: the operator measures the oil and each premix into its container, and the oil pump and the
+dispensers run until the operator presses Done.
 
-- The supplied HX711 `DT=17` conflicts with `backend/app/strip_reader.py`'s `LED_PIN = 17` for the strip reader.
-- The supplied BTS7960 pins 23, 24 and 25 conflict with the current `hardware.example.toml` defaults for heater relay, purification outlet valve and electrode relay. GPIO21 is also a default optional RPM input.
-- Because of these conflicts, do not simply copy the supplied Pi pin numbers into `hardware.toml` while using the current direct-GPIO output driver. The code needs the intended hybrid driver (ESP32 process outputs, Pi centrifuge/HX711) and conflict-free pin assignments first.
+Open loop: there are no RPM sensors, so the centrifuge and the mixers run at their set speed and the
+website shows that speed as the RPM reading (the centrifuge speed is set per batch, at most 2500 RPM).
 
-## ESP32-WROOM-32
+The FFA colour-sensor strip reader (TCS34725) is not fitted, so it was removed; the FFA test strip
+is read by eye and entered on the website. The older all-on-the-Pi defaults (heater relay 23,
+electrode relay 25 ...) are used only with `backend = "gpio"`.
 
-### 8-channel relay module (from the supplied sketch)
+## ESP32-WROOM-32 (`esp32_process_control.ino`)
 
-| Relay channel | Sketch device name | ESP32 GPIO |
-|---|---|---:|
-| IN8 | `dispenser1` | 22 |
-| IN7 | `dispenser2` | 21 |
-| IN6 | `reactorpump` | 19 |
-| IN5 | `pumpin` | 18 |
-| IN4 | `oil` | 25 |
-| IN3 | `pumpout` | 26 |
-| IN2 | `valve` | 27 |
-| IN1 | `electrode` | 13 |
+| Relay channel | Device id | ESP32 GPIO | Greenova job (default `[esp32.devices]`) |
+|---|---|---:|---|
+| IN8 | `dispenser1` | 22 | Pump A: NaOH/KOH + methanol (transesterification dose, until Done) |
+| IN7 | `dispenser2` | 21 | Pump B: H₂SO₄ + methanol (esterification dose, until Done) |
+| IN6 | `reactorpump` | 19 | Reactor pump (reactor → centrifuge), during separation |
+| IN5 | `pumpin` | 18 | Pumpin (centrifuge → purifier), during separation |
+| IN4 | `oil` | 25 | Oil pump (Oil Loading, until Done) |
+| IN3 | `pumpout` | 26 | Purification outlet, with `valve`: purifier → output container |
+| IN2 | `valve` | 27 | Purification outlet: opens after contact and the 1 min settle |
+| IN1 | `electrode` | 13 | Electrode power |
+| Heater relay | `heater` | 5 | Immersion heater |
+| L298N ENB / IN3 / IN4 | `mixer1` | 16 / 23 / 17 | Reactor stirrer |
+| L298N ENA / IN1 / IN2 | `mixer2` | 32 / 33 / 14 | Dry wash stirrer |
+| DS18B20 | (temperature) | 4 | Temperature (reaction cutoff and purification heater) |
 
-### Other ESP32 connections
+Relays and the heater relay are active-LOW in this sketch (`RELAY_ACTIVE_LOW` / `HEATER_ACTIVE_LOW`
+true); every output is off at boot. Mixer speed is in RPM, 0–1544 (`MAX_RPM`), open loop.
 
-| Device | Pins |
-|---|---|
-| Separate heater relay input | GPIO15 |
-| DS18B20 data | GPIO5 (4.7 kΩ pull-up to 3.3 V is required) |
-| L298N Mixer 1 | `IN3=23`, `IN4=17`, `ENB=16` |
-| L298N Mixer 2 | `IN1=33`, `IN2=14`, `ENA=32` |
+Changes from the earlier (Oct 16) pin list: the heater relay moved from GPIO15 to GPIO5, and the
+DS18B20 from GPIO5 to GPIO4 (one pin can't do both); the relays are now active-LOW.
 
-The supplied sketch says relay inputs and the heater relay are active-HIGH (`RELAY_ACTIVE_LOW=false`, `HEATER_ACTIVE_LOW=false`). Verify this with the heater and electrode power physically disconnected before changing relay polarity.
+## Job mapping
 
-## Greenova role mapping still needed before live use
+Confirmed by the operator (2026-10-20): `oil` dispenses the oil (automated oil input), `pumpin` pumps
+from the centrifuge to the purifier, `pumpout` from the purifier to the output container, and
+`valve` opens after purification. `reactorpump` (reactor → centrifuge) and which dispenser holds
+which premix are the remaining assumptions: check them with `python -m app.hwtest outputs` (heater
+and electrode supply unplugged) and change `[esp32.devices]` in `backend/hardware.toml` if needed.
 
-The supplied ESP32 sketch names **one** generic `valve` output on GPIO27, but Greenova's automatic process requires independently controlled reactor outlet, centrifuge outlet and purification outlet valves. It also names six pump/dispenser relay outputs, whose chemical/process roles do not map unambiguously to Greenova's two dosing pumps. Do not guess those assignments. Confirm which physical relay channel drives each Greenova function, including whether each valve is a single relay/solenoid or a motorized open/close actuator.
+When each output runs (2026-10-21):
+- `oil`, `dispenser1`, `dispenser2`: switched on when their step opens; off when the operator presses
+  Done (a 30-minute limit stops a forgotten pump with a fault).
+- `reactorpump`, the centrifuge and `pumpin`: together, after transesterification and a 1-minute
+  settle in the reactor, for the batch's separation time (Volume & Parameters); all three stop then.
+- `heater`: purification heating to 90 °C, then 87–90 °C during methanol removal.
+- `mixer2`: heating, methanol removal, the Magnesol prompt and contact (200 RPM); off for the
+  1-minute settle and the drain.
+- `valve` + `pumpout`: after the settle, until the output load cell is stable for 30 s.
 
-The supplied pinout also places the centrifuge motor on the Pi while the earlier Greenova firmware scaffold was written for ESP32 motor control. The firmware/backend protocol and watchdog must be aligned with the chosen split-controller architecture before real outputs are enabled.
+## Protocol
+
+USB serial, 115200 baud, the sketch's own text commands: `<device> on [seconds]`, `<device> off`,
+`mixerN on <seconds> <rpm>`, `alloff`, and `json` (answer: one `STATUS {...}` line with the
+temperature and every output). Greenova switches outputs on with a 5 s timer and refreshes it every
+second (dead-man), asks for `json` every second, and treats 3.5 s without an answer as a controller
+fault that stops every process.

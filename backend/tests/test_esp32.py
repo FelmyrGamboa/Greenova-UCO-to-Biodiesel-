@@ -1,0 +1,617 @@
+"""ESP32 hardware mode with a simulated ESP32 on a fake serial port and fake lgpio, so the real
+machine's code runs on any computer.
+
+FakeEsp32 follows firmware/esp32_process_control/esp32_process_control.ino: the same devices, the
+same text commands ("heater on 5", "mixer2 on 5 200", "valve off", "alloff", "json"), its timed ON
+(auto-off after the seconds), and the one-line STATUS {...} answer to "json"."""
+import json
+import sys
+import threading
+import time
+import types
+from pathlib import Path
+
+import pytest
+
+from app import config
+
+DEVICES = [("dispenser1", "Dispenser 1", "relay"), ("dispenser2", "Dispenser 2", "relay"),
+           ("reactorpump", "Reactor Pump", "relay"), ("pumpin", "Pump In", "relay"), ("oil", "Oil", "relay"),
+           ("pumpout", "Pump Out", "relay"), ("valve", "Valve", "relay"), ("electrode", "Electrode", "relay"),
+           ("heater", "Heater", "relay"), ("mixer1", "Mixer 1", "motor"), ("mixer2", "Mixer 2", "motor")]
+
+
+class FakeEsp32:
+    """The ESP32 sketch behind a pyserial-like object."""
+    MAX_RPM = 1544
+
+    def __init__(self, temp=31.25):
+        self.temp = temp
+        self.devs = {i: {"id": i, "label": label, "type": kind, "on": False, "timed": False, "start": 0.0,
+                         "dur": 0.0, "rpm": self.MAX_RPM if kind == "motor" else 0} for i, label, kind in DEVICES}
+        self.rx = bytearray()
+        self.lines: list[str] = []          # every command line received
+        self.silent = False                 # True: the ESP32 stops answering (hung / reset)
+        self.broken = False                 # True: the USB cable is unplugged
+        self.ignore_on: set = set()         # devices whose "on" doesn't take (e.g. a garbled command)
+        self.closed = False
+        self._lock = threading.Lock()
+
+    # --- pyserial-like ---
+    @property
+    def in_waiting(self):
+        self._tick()
+        return len(self.rx)
+
+    def read(self, n=1):
+        if self.broken:
+            raise OSError("device reports readiness to read but returned no data (unplugged?)")
+        self._tick()
+        with self._lock:
+            data = bytes(self.rx[:n])
+            del self.rx[:n]
+        if not data:
+            time.sleep(0.01)
+        return data
+
+    def write(self, data: bytes):
+        if self.broken:
+            raise OSError("write failed: device disconnected")
+        for line in data.decode().splitlines():
+            self._handle(line)
+        return len(data)
+
+    def reset_input_buffer(self):
+        with self._lock:
+            self.rx.clear()
+
+    def close(self):
+        self.closed = True
+
+    # --- the sketch ---
+    def _out(self, text: str) -> None:
+        if not self.silent:
+            with self._lock:
+                self.rx += (text + "\r\n").encode()
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+        for d in self.devs.values():
+            if d["on"] and d["timed"] and now - d["start"] >= d["dur"]:
+                d["on"] = d["timed"] = False
+                self._out(f"[timer] {d['label']} -> OFF")
+
+    def _set(self, d, on, sec=0):
+        d["on"], d["timed"], d["start"], d["dur"] = on, on and sec > 0, time.monotonic(), float(sec)
+        self._out(f"{d['label']} -> {'ON' if on else 'OFF'}" + (f" for {sec} s" if on and sec > 0 else ""))
+
+    def status_json(self) -> str:
+        self._tick()
+        return json.dumps({"maxRpm": self.MAX_RPM, "temp": self.temp, "devices": [
+            {"id": d["id"], "label": d["label"], "type": d["type"], "on": d["on"],
+             "remaining": 0, "rpm": d["rpm"]} for d in self.devs.values()]}, separators=(",", ":"))
+
+    def _handle(self, line: str) -> None:
+        line = line.strip().lower()
+        if not line:
+            return
+        self.lines.append(line)
+        if self.silent:
+            return
+        w = line.split()[:4]
+        if w[0] == "alloff":
+            for d in self.devs.values():
+                self._set(d, False)
+            return
+        if w[0] == "json":
+            self._out("STATUS " + self.status_json())
+            return
+        d = self.devs.get(w[0])
+        if d is None:
+            self._out("Unknown command. Type: help")
+            return
+        if len(w) > 1 and w[1] == "on":
+            if w[0] in self.ignore_on:
+                return
+            sec = max(int(w[2]), 0) if len(w) >= 3 else 0
+            if d["type"] == "motor" and len(w) >= 4:
+                d["rpm"] = min(max(int(w[3]), 0), self.MAX_RPM)
+            self._set(d, True, sec)
+        elif len(w) > 1 and w[1] == "off":
+            self._set(d, False)
+        elif len(w) > 2 and w[1] == "rpm" and d["type"] == "motor":
+            d["rpm"] = min(max(int(w[2]), 0), self.MAX_RPM)
+
+    def on(self, device: str) -> bool:
+        self._tick()
+        return self.devs[device]["on"]
+
+
+class FakeLgpio:
+    """lgpio with two HX711s (output: DT 17 / SCK 27, reactor: DT 5 / SCK 6), the BTS7960 pins and
+    a level switch on GPIO26."""
+    SET_PULL_UP = 32
+
+    def __init__(self):
+        self.raw = {17: 41028 + 145759, 5: 1000}     # 1 kg on the output cell (with the default calibration)
+        self.sck_of = {27: 17, 6: 5}
+        self.edges = {17: 0, 5: 0}
+        self.level = {}
+        self.pwm = {}
+        self.claimed = set()
+        self.freed = set()
+
+    def gpiochip_open(self, n):
+        return n
+
+    def gpiochip_close(self, h):
+        pass
+
+    def gpio_get_chip_info(self, h):
+        return (0, 54, f"gpiochip{h}", "pinctrl-rp1" if h == 0 else "other")
+
+    def gpio_claim_input(self, h, pin, flags=0):
+        self.claimed.add(pin)
+
+    def gpio_claim_output(self, h, pin, level=0):
+        self.claimed.add(pin)
+        self.level[pin] = level
+
+    def gpio_write(self, h, pin, level):
+        self.level[pin] = level
+        dout = self.sck_of.get(pin)
+        if dout is None:
+            return
+        if level == 1:
+            self.edges[dout] = self.edges[dout] + 1 if self.edges[dout] < 25 else 1
+        elif self.edges[dout] == 25:
+            self.edges[dout] = 0
+
+    def gpio_read(self, h, pin):
+        if pin in self.edges:
+            n = self.edges[pin]
+            if n == 0 or n > 24:
+                return 0                             # data ready
+            return (self.raw[pin] & 0xFFFFFF) >> (24 - n) & 1
+        return self.level.get(pin, 1)
+
+    def tx_pwm(self, h, pin, freq, duty, *args):
+        self.pwm[pin] = (freq, duty)
+
+    def gpio_free(self, h, pin):
+        self.freed.add(pin)
+
+
+def wait_until(condition, timeout=3.0, what="condition"):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if condition():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+@pytest.fixture()
+def lg(monkeypatch):
+    fake = FakeLgpio()
+    monkeypatch.setitem(sys.modules, "lgpio", fake)
+    return fake
+
+
+def _cfg(**changes):
+    cfg = config.load_hardware(Path("/nonexistent.toml"))
+    cfg["esp32"]["poll_seconds"] = 0.05
+    cfg["esp32"]["offline_after_seconds"] = 0.4
+    for key in ("reactor", "output"):
+        cfg["load_cells"][key]["cal_seconds"] = 0.3
+    cfg["centrifuge"]["ramp_seconds"] = 0.5
+    for path, value in changes.items():
+        node = cfg
+        keys = path.split(".")
+        for key in keys[:-1]:
+            node = node[key]
+        node[keys[-1]] = value
+    return cfg
+
+
+def _machine(lg, tmp_path, esp=None, **changes):
+    from app.esp32 import Esp32Hardware, Esp32Serial
+    esp = esp or FakeEsp32()
+    link = Esp32Serial("/dev/ttyFAKE", 115200, poll_seconds=0.05, offline_after_seconds=0.4, open_wait_seconds=0,
+                       command_gap_seconds=0, opener=lambda port, baud: esp)
+    hw = Esp32Hardware(_cfg(**changes), link=link, calibration_file=tmp_path / "cal.json")
+    wait_until(lambda: link.online, what="the ESP32 to answer")
+    return hw, esp
+
+
+def test_defaults_match_the_supplied_wiring():
+    hw = config.load_hardware(Path("/nonexistent.toml"))
+    assert config.actuator_backend(hw) == "esp32"
+    assert config.check_hardware(hw) == []
+    pins = dict((what, pin) for pin, what in config.used_pins(hw))
+    assert (pins["centrifuge.l_en"], pins["centrifuge.r_en"], pins["centrifuge.lpwm"], pins["centrifuge.rpwm"]) == (23, 24, 25, 21)
+    assert (pins["load_cells.output.data_pin"], pins["load_cells.output.clock_pin"]) == (17, 27)
+    assert "relays.heater" not in pins                      # the relays are on the ESP32, not the Pi
+    devices = hw["esp32"]["devices"]
+    assert devices["heater"] == "heater" and devices["purification_stirrer"] == "mixer2"
+    # the operator's machine: oil = oil input, pumpin = centrifuge -> purifier,
+    # valve + pumpout = purifier -> output container after purification
+    assert devices["oil_pump"] == "oil" and devices["reactor_outlet"] == "reactorpump"
+    assert devices["centrifuge_outlet"] == "pumpin" and devices["purification_outlet"] == ["valve", "pumpout"]
+
+
+def test_pin_conflicts_in_esp32_mode():
+    cfg = _cfg(**{"centrifuge.l_en": 17})
+    assert any("GPIO17 is used twice" in p for p in config.check_hardware(cfg))
+    cfg = _cfg(**{"level_switch.enabled": True, "level_switch.pin": 27})
+    assert any("GPIO27 is used twice" in p for p in config.check_hardware(cfg))
+    cfg = _cfg(**{"power_supply.control": "serial", "power_supply.port": "/dev/ttyUSB0", "actuators.port": "/dev/ttyUSB0"})
+    assert any("can't share" in p for p in config.check_hardware(cfg))
+
+
+def test_outputs_go_through_the_esp32_with_a_dead_man_timer(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        assert "alloff" in esp.lines                         # a fresh connection starts with everything off
+        r = hw.refresh()
+        assert r["temperature"] == 31.2 and r["controllerOnline"] is True and r["controllerError"] is None
+        assert r["purificationStirrerRpm"] == 0 and r["stirrerRpm"] == 0
+
+        # dry wash stirrer at 200 RPM: the ESP32's own RPM scale (MAX_RPM 1544) is used
+        full = hw.full_speed_rpm("purification_stirrer")
+        assert full == 1544
+        hw.set_motor("purification_stirrer", 200 / full)
+        assert "mixer2 on 5 200" in esp.lines and esp.on("mixer2")
+        wait_until(lambda: esp.lines.count("mixer2 on 5 200") >= 3, what="the dead-man refresh")
+
+        hw.set_heater(True)                                  # interlock: only with the stirrer running
+        assert esp.on("heater") and "heater on 5" in esp.lines
+        wait_until(lambda: hw.refresh()["purificationStirrerRpm"] == 200, what="the RPM reading")
+
+        # opening the purification outlet turns the heater off first (interlock in Hardware)
+        hw.set_valve("mesh_bed", True)
+        assert not esp.on("heater") and esp.on("valve") and hw.heater_on is False
+
+        # pumps and the reactor outlet: the interlocks still apply
+        hw.set_valve("mesh_bed", False)
+        hw.set_pump("catalyst", True)
+        assert esp.on("dispenser1")
+        from app.hardware import InterlockError
+        with pytest.raises(InterlockError):
+            hw.set_valve("reactor_outlet", True)
+        assert not esp.on("reactorpump")
+        hw.set_pump("catalyst", False)
+        hw.set_valve("reactor_outlet", True)
+        assert esp.on("reactorpump")
+
+        # an output switched on behind the Pi's back (the ESP32's web page) is switched off again
+        esp._set(esp.devs["heater"], True)
+        wait_until(lambda: not esp.on("heater"), what="the heater to be switched off again")
+
+        hw.all_off()
+        assert esp.lines[-1] == "alloff" or "alloff" in esp.lines[-3:]
+        assert not any(esp.on(d) for d, _, _ in DEVICES)
+        assert hw.link_fault is None
+    finally:
+        hw.close()
+    assert esp.closed
+
+
+def test_esp32_switches_off_by_itself_when_the_pi_stops(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path, **{"esp32.lease_seconds": 1})
+    try:
+        hw.set_motor("purification_stirrer", 0.2)
+        hw.set_heater(True)
+        assert esp.on("heater")
+        time.sleep(1.3)
+        assert esp.on("heater")                              # refreshed every poll: stays on
+        hw.link._stop.set()                                  # the backend stops (crash, cable, Pi off)
+        time.sleep(1.3)
+        assert not esp.on("heater") and not esp.on("mixer2")   # the ESP32's own timer switched them off
+    finally:
+        hw.link._stop.clear()
+        hw.close()
+
+
+def test_lost_link_is_a_fault_and_everything_switches_off(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        hw.set_motor("stirrer", 0.3)
+        hw.set_electrode_power(True)
+        assert hw.any_output_on()
+        esp.silent = True                                    # the ESP32 stops answering
+        wait_until(lambda: hw.link_fault is not None, what="the link fault")
+        assert "offline" in hw.link_fault
+        r = hw.refresh()
+        assert r["temperature"] is None and r["controllerOnline"] is False
+        assert not hw.any_output_on()                        # the Pi's view follows the ESP32's timers
+        from app.hardware import InterlockError
+        with pytest.raises(InterlockError, match="offline"):
+            hw.set_electrode_power(True)
+
+        esp.silent = False                                   # back: no output comes back on by itself
+        wait_until(lambda: hw.link.online, what="the link to come back")
+        wait_until(lambda: not esp.on("electrode") and not esp.on("mixer1"), what="the outputs to go off")
+        assert hw.link_fault is None
+
+        esp.broken = True                                    # unplugged: reconnects when it's back
+        wait_until(lambda: not hw.link.connected, what="the port to drop")
+        esp.broken = False
+        wait_until(lambda: hw.link.online, timeout=5, what="reconnection")
+    finally:
+        hw.close()
+
+
+def test_output_that_does_not_follow_is_a_fault(lg, tmp_path):
+    esp = FakeEsp32()
+    esp.ignore_on.add("dispenser2")
+    hw, _ = _machine(lg, tmp_path, esp)
+    try:
+        hw.set_pump("acid", True)                            # sent, but the ESP32 stays off
+        wait_until(lambda: hw.link_fault is not None, what="the command fault")
+        assert "did not switch" in hw.link_fault and "dispenser2" in hw.link_fault
+        hw.all_off()                                         # the emergency stop clears it
+        assert hw.link_fault is None
+    finally:
+        hw.close()
+
+
+def test_wrong_device_name_is_reported(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path, **{"esp32.devices.heater": "heatr", "esp32.devices.stirrer": "valve"})
+    try:
+        wait_until(lambda: hw.link_fault is not None, what="the configuration fault")
+        assert '"heatr" (no such device' in hw.link_fault and "needs a mixer" in hw.link_fault
+        from app.hardware import InterlockError
+        with pytest.raises(InterlockError, match="hardware.toml"):
+            hw.set_motor("purification_stirrer", 0.2)       # nothing switches on until it's fixed
+        assert not esp.on("mixer2")
+    finally:
+        hw.close()
+
+
+def test_not_fitted_and_time_limited_outputs(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path, **{"esp32.devices.centrifuge_outlet": "",
+                                        "esp32.devices.reactor_outlet": ["reactorpump", "pumpin"],
+                                        "esp32.max_on_seconds": {"reactor_outlet": 1}})
+    try:
+        from app.hardware import InterlockError
+        with pytest.raises(InterlockError, match="no ESP32 output"):
+            hw.set_valve("centrifuge_outlet", True)
+        hw.set_valve("centrifuge_outlet", False)             # off is always fine
+        hw.set_valve("reactor_outlet", True)                 # a transfer pump: runs 1 s, then stops itself
+        assert esp.on("reactorpump") and esp.on("pumpin") and "reactorpump on 1" in esp.lines
+        time.sleep(1.4)
+        assert not esp.on("reactorpump") and not esp.on("pumpin")
+        assert hw.valves["reactor_outlet"] is True and hw.link_fault is None   # no false fault
+        assert esp.lines.count("reactorpump on 1") == 1     # not refreshed
+    finally:
+        hw.close()
+
+
+def test_centrifuge_on_the_pi_ramps_softly(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        assert hw.full_speed_rpm("centrifuge") == 2500
+        hw.set_motor("centrifuge", 1500 / 2500)
+        assert hw.read()["centrifugeRpm"] < 1500             # starts softly
+        wait_until(lambda: hw.refresh()["centrifugeRpm"] == 1500, what="the ramp up")
+        assert lg.pwm[21] == (1000, 60.0)                    # RPWM: 60 % duty at 1 kHz
+        assert lg.level[23] == 1 and lg.level[24] == 1       # L_EN, R_EN
+        assert not hw.rpm_is_measured("centrifugeRpm")       # open loop: the RPM is the set speed
+        hw.set_valve("centrifuge_outlet", True)              # pumpin runs while it spins (separation)
+        assert esp.on("pumpin")
+        hw.set_valve("centrifuge_outlet", False)
+        hw.set_motor("centrifuge", 0)
+        wait_until(lambda: hw.refresh()["centrifugeRpm"] == 0, what="the ramp down")
+        wait_until(lambda: lg.level.get(23) == 0, what="the driver to be disabled")
+    finally:
+        hw.close()
+    assert {21, 23, 24, 25} <= lg.freed
+
+
+def test_load_cell_reading_tare_and_calibrate(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        wait_until(lambda: hw.refresh()["outputWeightG"] is not None, what="a weight")
+        assert hw.refresh()["outputWeightG"] == pytest.approx(1000.0, abs=0.2)
+        assert hw.refresh()["oilMassG"] is None              # no reactor load cell by default
+        assert hw.refresh()["loadCellsFitted"] == {"reactor": False, "output": True}
+        lg.raw[17] = 50_000                                  # empty container
+        time.sleep(0.3)
+        result = hw.tare_load_cell("output")
+        assert result["offset"] == 50_000
+        assert hw.refresh()["outputWeightG"] == 0.0
+        lg.raw[17] = 50_000 + 500 * 210                      # 500 g at 210 counts per gram
+        time.sleep(0.3)
+        result = hw.calibrate_load_cell("output", 500)
+        assert result["scale"] == pytest.approx(210)
+        assert hw.refresh()["outputWeightG"] == pytest.approx(500.0)
+        with pytest.raises(ValueError):
+            hw.tare_load_cell("reactor")
+        saved = json.loads((tmp_path / "cal.json").read_text())
+        assert saved["output"]["offset"] == 50_000 and saved["output"]["scale"] == pytest.approx(210)
+    finally:
+        hw.close()
+    hw2, _ = _machine(lg, tmp_path)                          # the calibration survives a restart
+    try:
+        cell = next(c for c in hw2.load_cells() if c["key"] == "output")
+        assert cell["scale"] == pytest.approx(210) and cell["calibratedAt"]
+    finally:
+        hw2.close()
+
+
+def test_reactor_load_cell_and_level_switch(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path, **{"load_cells.reactor.enabled": True, "load_cells.reactor.offset": 0,
+                                        "load_cells.reactor.scale": 2, "level_switch.enabled": True})
+    try:
+        wait_until(lambda: hw.refresh()["oilMassG"] == 500.0, what="the reactor weight")
+        lg.level[26] = 0                                     # float switch closed: biodiesel covers the heater
+        assert hw.refresh()["heaterSubmerged"] is True
+        lg.level[26] = 1
+        assert hw.refresh()["heaterSubmerged"] is False
+        hw.set_motor("purification_stirrer", 0.2)
+        from app.hardware import InterlockError
+        with pytest.raises(InterlockError, match="level switch"):
+            hw.set_heater(True)
+    finally:
+        hw.close()
+
+
+def test_describe_for_the_website(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        hw.set_motor("stirrer", 0.5)
+        wait_until(lambda: hw.describe()["controller"]["devices"], what="a status")
+        info = hw.describe()
+        assert info["backend"] == "esp32" and info["controller"]["online"] and info["fault"] is None
+        stirrer = next(r for r in info["roles"] if r["role"] == "stirrer")
+        assert stirrer["devices"] == ["mixer1"] and stirrer["on"] and stirrer["rpm"] == 772
+        assert all(d["used"] for d in info["controller"]["devices"])   # every ESP32 output has a job
+        assert info["centrifuge"]["maxRpm"] == 2500
+    finally:
+        hw.close()
+
+
+def test_find_port_skips_the_power_supply(monkeypatch):
+    from app import esp32
+    monkeypatch.setattr(esp32.glob, "glob", lambda pattern: {"/dev/ttyUSB*": ["/dev/ttyUSB0", "/dev/ttyUSB1"]}.get(pattern, []))
+    assert esp32.find_port("auto") == "/dev/ttyUSB0"
+    assert esp32.find_port("auto", exclude=("/dev/ttyUSB0",)) == "/dev/ttyUSB1"
+    assert esp32.find_port("/dev/ttyACM3") == "/dev/ttyACM3"
+
+
+def test_create_hardware_uses_the_esp32_in_hardware_mode(monkeypatch, lg, tmp_path):
+    from app import esp32
+    from app.hardware import create_hardware
+    esp = FakeEsp32()
+    monkeypatch.setattr(config, "HARDWARE", _cfg())
+    monkeypatch.setattr(config, "CALIBRATION_FILE", tmp_path / "cal.json")
+    monkeypatch.setattr(esp32, "_open_pyserial", lambda port, baud: esp)
+    monkeypatch.setattr(esp32, "find_port", lambda setting="auto", exclude=(): "/dev/ttyUSB0")
+    hw = create_hardware()
+    try:
+        assert isinstance(hw, esp32.Esp32Hardware)
+        wait_until(lambda: hw.link.online, timeout=5, what="the ESP32")
+        assert hw.link.port == "/dev/ttyUSB0"
+    finally:
+        hw.close()
+
+
+def test_system_tiles_in_esp32_mode():
+    from app import system
+    reading = {"temperature": 30.0, "oilMassG": None, "outputWeightG": 12.0, "stirrerRpm": 0, "centrifugeRpm": 0,
+               "purificationStirrerRpm": 0, "rpmEstimated": True, "controllerOnline": True, "controllerError": None,
+               "controllerPort": "/dev/ttyUSB0", "loadCellsFitted": {"reactor": False, "output": True},
+               "motorDuty": {}, "pumps": {}, "valves": {}}
+    tiles = {t["label"]: t for t in system.status(reading, {}, {})["tiles"]}
+    assert tiles["Output Controller"]["state"] == "ready"
+    assert "Reactor Load Cell" not in tiles                  # not fitted: no tile (the operator measures)
+    assert tiles["Reactor Stirrer"]["state"] == "ready"
+    reading.update(controllerOnline=False, controllerError="ESP32 controller offline: not connected", stirrerRpm=None)
+    status = system.status(reading, {}, {})
+    tiles = {t["label"]: t for t in status["tiles"]}
+    assert tiles["Output Controller"]["state"] == "fault" and not status["ready"]
+    assert tiles["Reactor Stirrer"]["secondary"].startswith("No reading")
+
+
+def test_a_stage_or_pump_that_cannot_start_leaves_nothing_half_on(lg, tmp_path):
+    """The ESP32 is offline: starting a stage or a dosing pump is refused cleanly (409 on the website)."""
+    import asyncio
+    from app.hardware import InterlockError
+    from app.models import Settings
+    from app.stages import StageRunner
+    from app.transfers import PumpRunner
+    esp = FakeEsp32()
+    hw, _ = _machine(lg, tmp_path, esp)
+    try:
+        esp.silent = True
+        wait_until(lambda: not hw.link.online, what="offline")
+
+        async def run():
+            stage, pump = StageRunner(hw), PumpRunner(hw)
+            with pytest.raises(InterlockError, match="offline"):
+                stage.start("Transesterification", Settings())
+            assert stage.state["state"] == "ready" and not stage.active
+            with pytest.raises(InterlockError):
+                pump.start("catalyst", 50, 50)
+            assert pump.state["phase"] == "idle"
+        asyncio.run(run())
+        assert not hw.any_output_on()
+    finally:
+        hw.close()
+
+
+def test_a_job_with_two_outputs_faults_when_one_does_not_follow(lg, tmp_path):
+    esp = FakeEsp32()
+    esp.ignore_on.add("pumpin")
+    hw, _ = _machine(lg, tmp_path, esp, **{"esp32.devices.reactor_outlet": ["reactorpump", "pumpin"]})
+    try:
+        hw.set_valve("reactor_outlet", True)
+        assert esp.on("reactorpump") and not esp.on("pumpin")
+        wait_until(lambda: hw.link_fault is not None, what="the command fault")
+        assert "(pumpin) on" in hw.link_fault
+    finally:
+        hw.close()
+
+
+def test_the_purification_outlet_is_the_valve_and_pumpout(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        hw.set_valve("centrifuge_outlet", True)
+        assert esp.on("pumpin") and not esp.on("pumpout")
+        hw.set_valve("mesh_bed", True)                       # drain after contact
+        assert esp.on("valve") and esp.on("pumpout") and esp.lines.index("valve on 5") < esp.lines.index("pumpout on 5")
+        hw.all_off()
+        assert not esp.on("valve") and not esp.on("pumpout") and not esp.on("pumpin")
+    finally:
+        hw.close()
+
+
+def test_oil_pump(lg, tmp_path):
+    from app.hardware import InterlockError
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        assert hw.has_oil_pump and set(hw.pumps) == {"catalyst", "acid", "oil"}
+        hw.set_pump("oil", True)
+        assert esp.on("oil") and "oil on 5" in esp.lines
+        with pytest.raises(InterlockError, match="Only one pump"):
+            hw.set_pump("catalyst", True)                    # one pump into the reactor at a time
+        with pytest.raises(InterlockError, match="pump into the reactor is running"):
+            hw.set_valve("reactor_outlet", True)
+        hw.set_pump("oil", False)
+        hw.set_valve("reactor_outlet", True)
+        with pytest.raises(InterlockError, match="reactor pump is emptying it"):
+            hw.set_pump("oil", True)                         # never fill while it is emptied
+        assert not esp.on("oil")
+    finally:
+        hw.close()
+    hw, esp = _machine(lg, tmp_path, **{"esp32.devices.oil_pump": ""})
+    try:
+        assert not hw.has_oil_pump and "oil" not in hw.pumps
+        with pytest.raises(InterlockError, match="no oil pump"):
+            hw.set_pump("oil", True)
+    finally:
+        hw.close()
+
+
+def test_oil_pump_runs_until_the_operator_presses_done(lg, tmp_path):
+    """The oil pump stays on (its 5 s timer refreshed every second) until Done, then goes off."""
+    import asyncio
+    from app.transfers import PumpRunner
+    hw, esp = _machine(lg, tmp_path)
+    try:
+        async def run():
+            runner = PumpRunner(hw, time_scale=20)           # 1 s steps take 50 ms
+            runner.start("oil", 920.0, 1000.0, stage="Oil Loading")
+            assert esp.on("oil")
+            await asyncio.sleep(1.0)                         # 20 simulated seconds: no automatic stop
+            on_before = runner.running and esp.on("oil")
+            runner.finish()
+            while runner.running:
+                await asyncio.sleep(0.02)
+            return on_before, runner.state
+        on_before, st = asyncio.run(run())
+        assert on_before and st["phase"] == "done" and st["deliveredG"] == 920.0
+        assert not esp.on("oil")
+    finally:
+        hw.close()
