@@ -32,6 +32,12 @@ lease_seconds = 5
 poll_seconds = 1.0           # how often the Pi asks for the ESP32's status ("json")
 offline_after_seconds = 3.5  # no status for this long = controller offline -> every process stops
 mixer_max_rpm = 1544         # the sketch's MAX_RPM (the ESP32 reports its own; this is the fallback)
+# Mixers (open loop): the PWM for the lowest speed, so slow speeds still turn the motor (0-254;
+# the sketch's MIN_PWM stays 0). Raise it if a mixer hums but doesn't turn, lower it if slow
+# speeds are too fast. One value for both, or per mixer: mixer_min_pwm = { stirrer = 80, purification_stirrer = 110 }
+# Find it with:  python -m app.hwtest mixer purification_stirrer
+mixer_min_pwm = 90
+mixer_kick_seconds = 1.0     # every start: this long at full speed first, then the set speed
 
 [esp32.devices]
 # Which ESP32 output does which Greenova job. The names are the sketch's device ids:

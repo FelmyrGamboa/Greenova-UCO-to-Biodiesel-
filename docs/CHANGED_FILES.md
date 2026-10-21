@@ -1,5 +1,12 @@
 # Greenova update notes
 
+## 2026-10-21 (6): mixers that turn at low speed; 4-second heater pulses
+
+- **Mixers.** The sketch turns RPM into PWM in a straight line from 0 (`MIN_PWM 0`), so 200 RPM was PWM 33 of 255 and 500 RPM PWM 83: too little for the DC motors behind the L298N, so mixer 1 (reactions) and mixer 2 (methanol removal, contact) didn't turn. Now every mixer start begins with `mixer_kick_seconds` (1 s) at full speed, and the speed is sent so the lowest speed gets `mixer_min_pwm` (default 90 of 255): 200 RPM → PWM 111. Both are in `[esp32]` of `hardware.toml` (one value, or one per mixer); the sketch stays unchanged. The website still shows the set speed. `python -m app.hwtest mixer stirrer|purification_stirrer` (Docker: `bash start-machine.sh --test-mixers`) finds the lowest PWM where each mixer turns.
+- **Heater pulses are 4 seconds** (were 2) during methanol removal; the rest of the rule is the same.
+
+**Files**: `backend/app/esp32.py`, `config.py`, `hwtest.py`, `purification.py`, `api.py`; `backend/hardware.example.toml`; `backend/tests/test_esp32.py`, `test_core.py`, `test_api.py`; `frontend/src/pages/NewBatch.tsx`, `Settings.tsx`, `lib/api.ts`, `lib/fil.ts`; `dockerfiles/start-machine.sh`; `backend/README.md`, `API.md`, `docs/*.md`.
+
 ## 2026-10-21 (5): no temperature checks in the reactions; purification heater in 2-second pulses
 
 - **Esterification and transesterification have no temperature checks.** No "temperature reading lost" or over-temperature fault, no start refusal without a reading, and the watchdog no longer switches the electrodes off for the temperature. A reading, when there is one, is still recorded (average temperature). They still don't start while the ESP32 controller is offline or faulty, and a measured over-current (power monitor fitted) still stops them.

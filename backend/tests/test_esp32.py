@@ -257,12 +257,14 @@ def test_outputs_go_through_the_esp32_with_a_dead_man_timer(lg, tmp_path):
         assert r["temperature"] == 31.2 and r["controllerOnline"] is True and r["controllerError"] is None
         assert r["purificationStirrerRpm"] == 0 and r["stirrerRpm"] == 0
 
-        # dry wash stirrer at 200 RPM: the ESP32's own RPM scale (MAX_RPM 1544) is used
+        # dry wash stirrer at 200 RPM: the ESP32's own RPM scale (MAX_RPM 1544) is used; it starts
+        # with the 1 s kick at full speed, then 200 RPM moved up to the minimum PWM (90 of 255)
         full = hw.full_speed_rpm("purification_stirrer")
         assert full == 1544
         hw.set_motor("purification_stirrer", 200 / full)
-        assert "mixer2 on 5 200" in esp.lines and esp.on("mixer2")
-        wait_until(lambda: esp.lines.count("mixer2 on 5 200") >= 3, what="the dead-man refresh")
+        assert "mixer2 on 5 1544" in esp.lines and esp.on("mixer2")
+        sent = f"mixer2 on 5 {round(90 / 255 * 1544 + 200 * 165 / 255)}"
+        wait_until(lambda: esp.lines.count(sent) >= 3, what="the dead-man refresh")
 
         hw.set_heater(True)                                  # interlock: only with the stirrer running
         assert esp.on("heater") and "heater on 5" in esp.lines
@@ -696,5 +698,25 @@ def test_an_esp32_brownout_is_named_in_the_fault(lg, tmp_path):
         wait_until(lambda: not hw.link.online, what="offline")
         fault = hw.link_fault
         assert "brownout" in fault and "own 5 V supply" in fault, fault
+    finally:
+        hw.close()
+
+
+def test_mixers_get_a_start_kick_and_a_minimum_pwm(lg, tmp_path):
+    """200 RPM would be PWM 33 of 255 in the sketch (the motor doesn't turn): it starts at full speed
+    for a moment, then runs at a speed whose PWM is at least mixer_min_pwm. The website still shows
+    the set speed."""
+    hw, esp = _machine(lg, tmp_path, **{"esp32.mixer_kick_seconds": 0.3, "esp32.mixer_min_pwm": 90})
+    try:
+        hw.set_motor("purification_stirrer", 200 / 1544)
+        assert esp.devs["mixer2"]["rpm"] == 1544                  # the kick
+        time.sleep(0.45)
+        hw._refresh_outputs()
+        rpm = esp.devs["mixer2"]["rpm"]
+        assert rpm == round(90 / 255 * 1544 + 200 * 165 / 255)     # PWM 111 of 255
+        wait_until(lambda: hw.refresh()["purificationStirrerRpm"] == 200, what="the set speed shown")
+        hw.set_motor("purification_stirrer", 1.0)
+        hw._refresh_outputs()
+        assert esp.devs["mixer2"]["rpm"] == 1544                  # full speed stays full speed
     finally:
         hw.close()

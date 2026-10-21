@@ -7,9 +7,9 @@ It starts by itself when the separation stage has finished (the centrifuge timer
 pumpin has sent everything to the purifier). Steps, one after the other, run by the Pi:
 1. methanol: methanol removal starts at once (no separate heating step) and lasts the methanol
    removal time (default 10 min). The dry wash stirrer runs (200 RPM) and the heater works in
-   2-second pulses: on for 2 s, then off; the Pi watches the temperature rise to its highest
+   4-second pulses: on for 4 s, then off; the Pi watches the temperature rise to its highest
    point, and when it is getting lower again (0.2 °C below that highest reading) the heater gets
-   the next 2-second pulse, and so on until the 10 minutes are over. No pulse at or above 90 °C.
+   the next 4-second pulse, and so on until the 10 minutes are over. No pulse at or above 90 °C.
 2. magnesol: heater off, stirrer on. The website shows "Add X g Magnesol (1% of the oil weight)";
    the sequence waits until the operator confirms that it was added.
 3. contact: stirred at 200 RPM for the contact time (default 10 min) with the heater off.
@@ -20,7 +20,7 @@ pumpin has sent everything to the purifier). Steps, one after the other, run by 
 6. complete: the valve closes and pumpout stops (api.py then switches every output off). A "Low
    output – check the polishing filter" warning when less than 70% of the oil weight came out.
 
-Fixed: the 2 s heater pulses, the 90 °C pulse limit, the 95 °C cutoff, the 200 RPM stirrer, the
+Fixed: the 4 s heater pulses, the 90 °C pulse limit, the 95 °C cutoff, the 200 RPM stirrer, the
 1 min settle and the drain rule. Settings: methanolRemovalTime and contactTime.
 
 The stirrer's RPM reading is reported (stirrerRpm) only during contact; in the other steps it is
@@ -41,7 +41,7 @@ from .hardware import Hardware
 from .models import Settings
 
 HOLD_TEMPERATURE_C = 90        # no heater pulse at or above this (a pulse in progress stops here)
-HEATER_PULSE_S = 2             # methanol removal: the heater is switched on for 2 s at a time ...
+HEATER_PULSE_S = 4             # methanol removal: the heater is switched on for 4 s at a time ...
 PULSE_DROP_C = 0.2             # ... again once the reading is this far below its highest point
 MAXIMUM_TEMPERATURE_C = 95     # software cutoff: the heater stops above this
 STIRRING_SPEED_RPM = 200       # dry wash stirrer target (fixed)
@@ -226,7 +226,7 @@ class PurificationRunner:
         st = self.state
         target = HOLD_TEMPERATURE_C
         try:
-            # 1. Methanol removal, straight away: valve closed, stirrer on, heater in 2-second pulses.
+            # 1. Methanol removal, straight away: valve closed, stirrer on, heater in 4-second pulses.
             #    Pulse -> the temperature rises to its highest point -> once it is getting lower
             #    (PULSE_DROP_C below that point) -> the next pulse. Until the time is over.
             self.hw.set_valve("mesh_bed", False)

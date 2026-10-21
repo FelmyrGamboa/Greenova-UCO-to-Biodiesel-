@@ -20,7 +20,7 @@ export type Catalyst = "NaOH" | "KOH";
 export type Adsorbent = "Magnesol" | "Bentonite";
 export type StageName = "Esterification" | "Transesterification" | "Separation";
 export type StageState = "ready" | "running" | "paused" | "complete" | "fault";
-/** Dry wash with Magnesol or bentonite: methanol removal straight away (stirrer on, heater in 2 s
+/** Dry wash with Magnesol or bentonite: methanol removal straight away (stirrer on, heater in 4 s
  * pulses: the next pulse when the temperature is getting lower again, none at or above 90 °C) → add
  * the adsorbent (operator; the phase is still called "magnesol") → contact (stirred at 200 RPM,
  * heater off) → settle (1 min, stirrer off) → drain (valve + pumpout, until the output load cell is

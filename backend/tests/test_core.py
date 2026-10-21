@@ -349,7 +349,7 @@ def _pulses(switches, with_off_reading=False):
 def _full_length(pulses_with_off):
     """Every pulse lasted 2 of the runner's seconds, except one cut at 90 °C or by the end of
     methanol removal."""
-    return all(length == 2 or t_off >= 90 or phase != "methanol" for _, _, _, t_off, phase, length in pulses_with_off)
+    return all(length == 4 or t_off >= 90 or phase != "methanol" for _, _, _, t_off, phase, length in pulses_with_off)
 
 
 def test_purification_full_sequence():
@@ -363,12 +363,12 @@ def test_purification_full_sequence():
     assert not rec["safetyStopOccurred"] and rec["automatic"] and rec["warning"] is None
     assert rec["heatingTimeSeconds"] == 0                      # no heating step
     pulses = _pulses(switches)
-    # the heater only ever ran during methanol removal, in 2-second pulses, the first one at once
+    # the heater only ever ran during methanol removal, in 4-second pulses, the first one at once
     assert all(phase == "methanol" for _, on, phase, _, _ in switches if on)
     assert len(pulses) >= 5
-    # 2 s each; shorter only when 90 °C was reached during the pulse
+    # 4 s each; shorter only when 90 °C was reached during the pulse
     assert _full_length(_pulses(switches, True)), pulses
-    assert sum(p[-1] == 2 for p in _pulses(switches, True)) >= 5
+    assert sum(p[-1] == 4 for p in _pulses(switches, True)) >= 5
     assert switches[0][1] is True and switches[0][3] < 28      # the first pulse at once, from room temperature
     assert all(t < 90 for _, _, t in pulses)                   # never a pulse at or above 90 °C
     assert st["heaterPulses"] == len(pulses)
@@ -385,7 +385,7 @@ def test_purification_full_sequence():
 
 
 def test_heater_pulses_wait_for_the_temperature_to_fall():
-    """With a real heater the temperature keeps rising after a pulse. The next 2-second pulse comes
+    """With a real heater the temperature keeps rising after a pulse. The next 4-second pulse comes
     only once the reading is getting lower: 0.2 °C below its highest point since the last pulse."""
     hw = SimulatedMachine(100, heater_lag=0.8)
     hw.load_oil(500)

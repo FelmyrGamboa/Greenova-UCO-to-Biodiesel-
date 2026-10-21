@@ -382,6 +382,15 @@ class Esp32Hardware(Hardware):
         self._lease = max(0, int(e.get("lease_seconds", 5)))
         self._max_on = {role: int(s) for role, s in (e.get("max_on_seconds") or {}).items() if s}
         self._mixer_max_rpm = float(e.get("mixer_max_rpm", 1544))
+        # The sketch turns RPM into PWM in a straight line (MIN_PWM 0): 200 RPM = PWM 33 of 255, too
+        # little for a DC motor behind an L298N to turn. mixer_min_pwm sets the PWM for the lowest
+        # speed (the sketch's MIN_PWM, done here so the sketch stays as it is), and every start
+        # begins with mixer_kick_seconds at full speed so the motor gets going.
+        floor = e.get("mixer_min_pwm", 90)
+        self._min_pwm = {role: float(floor.get(role, 90) if isinstance(floor, dict) else floor)
+                         for role in MOTOR_ROLES}
+        self._kick_s = max(0.0, float(e.get("mixer_kick_seconds", 1.0)))
+        self._kick_until: dict[str, float] = {}
         self._want: dict[str, int] = {}               # role -> 1/0 (relays) or RPM (mixers, 0 = off)
         self._switched_at: dict[str, float] = {}
         self._deadline: dict[str, Optional[float]] = {}
@@ -446,8 +455,18 @@ class Esp32Hardware(Hardware):
         if not value:
             return f"{device} off"
         if role in MOTOR_ROLES:
-            return f"{device} on {seconds} {int(value)}"          # "mixer2 on 5 200": 0 s = no timer
+            return f"{device} on {seconds} {self._command_rpm(role, value)}"   # "mixer2 on 5 674": 0 s = no timer
         return f"{device} on {seconds}" if seconds else f"{device} on"
+
+    def _command_rpm(self, role: str, rpm: float) -> int:
+        """The RPM to send for a target speed: full speed during the start kick, otherwise the
+        target moved up so the lowest speed gets mixer_min_pwm (the sketch: PWM = RPM × 255 / MAX_RPM)."""
+        top = self.full_speed_rpm(role) or self._mixer_max_rpm
+        if time.monotonic() < self._kick_until.get(role, 0.0):
+            return int(top)
+        floor = min(max(self._min_pwm.get(role, 0.0), 0.0), 254.0)
+        rpm = min(max(float(rpm), 0.0), top)
+        return min(int(top), round(floor / 255 * top + rpm * (255 - floor) / 255))
 
     def _switch(self, role: str, value: int) -> None:
         """Switch one Greenova job on (value > 0: 1, or the RPM for a mixer) or off (0)."""
@@ -464,6 +483,8 @@ class Esp32Hardware(Hardware):
         with self._lock:
             now = time.monotonic()
             limit = self._max_on.get(role)
+            if role in MOTOR_ROLES and value and not self._want.get(role):
+                self._kick_until[role] = now + self._kick_s      # start at full speed for a moment
             self._want[role] = value
             self._switched_at[role] = now
             self._mismatch[role] = 0
@@ -620,11 +641,12 @@ class Esp32Hardware(Hardware):
         devices = {str(d.get("id", "")).lower(): d for d in (data or {}).get("devices", []) if isinstance(d, dict)}
 
         def mixer_rpm(role: str) -> Optional[float]:
+            """The speed it was set to (open loop), while the ESP32 reports it on."""
             ids = self._roles[role]
             d = devices.get(ids[0]) if ids else None
             if d is None:
                 return None
-            return float(d.get("rpm", 0)) if d.get("on") else 0
+            return float(self._want.get(role) or 0) if d.get("on") else 0
 
         power = self._samplers.get("power")
         volts, amps = (power.value if power else None) or (None, None)

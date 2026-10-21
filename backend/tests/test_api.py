@@ -59,7 +59,7 @@ def test_health_and_config(client):
     assert cfg["separation"] == {"timeMinutes": 60, "speedRpm": 2500, "timeMin": 1, "timeMax": 180,
                                  "speedMin": 100, "speedMax": 2500, "settleSeconds": 60}
     pur = cfg["purification"]
-    assert (pur["holdTemperature"], pur["heaterPulseSeconds"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 2, 95, 200)
+    assert (pur["holdTemperature"], pur["heaterPulseSeconds"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 4, 95, 200)
     assert pur["pulseDropC"] == 0.2 and "holdBand" not in pur and "heatingTimeoutMinutes" not in pur
     assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settleSeconds"]) == (10, 10, 60)
     assert pur["magnesolGramsPerMlOil"] == 0.0092 and pur["bentoniteGramsPerMlOil"] == 0.0184
@@ -222,7 +222,7 @@ def test_whole_batch_moves_through_the_machine(client):
     p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=4)
     sensors = client.get("/api/live").json()["sensors"]
     assert not sensors["reactorValveOpen"] and not sensors["centrifugeValveOpen"] and sensors["centrifugeRpm"] == 0
-    assert p["batchId"] == b and p["automatic"] is True and p["heaterPulses"] >= 1   # first 2 s pulse at once
+    assert p["batchId"] == b and p["automatic"] is True and p["heaterPulses"] >= 1   # first 4 s pulse at once
     assert p["stirrerOn"] is True and p["stirrerRpm"] is None                # no RPM reading in methanol removal
     assert p["stirringSpeed"] == 200 and p["targetTemperature"] == 90
     # from the batch's oil: 276 g ÷ 0.92 g/mL = 300 mL; Magnesol = 300 × 0.0092 = 2.76 -> 2.8 g

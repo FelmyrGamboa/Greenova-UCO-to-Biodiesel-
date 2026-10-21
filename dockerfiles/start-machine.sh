@@ -10,6 +10,7 @@
 #     bash start-machine.sh                  start / restart and check
 #     bash start-machine.sh --check          only the check (Greenova already running)
 #     bash start-machine.sh --test-outputs   switch each output for 2 s, one by one (bench test)
+#     bash start-machine.sh --test-mixers    find the lowest PWM where mixer 1 and mixer 2 turn
 set -uo pipefail
 cd "$(dirname "$0")"
 HERE="$(pwd)"
@@ -82,6 +83,17 @@ if [ "$MODE" = "--check" ]; then
   check_hardware; exit $?
 fi
 
+if [ "$MODE" = "--test-mixers" ]; then
+  step "Mixer test: the lowest PWM where each mixer turns (the backend is stopped meanwhile)"
+  docker compose stop backend frontend
+  for role in stirrer purification_stirrer; do
+    docker compose run --rm --no-deps backend python -m app.hwtest mixer "$role"
+  done
+  echo "Put the mixer_min_pwm line it printed under [esp32] in $DATA/hardware.toml (create the file if needed)."
+  docker compose up -d
+  exit 0
+fi
+
 if [ "$MODE" = "--test-outputs" ]; then
   step "Bench test: each output on for 2 s (the backend is stopped meanwhile)"
   docker compose stop backend frontend
@@ -90,6 +102,12 @@ if [ "$MODE" = "--test-outputs" ]; then
   exit 0
 fi
 
+# MySQL's first start imports every .sql in mysql-init: the dump must be there (an unchanged copy)
+if [ -d "$HERE/mysql-init" ] && [ -f "$BACKEND/greenova_db_ver2.sql" ] \
+   && ! cmp -s "$BACKEND/greenova_db_ver2.sql" "$HERE/mysql-init/greenova_db_ver2.sql"; then
+  cp "$BACKEND/greenova_db_ver2.sql" "$HERE/mysql-init/greenova_db_ver2.sql" \
+    && echo "Copied backend/greenova_db_ver2.sql (unchanged) into mysql-init."
+fi
 for f in frontend.Dockerfile mysql-init; do
   [ -e "$HERE/$f" ] || warn "$f is missing next to docker-compose.yaml (it comes with the project zip)."
 done

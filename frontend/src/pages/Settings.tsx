@@ -244,7 +244,7 @@ export default function Settings() {
 
       <Card className="p-6">
         <Heading as="h2" className="text-lg font-semibold">{t("Purification")}</Heading>
-        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: methanol removal straight away (stirred at 200 RPM, the heater in 2-second pulses, the next one when the temperature is getting lower, none from 90 °C), add the adsorbent, contact (stirred at 200 RPM, heater off), settle for 1 minute, then the valve opens and pumpout runs until the output load cell is stable for 30 s.")}</p>
+        <p className="mt-1 text-sm text-gray-500">{t("Dry wash with Magnesol or bentonite (chosen for each batch in Volume & Parameters). It runs by itself after separation: methanol removal straight away (stirred at 200 RPM, the heater in 4-second pulses, the next one when the temperature is getting lower, none from 90 °C), add the adsorbent, contact (stirred at 200 RPM, heater off), settle for 1 minute, then the valve opens and pumpout runs until the output load cell is stable for 30 s.")}</p>
         <div className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
           <Field label={t("Methanol removal time")} inputMode="numeric" pattern="[0-9]*" value={methanolRemovalTime} onChange={wholeInput(setMethanolRemovalTime)} unit="min" />
           <Field label={t("Contact time")} inputMode="numeric" pattern="[0-9]*" value={contactTime} onChange={wholeInput(setContactTime)} unit="min" />

@@ -79,7 +79,7 @@ ESP32 outputs: see `firmware/esp32_process_control/README.md` (`dispenser1` GPIO
 | Reactor stirrer | `mixer1` | reaction stages |
 | Reactor pump (reactor → centrifuge) | `reactorpump` | separation (after the 1 min settle), with the centrifuge |
 | Pumpin (centrifuge → purifier) | `pumpin` | separation, with the centrifuge |
-| Immersion heater | `heater` | purification methanol removal, 2-second pulses (the next one when the temperature is getting lower; none from 90 °C) |
+| Immersion heater | `heater` | purification methanol removal, 4-second pulses (the next one when the temperature is getting lower; none from 90 °C) |
 | Dry wash stirrer | `mixer2` | purification methanol removal, the Magnesol prompt and contact (200 RPM) |
 | Purification outlet (purifier → output container) | `valve` + `pumpout` | after contact and the 1 min settle, until the output load cell is stable for 30 s |
 
@@ -91,6 +91,7 @@ Check which dispenser holds which premix. Change any line to match the real mach
 - **Dead-man timer.** Every ESP32 output is switched on with the sketch's timed ON (`heater on 5`) and refreshed every second. If the backend, the Pi or the USB cable stops, the ESP32 switches the output off by itself within 5 s (`lease_seconds`).
 - **Controller faults stop everything.** No status from the ESP32 for 3.5 s, an output that doesn't follow its command, or a device in `[esp32.devices]` the sketch doesn't have: the backend stops the stage, purification and pumps, switches everything off and shows why (alarm, the **Output Controller** tile, Settings → Hardware). Nothing switches back on by itself when the ESP32 returns.
 - The sketch's own Wi-Fi page can switch outputs past these rules. Greenova switches its outputs back off within a second, but leave `WIFI_SSID` as `YOUR_WIFI_NAME` so the ESP32 stays off the network.
+- Mixers: the sketch's RPM → PWM line starts at 0, so slow speeds (200 RPM = PWM 33) don't turn the motors. Greenova starts each mixer with 1 s at full speed (`mixer_kick_seconds`) and gives the lowest speed `mixer_min_pwm` (90 of 255) under `[esp32]` in `hardware.toml`. If a mixer still hums without turning, find its value with `python -m app.hwtest mixer purification_stirrer` (or `stirrer`; in Docker `bash start-machine.sh --test-mixers`) and set it.
 - RPM is open loop (there are no speed sensors): the mixers and the centrifuge are driven at the set speed, and the website shows that speed as the RPM reading. Mixers use the sketch's RPM (`MAX_RPM` 1544); the centrifuge is PWM from `[centrifuge] max_rpm` (2500), so a batch's centrifuge speed can be at most 2500 RPM.
 
 ### Load cells

@@ -7,6 +7,7 @@ service stopped (only one program can use the GPIO pins and the ESP32's serial p
     .venv/bin/python -m app.hwtest read                 # every sensor, once per second (Ctrl+C to stop)
     .venv/bin/python -m app.hwtest outputs              # switch each job's output (relay, pump, valve, motor) one by one
     .venv/bin/python -m app.hwtest calibrate output     # load cell Tare + Calibrate (or: reactor)
+    .venv/bin/python -m app.hwtest mixer purification_stirrer   # lowest PWM where mixer 2 turns (or: stirrer)
     .venv/bin/python -m app.hwtest pump oil 60          # run a pump 60 s into a jug to measure its mL/min (oil, catalyst, acid)
     .venv/bin/python -m app.hwtest i2c                  # list the I2C devices (power monitor)
 
@@ -264,6 +265,46 @@ def i2c() -> int:
     return 0
 
 
+def mixer(role: str) -> int:
+    """Finds a mixer's lowest working PWM: raw PWM steps (no start kick), the operator says when it turns."""
+    if role not in ("stirrer", "purification_stirrer"):
+        print("Use: python -m app.hwtest mixer stirrer   (mixer 1, reactor)   or   mixer purification_stirrer   (mixer 2)")
+        return 1
+    if not _esp32_mode():
+        print("Only for the ESP32 controller ([actuators] backend = \"esp32\").")
+        return 1
+    hw = _hardware()
+    device = config.HARDWARE["esp32"]["devices"].get(role)
+    device = device[0] if isinstance(device, (list, tuple)) else device
+    top = hw.full_speed_rpm(role) or 1544
+    print(f"{role} = ESP32 {device}. Each step runs 3 s, from a standstill. Fill the vessel as in a batch.")
+    found = None
+    try:
+        for pwm in range(30, 256, 15):
+            rpm = round(pwm * top / 255)                      # the sketch: PWM = RPM x 255 / MAX_RPM
+            hw.link.send(f"{device} on 3 {rpm}")
+            time.sleep(3.2)
+            answer = input(f"PWM {pwm}/255: does it turn? [y/N/q] ").strip().lower()
+            hw.link.send(f"{device} off")
+            if answer == "q":
+                break
+            if answer == "y":
+                found = pwm
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        hw.link.send(f"{device} off")
+        hw.close()
+    if found is None:
+        print("No answer: nothing changed. Check the L298N's motor supply and wiring.")
+        return 1
+    print(f"\nIt turns from PWM {found}. In backend/hardware.toml (Docker: backend/data/hardware.toml), [esp32]:")
+    print(f"    mixer_min_pwm = {{ {role} = {min(found + 10, 254)} }}   (a little margin), then restart Greenova.")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     command = argv[1] if len(argv) > 1 else "check"
     if command == "check":
@@ -278,6 +319,8 @@ def main(argv: list[str]) -> int:
         return calibrate(argv[2] if len(argv) > 2 else "")
     if command == "i2c":
         return i2c()
+    if command == "mixer":
+        return mixer(argv[2] if len(argv) > 2 else "")
     if command == "pump":
         return pump(argv[2] if len(argv) > 2 else "", float(argv[3]) if len(argv) > 3 else 60)
     print(__doc__)

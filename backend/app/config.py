@@ -92,6 +92,8 @@ HARDWARE_DEFAULTS: dict = {
         "poll_seconds": 1.0,
         "offline_after_seconds": 3.5,
         "mixer_max_rpm": 1544,           # the sketch's MAX_RPM (used until the ESP32 reports its own)
+        "mixer_min_pwm": 90,             # PWM for the lowest mixer speed (slow speeds still turn the motor)
+        "mixer_kick_seconds": 1.0,       # every mixer start: this long at full speed first
         # Greenova job -> ESP32 device name(s) in esp32_process_control.ino ("" = not fitted)
         "devices": {
             "heater": "heater",

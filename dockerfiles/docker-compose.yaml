@@ -28,9 +28,9 @@ services:
       # so mysql-init/01-greenova-user.sql creates 'greenova' (no password) instead.
     volumes:
       - mysql-data:/var/lib/mysql
-      # First start only (empty data volume): the project's dump, unchanged, then the user for Docker
+      # First start only (empty data volume): every .sql in mysql-init runs once: the project's dump
+      # greenova_db_ver2.sql (an unchanged copy of backend/greenova_db_ver2.sql) and the user for Docker
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
-      - ../backend/greenova_db_ver2.sql:/docker-entrypoint-initdb.d/00-greenova_db_ver2.sql:ro
     ports:
       # 127.0.0.1 only: a user without a password should not be reachable from the Wi-Fi.
       - "127.0.0.1:${MYSQL_PORT:-3307}:3306"

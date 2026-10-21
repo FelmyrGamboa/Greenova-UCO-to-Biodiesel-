@@ -121,13 +121,13 @@ export const PROCESS_CONFIG = {
     settleSeconds: 60,
   },
   // Purification (dry wash with Magnesol or bentonite): fixed values, same as the backend's purification.py.
-  // No heating step: methanol removal starts at once, with the heater in 2-second pulses (the next
+  // No heating step: methanol removal starts at once, with the heater in 4-second pulses (the next
   // pulse when the temperature is getting lower again, never at or above holdTemperature). After
   // contact it settles for 1 min, then the valve and pumpout run until the output load cell is
   // stable for 30 s.
   purification: {
     holdTemperature: 90,
-    heaterPulseSeconds: 2,
+    heaterPulseSeconds: 4,
     settleSeconds: 60,
     maximumTemperature: 95,
     stirringSpeedRpm: 200,
@@ -988,7 +988,7 @@ type PurificationView = {
   temperature: number | null;
   highest: number | null;
   heaterOn: boolean;
-  /** 2-second heater pulses so far (methanol removal). */
+  /** 4-second heater pulses so far (methanol removal). */
   heaterPulses: number;
   stirrerOn: boolean;
   stirrerRpm: number | null;

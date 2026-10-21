@@ -51,7 +51,7 @@ They run anywhere (a laptop too): the process tests use `tests/simulator.py`, a 
 | `app/analytics.py` | Summary, best parameters per FFA range, recommended parameters, cost per liter |
 | `app/stages.py` | Esterification, Transesterification and Separation (settle, then reactor pump + centrifuge + pumpin) |
 | `app/transfers.py` | The oil pump and the dispensers (pump A, pump B): on until the operator presses Done |
-| `app/purification.py` | Purification: methanol removal straight away (heater in 2 s pulses) → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
+| `app/purification.py` | Purification: methanol removal straight away (heater in 4 s pulses) → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
 | `app/system.py` | System Status tiles and device list |
 | `app/hardware.py` | Safety interlocks and the older all-on-the-Pi wiring (`PiHardware`, `backend = "gpio"`) |
 | `app/esp32.py` | The machine (`backend = "esp32"`, the default): the ESP32 serial link (dead-man timer, status checks) and `Esp32Hardware` with the Pi's centrifuge and load cells |
@@ -104,14 +104,14 @@ After separation, purification runs by itself. The operator only adds the adsorb
 
 | Step | What happens | Time |
 |---|---|---|
-| 1. Methanol removal | Starts at once (no heating step). Stirrer (`mixer2`) at 200 RPM; the heater runs in **2-second pulses**: on 2 s, off, the Pi waits for the temperature to rise to its highest point, and when it is getting lower (0.2 °C below that point) the next 2 s pulse, until the time is over. No pulse at or above 90 °C. The website shows "Prepare X g Magnesol". | `methanolRemovalTime` (10 min) |
+| 1. Methanol removal | Starts at once (no heating step). Stirrer (`mixer2`) at 200 RPM; the heater runs in **4-second pulses**: on 4 s, off, the Pi waits for the temperature to rise to its highest point, and when it is getting lower (0.2 °C below that point) the next 4 s pulse, until the time is over. No pulse at or above 90 °C. The website shows "Prepare X g Magnesol". | `methanolRemovalTime` (10 min) |
 | 2. Add adsorbent | Heater off, stirrer on. "Add X g Magnesol (1% of the oil weight)"; waits for **Confirm**. | Waits for the operator |
 | 3. Contact | Stirred at **200 RPM** (the RPM is shown here), heater off. | `contactTime` |
 | 4. Settle | Stirrer off: it settles for **1 minute**. | 60 s |
 | 5. Drain | The **valve** opens and **pumpout** runs: purifier → filter → output container. Done **only** when the output load cell stays within ±2 g for **30 s** (counted once the flow has started). No time limit. | |
 | 6. Done | Everything is switched off. "Low output – check the polishing filter" when less than 70% of the oil weight came out. | |
 
-**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g: Magnesol 1% = oil volume × 0.0092 g (500 mL → 4.6 g), bentonite 2% = × 0.0184 g. Settings → Purification has the two times, the two doses and the default adsorbent; the 2 s heater pulses (none from 90 °C), the 95 °C cutoff, the 200 RPM stirrer, the 1-minute settle and the drain rule are fixed in `app/purification.py`. The settle time is recorded in the `settlingTimeSeconds` column. Purification needs a reading from the output load cell (it is the only way the run completes).
+**Adsorbent** = oil volume (mL) × 0.92 g/mL × dose %, rounded to 0.1 g: Magnesol 1% = oil volume × 0.0092 g (500 mL → 4.6 g), bentonite 2% = × 0.0184 g. Settings → Purification has the two times, the two doses and the default adsorbent; the 4 s heater pulses (none from 90 °C), the 95 °C cutoff, the 200 RPM stirrer, the 1-minute settle and the drain rule are fixed in `app/purification.py`. The settle time is recorded in the `settlingTimeSeconds` column. Purification needs a reading from the output load cell (it is the only way the run completes).
 
 With the optional level switch (`[level_switch]` in `hardware.toml`) the heater waits until biodiesel covers it; without one, purification starts at once (and a manual restart asks the operator to confirm that the heater is submerged).
 
