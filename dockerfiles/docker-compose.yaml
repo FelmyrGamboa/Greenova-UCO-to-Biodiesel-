@@ -38,7 +38,9 @@ services:
       retries: 30
       start_period: 30s
 
-  # ---------- Backend: FastAPI on port 8000, demo (simulated) hardware ----------
+  # ---------- Backend: FastAPI on port 8000, driving the real machine ----------
+  # It needs the Pi's GPIO chip (centrifuge, load cell) and the ESP32's USB port. Check the names
+  # first with:  ls /dev/gpiochip* /dev/ttyUSB* /dev/ttyACM*   and list only devices that exist.
   backend:
     build:
       context: ../backend
@@ -54,10 +56,14 @@ services:
       DB_USER: greenova
       DB_PASSWORD: ""                    # no password
       DB_NAME: greenova_db
-      GREENOVA_MOCK: "1"                 # simulated machine (there is no Raspberry Pi in Docker)
-      GREENOVA_TIME_SCALE: ${GREENOVA_TIME_SCALE:-1}   # e.g. 20 = demo machine 20x faster
-      GREENOVA_SEED: ${GREENOVA_SEED:-1} # 1 = add the 6 sample batches to an empty database
+      GPIO_CHIP: "0"                     # Pi 4 / Pi 5 on a recent OS; "4" if you only have /dev/gpiochip4
       TZ: ${TZ:-Asia/Manila}
+    devices:
+      - /dev/gpiochip0:/dev/gpiochip0    # change both to gpiochip4 if that's the only one you have
+      - /dev/ttyUSB0:/dev/ttyUSB0        # the ESP32 (change both to /dev/ttyACM0 if that's its name)
+    volumes:
+      - ../backend/hardware.toml:/app/hardware.toml
+      - ../backend/loadcell_calibration.json:/app/loadcell_calibration.json
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     healthcheck:
@@ -66,18 +72,6 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
-    devices:
-      - /dev/gpiochip0:/dev/gpiochip0     # Pi 4, and Pi 5 on a recent OS
-      - /dev/gpiochip4:/dev/gpiochip4     # Pi 5 on an older OS (delete this line if the file doesn't exist)
-      - /dev/ttyUSB0:/dev/ttyUSB0         # the ESP32's USB port (may be /dev/ttyACM0)
-    group_add:
-      - dialout
-      - gpio
-    environment:
-      - GPIO_CHIP=0                       # use 4 if your Pi only has /dev/gpiochip4
-    volumes:
-      - ../backend/hardware.toml:/app/hardware.toml
-      - ../backend/loadcell_calibration.json:/app/loadcell_calibration.json
 
   # ---------- Website: Vite dev server (npm run dev) on port 8443 ----------
   frontend:
