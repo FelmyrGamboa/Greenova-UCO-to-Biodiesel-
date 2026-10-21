@@ -66,6 +66,18 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+    devices:
+      - /dev/gpiochip0:/dev/gpiochip0     # Pi 4, and Pi 5 on a recent OS
+      - /dev/gpiochip4:/dev/gpiochip4     # Pi 5 on an older OS (delete this line if the file doesn't exist)
+      - /dev/ttyUSB0:/dev/ttyUSB0         # the ESP32's USB port (may be /dev/ttyACM0)
+    group_add:
+      - dialout
+      - gpio
+    environment:
+      - GPIO_CHIP=0                       # use 4 if your Pi only has /dev/gpiochip4
+    volumes:
+      - ../backend/hardware.toml:/app/hardware.toml
+      - ../backend/loadcell_calibration.json:/app/loadcell_calibration.json
 
   # ---------- Website: Vite dev server (npm run dev) on port 8443 ----------
   frontend:
