@@ -9,4 +9,4 @@ frontend/dist/
 loadcell_calibration.json
 loadcell_calibration.json.tmp
 # Docker: hardware.toml and the load cell calibration (dockerfiles/docker-compose.yaml)
-data/
+# data/

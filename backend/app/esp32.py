@@ -386,6 +386,9 @@ class Esp32Hardware(Hardware):
         # stirring speed), so the ESP32 runs and reports that RPM. The sketch turns it into PWM from
         # its own MIN_PWM (90), which keeps slow speeds turning. Every start begins with
         # mixer_kick_seconds at full speed (MAX_RPM) so the motor gets going, then the set RPM.
+        floor = e.get("mixer_min_pwm", 90)
+        self._min_pwm = {role: float(floor.get(role, 90) if isinstance(floor, dict) else floor) for role in MOTOR_ROLES}
+        self._kick_s = max(0.0, float(e.get("mixer_kick_seconds", 1.0)))
         self._kick_s = max(0.0, float(e.get("mixer_kick_seconds", 1.0)))
         self._kick_until: dict[str, float] = {}
         self._want: dict[str, int] = {}               # role -> 1/0 (relays) or RPM (mixers, 0 = off)
@@ -455,13 +458,22 @@ class Esp32Hardware(Hardware):
             return f"{device} on {seconds} {self._command_rpm(role, value)}"   # "mixer2 on 5 200": 0 s = no timer
         return f"{device} on {seconds}" if seconds else f"{device} on"
 
+    # def _command_rpm(self, role: str, rpm: float) -> int:
+    #     """The RPM to send: full speed (MAX_RPM) during the start kick, then exactly the set RPM.
+    #     Never moved up here: the sketch's MIN_PWM (90) is what makes slow speeds turn."""
+    #     top = self.full_speed_rpm(role) or self._mixer_max_rpm
+    #     if time.monotonic() < self._kick_until.get(role, 0.0):
+    #         return int(top)
+    #     return round(min(max(float(rpm), 0.0), top))
     def _command_rpm(self, role: str, rpm: float) -> int:
-        """The RPM to send: full speed (MAX_RPM) during the start kick, then exactly the set RPM.
-        Never moved up here: the sketch's MIN_PWM (90) is what makes slow speeds turn."""
+        """Full speed during the start kick, then the target moved up so the lowest speed gets
+        mixer_min_pwm (sketch with MIN_PWM 0: PWM = RPM x 255 / MAX_RPM)."""
         top = self.full_speed_rpm(role) or self._mixer_max_rpm
         if time.monotonic() < self._kick_until.get(role, 0.0):
             return int(top)
-        return round(min(max(float(rpm), 0.0), top))
+        rpm = min(max(float(rpm), 0.0), top)
+        floor = min(max(self._min_pwm.get(role, 0.0), 0.0), 254.0)
+        return min(int(top), round(floor / 255 * top + rpm * (255 - floor) / 255))
 
     def sketch_min_pwm(self) -> Optional[int]:
         """The sketch's own MIN_PWM, when its STATUS reports it (the current sketch: 90); None for an
