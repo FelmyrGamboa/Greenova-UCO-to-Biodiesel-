@@ -103,8 +103,6 @@
 # Databases
 # ---------------------------------------------------------------------------
 *.db                 filter=lfs diff=lfs merge=lfs -text
-*.sqlite             filter=lfs diff=lfs merge=lfs -text
-*.sqlite3            filter=lfs diff=lfs merge=lfs -text
 *.mdb                filter=lfs diff=lfs merge=lfs -text
 *.accdb              filter=lfs diff=lfs merge=lfs -text
 

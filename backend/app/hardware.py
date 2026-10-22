@@ -1,26 +1,28 @@
-"""Hardware layer.
+"""Hardware layer: the real machine. There is no demo or simulated mode.
 
-MockHardware simulates the machine for demos and testing. PiHardware talks to the real pins.
+Esp32Hardware (esp32.py) is the machine with the ESP32 controller on USB plus the Pi's centrifuge
+and load cell (hardware.toml [actuators] backend = "esp32", the default). PiHardware is the older
+wiring with every output on the Pi's own pins (backend = "gpio"). (The automated tests use their
+own simulated machine, tests/simulator.py.)
 
-The machine:
-- Main reactor on the input load cell (oil and acetone are poured in by hand through the
-  filtered inlet; the two dosing pumps add their premix): graphite-graphite electrodes on a DC
-  power supply with a current limit, stirrer, temperature.
-  Pump A ("catalyst") = NaOH/KOH dissolved in methanol. Pump B ("acid") = H2SO4 in methanol.
-- Reactor outlet valve -> centrifuge (opens after transesterification).
-- Centrifuge, and its outlet valve -> purification tank (opens after separation).
-- Purification tank (dry wash with Magnesol or bentonite): immersion heater, dry wash stirrer, level switch
-  at the heater; its outlet valve (named "mesh_bed" in the code) lets the biodiesel through the
-  filter into the output container on the output load cell (the yield).
+The machine (the names in the code; the ESP32 outputs are in hardware.toml [esp32.devices]):
+- Main reactor: the oil pump ("oil") and the two dispensers add the oil and the premixes (the
+  operator measures each one into its container and stops the pump when it has all gone in):
+  pump A ("catalyst") = NaOH/KOH dissolved in methanol, pump B ("acid") = H2SO4 in methanol.
+  Graphite-graphite electrodes on a DC power supply with a current limit, stirrer, temperature.
+- Separation (continuous): the reactor pump ("reactor_outlet": reactor -> centrifuge), the
+  centrifuge, and pumpin ("centrifuge_outlet": centrifuge -> purifier) run together.
+- Purifier (dry wash with Magnesol or bentonite): immersion heater, dry wash stirrer, optional level
+  switch at the heater; the purification outlet ("mesh_bed": the valve + pumpout) sends the
+  biodiesel through the filter into the output container on the output load cell (the yield).
 
 The safety rules live here, so they apply no matter who switches things (a process sequence,
 a manual button on the website, or a bug):
 - The heater runs only while the dry wash stirrer runs and the heater is submerged (level switch),
   and never with the purification outlet open. Stopping the stirrer or opening the outlet turns
   the heater off first.
-- The dosing pumps can't run while the reactor outlet valve is open, and the reverse.
-- The centrifuge outlet can't open while the centrifuge spins, and the centrifuge can't start
-  while its outlet is open.
+- The pumps into the reactor (oil, A, B) can't run while the reactor pump is emptying it, and the
+  reverse; only one of them runs at a time.
 - watchdog() turns the heater or the electrodes off if the temperature is too high or lost.
 
 Readings use the website's names: oilMassG (input load cell under the reactor), outputWeightG
@@ -28,7 +30,6 @@ Readings use the website's names: oilMassG (input load cell under the reactor), 
 purificationStirrerRpm, heaterSubmerged (level switch: True = biodiesel covers the heater).
 Any reading is None when there's no valid value or no sensor.
 """
-import random
 import threading
 import time
 from typing import Optional
@@ -37,11 +38,14 @@ from . import config
 
 VALVES = ("reactor_outlet", "centrifuge_outlet", "mesh_bed")
 MOTORS = ("stirrer", "centrifuge", "purification_stirrer")
-PUMPS = ("catalyst", "acid")
+PUMPS = ("catalyst", "acid", "oil")      # "oil": the oil pump, when the machine has one
 
-VALVE_LABELS = {"reactor_outlet": "Reactor outlet valve", "centrifuge_outlet": "Centrifuge outlet valve",
-                "mesh_bed": "Purification outlet valve"}
-PUMP_LABELS = {"catalyst": "Pump A (NaOH/KOH + methanol)", "acid": "Pump B (H₂SO₄ + methanol)"}
+# reactor_outlet / centrifuge_outlet / mesh_bed are pumps (and a valve) on the ESP32 machine
+VALVE_LABELS = {"reactor_outlet": "Reactor pump (reactor → centrifuge)",
+                "centrifuge_outlet": "Pumpin (centrifuge → purifier)",
+                "mesh_bed": "Purification outlet (valve + pumpout)"}
+PUMP_LABELS = {"catalyst": "Pump A (NaOH/KOH + methanol)", "acid": "Pump B (H₂SO₄ + methanol)",
+               "oil": "Oil pump"}
 
 
 class InterlockError(Exception):
@@ -49,12 +53,12 @@ class InterlockError(Exception):
 
 
 class Hardware:
-    def __init__(self):
+    def __init__(self, pumps: tuple = PUMPS):
         self.heater_on = False
         self.electrode_power_on = False
         self.valves = {name: False for name in VALVES}
         self.motor_duty = {name: 0.0 for name in MOTORS}
-        self.pumps = {name: False for name in PUMPS}
+        self.pumps = {name: False for name in pumps}      # only the pumps this machine has
         self._snapshot: Optional[dict] = None
 
     # ----- outputs, with interlocks -----
@@ -90,9 +94,7 @@ class Hardware:
             if name == "mesh_bed" and self.heater_on:
                 self.set_heater(False)
             if name == "reactor_outlet" and any(self.pumps.values()):
-                raise InterlockError("The reactor outlet can't open while a dosing pump is running.")
-            if name == "centrifuge_outlet" and self.motor_duty.get("centrifuge"):
-                raise InterlockError("The centrifuge outlet can't open while the centrifuge is spinning.")
+                raise InterlockError("The reactor pump can't run while a pump into the reactor is running.")
         self._write_valve(name, is_open)
         self.valves[name] = is_open
 
@@ -104,8 +106,6 @@ class Hardware:
         if name not in self.motor_duty:
             raise ValueError(f"Unknown motor: {name}")
         duty = min(max(duty, 0.0), 1.0)
-        if duty > 0 and name == "centrifuge" and self.valves.get("centrifuge_outlet"):
-            raise InterlockError("The centrifuge can't start while its outlet valve is open.")
         if duty == 0 and name == "purification_stirrer" and self.heater_on:
             self.set_heater(False)          # the heater never runs without the stirrer
         self._write_motor(name, duty)
@@ -113,11 +113,13 @@ class Hardware:
 
     def set_pump(self, name: str, on: bool) -> None:
         if name not in self.pumps:
+            if name in PUMPS:
+                raise InterlockError(f"This machine has no {PUMP_LABELS[name].lower()} (hardware.toml).")
             raise ValueError(f"Unknown pump: {name}")
         if on and self.valves.get("reactor_outlet"):
-            raise InterlockError("A dosing pump can't run while the reactor outlet valve is open.")
+            raise InterlockError("A pump into the reactor can't run while the reactor pump is emptying it.")
         if on and any(v for k, v in self.pumps.items() if k != name):
-            raise InterlockError("Only one dosing pump runs at a time.")
+            raise InterlockError("Only one pump into the reactor runs at a time.")
         self._write_pump(name, on)
         self.pumps[name] = on
 
@@ -130,6 +132,50 @@ class Hardware:
             self.set_motor(name, 0.0)
         for name in self.valves:
             self.set_valve(name, False)
+
+    @property
+    def has_oil_pump(self) -> bool:
+        return "oil" in self.pumps
+
+    def any_output_on(self) -> bool:
+        return (self.heater_on or self.electrode_power_on or any(self.valves.values())
+                or any(self.motor_duty.values()) or any(self.pumps.values()))
+
+    # ----- what the hardware can tell about itself (ESP32 mode overrides these) -----
+    @property
+    def link_fault(self) -> Optional[str]:
+        """Why the output controller can't be trusted right now (the ESP32 is offline, or an output
+        didn't follow a command), or None. main.py stops every process when this is set."""
+        return None
+
+    def full_speed_rpm(self, name: str) -> Optional[float]:
+        """RPM at full speed when the hardware knows it (the ESP32 sketch's MAX_RPM for the mixers,
+        [centrifuge] max_rpm), or None to use the Settings value (stirrerMaxRpm ...)."""
+        return None
+
+    def rpm_is_measured(self, key: str) -> bool:
+        """False when the RPM reading is only worked out from the speed setting (no RPM sensor)."""
+        return True
+
+    def describe(self) -> dict:
+        """For the website's Settings -> Hardware card."""
+        return {"backend": "gpio", "fault": self.link_fault, "controller": None,
+                "roles": [], "centrifuge": None, "loadCells": self.load_cells()}
+
+    def load_cells(self) -> list[dict]:
+        return []
+
+    def tare_load_cell(self, key: str) -> dict:
+        raise NotImplementedError("Tare and calibration from the website need the ESP32 hardware mode. "
+                                  "Use: python -m app.hwtest calibrate " + key)
+
+    def calibrate_load_cell(self, key: str, grams: float) -> dict:
+        raise NotImplementedError("Tare and calibration from the website need the ESP32 hardware mode. "
+                                  "Use: python -m app.hwtest calibrate " + key)
+
+    def check_load_cell(self, key: str, grams: float) -> dict:
+        raise NotImplementedError("Tare and calibration from the website need the ESP32 hardware mode. "
+                                  "Use: python -m app.hwtest calibrate " + key)
 
     # ----- inputs -----
     def _output_states(self) -> dict:
@@ -153,9 +199,10 @@ class Hardware:
             return self.refresh()
         return {**self._snapshot, **self._output_states()}
 
-    def watchdog(self, heater_max_c: float, reaction_max_c: float) -> Optional[str]:
-        """Turns the heater or the electrodes off if something is wrong. Returns an alarm
-        message, or None."""
+    def watchdog(self, heater_max_c: float, reaction_max_c: Optional[float] = None) -> Optional[str]:
+        """Turns the heater off if something is wrong (no temperature reading, too hot, level
+        switch dry). Returns an alarm message, or None. The electrodes are not checked against the
+        temperature (the reactions run without a temperature check); reaction_max_c is unused."""
         t = self.read().get("temperature")
         problem = None if t is not None else "temperature reading lost"
         if self.heater_on and (problem or t > heater_max_c):
@@ -164,12 +211,9 @@ class Hardware:
         if self.heater_on and self.read().get("heaterSubmerged") is False:
             self.set_heater(False)
             return "Heater stopped: biodiesel level dropped below the heater."
-        if self.electrode_power_on and (problem or t > reaction_max_c):
-            self.set_electrode_power(False)
-            return f"Electrodes stopped: {problem or f'temperature exceeded {reaction_max_c:g} °C'}."
         return None
 
-    # ----- implemented by MockHardware and PiHardware -----
+    # ----- implemented by Esp32Hardware and PiHardware (and the tests' simulated machine) -----
     def _read_sensors(self) -> dict:
         raise NotImplementedError
 
@@ -196,146 +240,6 @@ class Hardware:
 
     def close(self) -> None:
         pass
-
-
-class MockHardware(Hardware):
-    """A simulated machine. Liquids move between the parts: pumps add premix to the reactor at
-    about 80 g/min, the reactor outlet and the centrifuge outlet pass about 15 g/s (a batch in
-    under a minute), and the
-    purification outlet (through the filter) about 3 g/s. After separation, the biodiesel (85% of
-    the oil's weight) flows on to the purification tank; glycerol and the rest stay in the
-    centrifuge. The heater warms the biodiesel about 45 °C per minute (under 1.5 min to 90 °C).
-    The electrode current stays just under the power supply's current limit.
-    time_scale > 1 makes it run faster for demos."""
-    AMBIENT_C = 27.0
-    PUMP_G_PER_S = 80 / 60
-    DRAIN_G_PER_S = 15.0
-    OUTLET_G_PER_S = 3.0
-    BIODIESEL_FRACTION = 0.85
-
-    def __init__(self, time_scale: float = 1.0):
-        super().__init__()
-        self.time_scale = time_scale
-        self._lock = threading.Lock()
-        self._last = time.monotonic()
-        self.temp_c = self.AMBIENT_C
-        self.oil_g = 0.0          # oil loaded in this batch (sets how much biodiesel it makes)
-        self.reactor_g = 0.0      # on the input load cell
-        self.centrifuge_g = 0.0
-        self.biodiesel_left_g = 0.0   # biodiesel still in the centrifuge
-        self.tank_g = 0.0         # purification tank, above the outlet filter
-        self.output_g = 0.0       # on the output load cell
-        self.supply_voltage = 30.0
-        self.supply_current_limit = 1.0   # set on the supply (by the Pi, or by hand in the simulation)
-
-    # demo helpers (only used in demo mode)
-    def demo_load_oil(self, volume_ml: float, density: float = 0.92) -> None:
-        """A new batch: oil in the reactor, everything else empty."""
-        with self._lock:
-            self.oil_g = volume_ml * density
-            self.reactor_g = self.oil_g
-            self.centrifuge_g = self.biodiesel_left_g = self.tank_g = 0.0
-
-    def demo_add(self, place: str, grams: float) -> None:
-        with self._lock:
-            if place == "reactor":
-                self.reactor_g += grams
-            else:
-                self.tank_g += grams
-
-    def demo_fill_tank(self, grams: float) -> None:
-        with self._lock:
-            self.tank_g = grams
-
-    def demo_set_temperature(self, value: float) -> None:
-        with self._lock:
-            self.temp_c = value
-
-    def demo_finish_flow(self) -> None:
-        with self._lock:
-            self.output_g += self.tank_g
-            self.tank_g = 0.0
-
-    def demo_finish_drain(self, valve: str) -> None:
-        with self._lock:
-            if valve == "reactor_outlet":
-                self._move_to_centrifuge(self.reactor_g)
-            elif valve == "centrifuge_outlet":
-                self._move_to_tank(self.biodiesel_left_g)
-
-    def _move_to_centrifuge(self, grams: float) -> None:
-        grams = min(grams, self.reactor_g)
-        share = grams / self.reactor_g if self.reactor_g else 0.0
-        self.reactor_g -= grams
-        self.centrifuge_g += grams
-        # the oil's share of what moved becomes biodiesel after separation
-        self.biodiesel_left_g += share * self.oil_g * self.BIODIESEL_FRACTION
-        self.oil_g *= (1 - share)
-
-    def _move_to_tank(self, grams: float) -> None:
-        grams = min(grams, self.biodiesel_left_g, self.centrifuge_g)
-        self.biodiesel_left_g -= grams
-        self.centrifuge_g -= grams
-        self.tank_g += grams
-
-    def _advance(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            dt = (now - self._last) * self.time_scale
-            self._last = now
-            if self.heater_on:
-                self.temp_c += 0.75 * dt
-            elif self.electrode_power_on:
-                self.temp_c += (42.0 - self.temp_c) * min(0.002 * dt, 1.0)   # settles near 42 °C
-            else:
-                self.temp_c -= (self.temp_c - self.AMBIENT_C) * min(0.002 * dt, 1.0)
-            if any(self.pumps.values()):
-                self.reactor_g += self.PUMP_G_PER_S * dt
-            if self.valves["reactor_outlet"] and self.reactor_g > 0:
-                self._move_to_centrifuge(self.DRAIN_G_PER_S * dt)
-            if self.valves["centrifuge_outlet"] and self.biodiesel_left_g > 0:
-                self._move_to_tank(self.DRAIN_G_PER_S * dt)
-            if self.valves["mesh_bed"] and self.tank_g > 0:
-                moved = min(self.tank_g, self.OUTLET_G_PER_S * dt)
-                self.tank_g -= moved
-                self.output_g += moved
-
-    def _read_sensors(self) -> dict:
-        self._advance()
-        on = self.electrode_power_on
-        return {
-            "oilMassG": round(self.reactor_g, 1),
-            "outputWeightG": round(self.output_g, 1),
-            "temperature": round(self.temp_c + random.uniform(-0.1, 0.1), 1),
-            "voltage": self.supply_voltage if on else 0.0,
-            "current": round(self.supply_current_limit * 0.9 + random.uniform(-0.02, 0.02), 2) if on else 0.0,
-            "stirrerRpm": round(self.motor_duty["stirrer"] * 900),
-            "centrifugeRpm": round(self.motor_duty["centrifuge"] * 3000),
-            "purificationStirrerRpm": (round(self.motor_duty["purification_stirrer"] * 600 + random.uniform(-3, 2))
-                                       if self.motor_duty["purification_stirrer"] else 0),
-            "heaterSubmerged": self.tank_g > 30,   # simulated level switch at the heater's height
-        }
-
-    def _write_heater(self, on: bool) -> None:
-        self._advance()
-
-    def _write_electrode_power(self, on: bool) -> None:
-        self._advance()
-
-    def _write_valve(self, name: str, is_open: bool) -> None:
-        self._advance()
-
-    def _write_motor(self, name: str, duty: float) -> None:
-        self._advance()
-
-    def _write_pump(self, name: str, on: bool) -> None:
-        self._advance()
-
-    def _write_current_limit(self, amps: float) -> None:
-        self.supply_current_limit = amps
-
-    def _write_voltage(self, volts: float) -> None:
-        self.supply_voltage = volts
 
 
 class _Sampler:
@@ -377,15 +281,15 @@ class PiHardware(Hardware):
     To use a sensor that isn't supported, replace the matching _read_... method below."""
 
     def __init__(self, hw_config: Optional[dict] = None):
-        super().__init__()
         from gpiozero import Button, OutputDevice, PWMOutputDevice  # apt: python3-gpiozero python3-lgpio
 
         from . import drivers
 
         cfg = hw_config or config.HARDWARE
-        problems = config.check_hardware(cfg)
+        problems = config.check_hardware(cfg, backend="gpio")
         if problems:
             raise RuntimeError("hardware.toml: " + " ".join(problems))
+        super().__init__(tuple(name for name in PUMPS if cfg["pumps"].get(name) is not None))
         self.cfg = cfg
         active_high = cfg["relays"]["active_high"]
         self._closables: list = []
@@ -397,7 +301,7 @@ class PiHardware(Hardware):
 
         self._heater = relay(cfg["relays"]["heater"])
         self._electrodes = relay(cfg["relays"]["electrode_power"])
-        self._pumps = {name: relay(cfg["pumps"][name]) for name in PUMPS}
+        self._pumps = {name: relay(cfg["pumps"][name]) for name in self.pumps}
 
         # Valves: "single" = one relay, ON = open (2-wire NC solenoid, spring return).
         #         "dual"   = 3-wire motorized ball valve: one relay powers OPEN, the other CLOSE.
@@ -441,9 +345,11 @@ class PiHardware(Hardware):
         if cells:
             lgpio, chip = drivers.open_gpiochip(cfg.get("gpiochip"))
             self._lgpio_chip = (lgpio, chip)
+            store = drivers.CalibrationStore(config.CALIBRATION_FILE)   # python -m app.hwtest calibrate
             for key, c in cells.items():
-                scale = drivers.HX711Scale(lgpio, chip, c["data_pin"], c["clock_pin"], c.get("offset", 0),
-                                           c.get("scale", 1.0), c.get("samples", 3))
+                saved = store.get(key)
+                scale = drivers.HX711Scale(lgpio, chip, c["data_pin"], c["clock_pin"], saved.get("offset", c.get("offset", 0)),
+                                           saved.get("scale", c.get("scale", 1.0)), c.get("samples", 3))
                 self._scales[key] = scale
                 self._samplers[f"weight_{key}"] = _Sampler(f"weight-{key}", scale.read_grams, 0.05)
 
@@ -561,12 +467,31 @@ class PiHardware(Hardware):
 
 
 def create_hardware() -> Hardware:
-    if config.MOCK:
-        return MockHardware(config.TIME_SCALE)
+    """The real machine, from hardware.toml [actuators] backend: "esp32" (the ESP32 controller on
+    USB + the Pi's centrifuge and load cell, see esp32.py) or "gpio" (the older wiring with
+    everything on the Pi's pins). The backend runs on the Raspberry Pi only."""
+    actuator_backend = config.actuator_backend(config.HARDWARE)
+    if actuator_backend == "esp32":
+        try:
+            from .esp32 import Esp32Hardware
+            return Esp32Hardware()
+        except ImportError as e:
+            raise RuntimeError(
+                f"Hardware mode (ESP32) needs lgpio and pyserial on the Raspberry Pi: {e}. Run setup-pi.sh "
+                "(sudo apt install python3-lgpio python3-serial). The backend runs on the Raspberry Pi that is wired to the machine."
+            ) from None
+        except Exception as e:
+            if "busy" in str(e).lower():     # lgpio: another program holds the centrifuge / load cell pins
+                raise RuntimeError(f"{e}: another program uses the Pi's GPIO pins. Stop the old control panel "
+                                   "(sudo systemctl disable --now pi-control) and try again.") from None
+            raise
+    if actuator_backend != "gpio":
+        raise RuntimeError(f"Unknown hardware.toml actuators.backend={actuator_backend!r}; use 'gpio' or 'esp32'.")
+
     try:
         import gpiozero  # noqa: F401  (only installed on the Raspberry Pi)
     except ImportError:
         raise RuntimeError(
-            "GREENOVA_MOCK=0 (hardware mode) only works on the Raspberry Pi with gpiozero installed. "
-            "On a laptop, remove GREENOVA_MOCK (or set it to 1) to use demo mode.") from None
+            "backend = \"gpio\" needs the Raspberry Pi's gpiozero (sudo apt install python3-gpiozero). "
+            "The backend runs on the Raspberry Pi that is wired to the machine.") from None
     return PiHardware()

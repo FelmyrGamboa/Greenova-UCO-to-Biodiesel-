@@ -80,11 +80,16 @@ class FakeLgpio:
         if dout is not None and level == 1:
             self.edges[dout] = self.edges[dout] + 1 if self.edges[dout] < 25 else 1
         if dout is not None and level == 0 and self.edges[dout] == 25:
-            self.edges[dout] = 0
+            self.edges[dout] = -1              # the 25th pulse pulls DT high until the next conversion
 
     def gpio_read(self, h, pin):
         n = self.edges.get(pin, 0)
-        if n == 0 or n > 24:
+        if n == -1:
+            self.edges[pin] = 0                # high once, then the next conversion is ready
+            return 1
+        if n > 24:
+            return 1
+        if n == 0:
             return 0                           # ready
         raw = self.RAW[pin] & 0xFFFFFF
         return (raw >> (24 - n)) & 1
@@ -126,7 +131,11 @@ def fake_pi(monkeypatch):
 
 
 def _config(**changes):
+    """The older all-on-the-Pi wiring ([actuators] backend = "gpio") with its original pins."""
     cfg = config.load_hardware(Path("/nonexistent.toml"))
+    cfg["actuators"]["backend"] = "gpio"
+    cfg["load_cells"]["reactor"].update(enabled=False, data_pin=27, clock_pin=22, samples=3)
+    cfg["load_cells"]["output"].update(enabled=False, data_pin=10, clock_pin=9, samples=3)
     for path, value in changes.items():
         node = cfg
         keys = path.split(".")
@@ -142,11 +151,15 @@ def test_example_file_matches_the_defaults():
     assert config.check_hardware(from_file) == []
 
 
+def test_gpio_wiring_has_no_conflicts():
+    assert config.check_hardware(_config()) == []
+
+
 def test_pin_conflicts_are_found():
     cfg = _config(**{"pumps.acid": 23})
     assert any("GPIO23 is used twice" in p for p in config.check_hardware(cfg))
-    cfg = _config(**{"relays.heater": 17})
-    assert any("strip reader LED" in p for p in config.check_hardware(cfg))
+    cfg = _config(**{"relays.heater": 2})
+    assert any("already used by the I2C SDA" in p for p in config.check_hardware(cfg))
     cfg = _config(**{"load_cells.reactor.enabled": True, "load_cells.reactor.data_pin": 5})
     assert any("GPIO5 is used twice" in p for p in config.check_hardware(cfg))
 
@@ -222,3 +235,27 @@ def test_pi_hardware_refuses_a_bad_configuration(fake_pi):
     from app.hardware import PiHardware
     with pytest.raises(RuntimeError, match="used twice"):
         PiHardware(_config(**{"pumps.acid": 5}))
+
+
+def test_esp32_mode_needs_the_pi_libraries(monkeypatch):
+    """Hardware mode on a computer without lgpio: a clear message instead of a traceback.
+    (The ESP32 mode itself is tested in test_esp32.py.)"""
+    from app.hardware import create_hardware
+    monkeypatch.setitem(config.HARDWARE["actuators"], "backend", "esp32")
+    monkeypatch.setitem(sys.modules, "lgpio", None)          # import lgpio -> ImportError
+    with pytest.raises(RuntimeError, match="needs lgpio and pyserial"):
+        create_hardware()
+
+
+def test_hx711_conversion_with_a_long_clock_pulse_is_thrown_away(monkeypatch):
+    """SCK high for 60 µs or more powers the HX711 down mid-read: that conversion is spoiled and
+    dropped (None), the next one counts again."""
+    from app import drivers
+    lg = FakeLgpio()
+    hx = drivers.HX711Scale(lg, 0, 27, 22)
+    assert hx.read_raw() == 47000
+    ticks = iter([0.0, 0.0001] + [0.0] * 200)                   # the first pulse took 100 µs
+    monkeypatch.setattr(drivers.time, "perf_counter", lambda: next(ticks))
+    assert hx.read_raw() is None and hx.spoiled == 1
+    monkeypatch.undo()
+    assert hx.read_raw() == 47000
