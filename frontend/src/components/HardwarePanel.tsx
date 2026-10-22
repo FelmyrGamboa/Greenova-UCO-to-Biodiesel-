@@ -165,12 +165,11 @@ function LoadCellCard({ cell, canCalibrate, onChange }: { cell: LoadCellInfo; ca
       if (step === "tare") {
         const done = await tareLoadCell(cell.key);
         onChange(done.loadCells);
-        setMessage({ ok: true, text: t("Zeroed. Now put a known weight on it, type its grams and press Add weight.") });
+        setMessage({ ok: true, text: t("Zeroed.") });
       } else {
         const done = await calibrateLoadCell(cell.key, known);
         onChange(done.loadCells);
-        setGrams("");
-        setMessage({ ok: true, text: t("Calibrated with {count} weight(s): {scale} counts per gram (noise about {noise} g). Add another, different weight for more accuracy.", { count: done.result.points.length, scale: done.result.scale.toFixed(3), noise: done.result.resolutionG }) });
+        setMessage({ ok: true, text: t("Calibrated: {scale} counts per gram (noise about {noise} g).", { scale: done.result.scale.toFixed(3), noise: done.result.resolutionG }) });
       }
     } catch (e) {
       setMessage({ ok: false, text: e instanceof Error ? t(e.message) : String(e) });
@@ -199,16 +198,11 @@ function LoadCellCard({ cell, canCalibrate, onChange }: { cell: LoadCellInfo; ca
       ) : canCalibrate ? (
         <div className="mt-4 space-y-3">
           <div className="flex flex-wrap items-end gap-3">
-            <Button variant="secondary" disabled={busy !== null} onClick={() => run("tare")}>{busy === "tare" ? t("Zeroing… (5 s)") : t("1. Tare (empty)")}</Button>
+            <Button variant="secondary" disabled={busy !== null} onClick={() => run("tare")}>{busy === "tare" ? t("Zeroing… (3 s)") : t("Tare (empty)")}</Button>
             <div className="w-36"><Field label={t("Known weight")} inputMode="decimal" value={grams} onChange={(event) => setGrams(event.target.value.replace(/[^\d.]/g, ""))} unit="g" /></div>
-            <Button variant="secondary" disabled={busy !== null || !cell.taredThisSession} onClick={() => run("calibrate")}>{busy === "calibrate" ? t("Measuring… (5 s)") : t("2. Add weight")}</Button>
+            <Button variant="secondary" disabled={busy !== null} onClick={() => run("calibrate")}>{busy === "calibrate" ? t("Calibrating… (3 s)") : t("Calibrate")}</Button>
           </div>
-          {cell.points && cell.points.length > 0 && (
-            <div className="text-xs leading-5 text-gray-500" data-testid="calibration-points">
-              {t("Last calibration")}: {cell.points.map((p) => `${p.grams} g → ${p.errorG >= 0 ? "+" : ""}${p.errorG.toFixed(1)} g`).join(" · ")}
-            </div>
-          )}
-          <p className="text-xs leading-5 text-gray-600">{t("1. Empty it (or only the empty container), keep it still and press Tare. 2. Put a known weight on it, type its grams and press Add weight. Add two or three different weights (for example 200 g, 500 g, 1000 g) for the best accuracy: the scale is fitted through all of them. Only while no process is running. When the machine is idle, the zero follows small drifts by itself.")}</p>
+          <p className="text-xs leading-5 text-gray-600">{t("1. Empty it (or only the empty container) and press Tare. 2. Put a known weight on it, type its grams and press Calibrate. Only while no process is running.")}</p>
         </div>
       ) : (
         <p className="mt-3 text-xs leading-5 text-gray-500">{t("Calibrate with: python -m app.hwtest calibrate {key}", { key: cell.key })}</p>

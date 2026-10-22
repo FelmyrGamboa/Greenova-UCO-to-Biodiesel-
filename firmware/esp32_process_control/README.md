@@ -47,8 +47,8 @@ cell are wired to the Raspberry Pi, not to the ESP32 (see `docs/RASPBERRY_PI_SET
 - **Speeds.** Mixer speeds are sent in the sketch's RPM (0–1544, `MAX_RPM`), always with the RPM
   (`mixer2 on 5 200`), never a bare `mixer2 on` (which would run at full speed). The RPM sent is
   exactly the set speed (mixer 2: 200 RPM; mixer 1: the stage's stirring speed), so the sketch's
-  STATUS, its Serial Monitor `status` and its web page show the same RPM as the website (no start
-  kick unless `mixer_kick_seconds` is set).
+  STATUS, its Serial Monitor `status` and its web page show the same RPM as the website. Each start
+  begins with about 1 s at full speed (1544) so the motor gets going.
 - **One change in the sketch: `#define MIN_PWM 90`** (was 0). The sketch turns RPM into PWM in a
   straight line from MIN_PWM (1 RPM) to 255 (1544 RPM); with 0, 200 RPM was PWM 33 and the mixers
   behind the L298N didn't turn. With 90, 200 RPM is PWM 111 and 700 RPM is PWM 164. STATUS also

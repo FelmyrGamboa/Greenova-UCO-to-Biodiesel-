@@ -4,15 +4,13 @@
 #      panel, a native Greenova service, a serial monitor),
 #   2. checks that the ESP32 and the GPIO chip are there,
 #   3. builds and starts MySQL, the backend and the website,
-#   4. asks the backend what works: ESP32, temperature, centrifuge, output load cell,
-#   5. opens the website in the Pi's browser (and from then on after every reboot).
+#   4. asks the backend what works: ESP32, temperature, centrifuge, output load cell.
 #
 #     cd ~/Desktop/Greenova-UCO-to-Biodiesel-/dockerfiles
 #     bash start-machine.sh                  start / restart and check
 #     bash start-machine.sh --check          only the check (Greenova already running)
 #     bash start-machine.sh --test-outputs   switch each output for 2 s, one by one (bench test)
 #     bash start-machine.sh --test-mixers    find the lowest PWM where mixer 1 and mixer 2 turn
-#     bash open-website.sh                   open the website in the browser (also after a reboot)
 set -uo pipefail
 cd "$(dirname "$0")"
 HERE="$(pwd)"
@@ -180,23 +178,3 @@ check_hardware
 ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
 echo "Website: http://${ip:-<pi-address>}:${FRONTEND_PORT:-8443}"
-
-step "5. Opening the website in the browser"
-# after every reboot too: a desktop autostart entry runs open-website.sh at login
-if [ -d "$HOME/.config" ]; then
-  mkdir -p "$HOME/.config/autostart"
-  cat > "$HOME/.config/autostart/greenova-website.desktop" <<DESKTOP
-[Desktop Entry]
-Type=Application
-Name=Greenova website
-Comment=Opens the Greenova website when the Pi has started it
-Exec=bash "$HERE/open-website.sh"
-Terminal=false
-X-GNOME-Autostart-enabled=true
-DESKTOP
-  echo "Installed: the website also opens by itself after each reboot ($HOME/.config/autostart/greenova-website.desktop)."
-fi
-if [ "${GREENOVA_NO_BROWSER:-0}" != "1" ]; then
-  nohup bash "$HERE/open-website.sh" >/dev/null 2>&1 &
-  echo "The browser opens http://localhost:${FRONTEND_PORT:-8443}/dashboard as soon as the website answers."
-fi

@@ -58,7 +58,7 @@ export default function Settings() {
   // Separation defaults: each batch sets its own time and speed (Volume & Parameters), starting from these.
   const [separationTime, setSeparationTime] = useState(numberSetting("separationTime", 60));
   const [separationSpeed, setSeparationSpeed] = useState(String(Math.min(Number(numberSetting("separationSpeed", 2500)), 2500)));
-  const [heaterPowerWatts, setHeaterPowerWatts] = useState(numberSetting("heaterPowerWatts", 900));
+  const [heaterPowerWatts] = useState(numberSetting("heaterPowerWatts", 900));   // kept as saved (no energy figure any more)
   const [esterificationDesignFfa, setEsterificationDesignFfa] = useState(numberSetting("esterificationDesignFfa", 10));
   const [stripMaxFfa] = useState("5");
   const [provenBatchCount, setProvenBatchCount] = useState(whole(initialSettings.provenBatchCount || 3, 3));
@@ -70,7 +70,7 @@ export default function Settings() {
   const [sulfuricAcidPrice, setSulfuricAcidPrice] = useState(whole(initialSettings.sulfuricAcidPrice || 120, 120));
   const [acetonePrice, setAcetonePrice] = useState(whole(initialSettings.acetonePrice || 100, 100));
   const [bentonitePrice, setBentonitePrice] = useState(whole(initialSettings.bentonitePrice || 80, 80));
-  const [electricityPrice, setElectricityPrice] = useState(whole(initialSettings.electricityPrice || 12, 12));
+  const [electricityPrice] = useState(whole(initialSettings.electricityPrice || 12, 12));   // kept as saved (cost per liter is materials only)
   const [dieselPrice, setDieselPrice] = useState(whole(initialSettings.dieselPrice || 55, 55));
   const [magnesolPrice, setMagnesolPrice] = useState(whole(initialSettings.magnesolPrice || 250, 250));
   // Dry wash adsorbent: doses in % of the oil weight, and which one a new batch starts with
@@ -206,7 +206,6 @@ export default function Settings() {
           <Field label={t("Acetone price")} inputMode="numeric" pattern="[0-9]*" value={acetonePrice} onChange={wholeInput(setAcetonePrice)} unit="₱/L" />
           <Field label={t("Bentonite price")} inputMode="numeric" pattern="[0-9]*" value={bentonitePrice} onChange={wholeInput(setBentonitePrice)} unit="₱/kg" />
           <Field label={t("Magnesol price")} inputMode="numeric" pattern="[0-9]*" value={magnesolPrice} onChange={wholeInput(setMagnesolPrice)} unit="₱/kg" />
-          <Field label={t("Electricity price")} inputMode="numeric" pattern="[0-9]*" value={electricityPrice} onChange={wholeInput(setElectricityPrice)} unit="₱/kWh" />
           <Field label={t("Diesel price")} inputMode="numeric" pattern="[0-9]*" value={dieselPrice} onChange={wholeInput(setDieselPrice)} unit="₱/L" />
         </div>
         <p className="mt-3 text-xs text-gray-600">{t("Default FFA ranges (whole percent): 0–3% goes directly to transesterification, 4% is esterified, and 5% or above is recorded using the strip’s darkest color.")}</p>
@@ -224,7 +223,6 @@ export default function Settings() {
           <Field label={t("Maximum batch volume")} value={oilMaximumVolumeMl} onChange={wholeInput(setOilMaximumVolumeMl)} inputMode="numeric" pattern="[0-9]*" unit="mL" />
           <Field label={t("Default separation time")} value={separationTime} onChange={wholeInput(setSeparationTime)} inputMode="numeric" pattern="[0-9]*" unit="min" />
           <Field label={t("Default centrifuge speed")} value={separationSpeed} onChange={wholeInput(setSeparationSpeed)} inputMode="numeric" pattern="[0-9]*" unit="RPM" />
-          <Field label={t("Heater power (for the energy used)")} value={heaterPowerWatts} onChange={wholeInput(setHeaterPowerWatts)} inputMode="numeric" pattern="[0-9]*" unit="W" />
           <Field label={t("Batch naming format")} value={format} placeholder={DEFAULT_BATCH_FORMAT} onChange={(event) => setFormat(event.target.value)} />
         </div>
       </Card>

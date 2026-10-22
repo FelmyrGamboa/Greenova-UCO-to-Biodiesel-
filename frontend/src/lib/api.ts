@@ -624,14 +624,6 @@ export type LoadCellInfo = {
   scale?: number;
   busy?: boolean;
   calibratedAt?: string | null;
-  /** The last calibration's known weights and how far each reads from its true weight (g). */
-  points?: Array<{ grams: number; errorG: number }>;
-  /** A Tare was done in this session, so known weights can be added. */
-  taredThisSession?: boolean;
-  /** How far automatic zero tracking has moved the zero since the Tare (g). */
-  zeroTrackedG?: number;
-  /** Conversions thrown away because a clock pulse was too long. */
-  spoiledReadings?: number;
   taredAt?: string | null;
 };
 
@@ -658,13 +650,12 @@ export type HardwareInfo = {
 };
 
 export const getHardware = () => get<HardwareInfo>("/api/hardware");
-/** Zero the load cell: nothing on it (or only the empty container). Takes about 5 s. */
+/** Zero the load cell: nothing on it (or only the empty container). Takes about 3 s. */
 export const tareLoadCell = (key: string) =>
-  send<{ result: { offset: number; noiseG: number }; loadCells: LoadCellInfo[] }>("POST", `/api/hardware/load-cells/${key}/tare`);
-/** A known weight (grams) is on the tared load cell: adds it and fits the scale through the zero
- * and every weight added since the Tare. Takes about 5 s. */
+  send<{ result: { offset: number }; loadCells: LoadCellInfo[] }>("POST", `/api/hardware/load-cells/${key}/tare`);
+/** A known weight (grams) is on the tared load cell: works out its scale. Takes about 3 s. */
 export const calibrateLoadCell = (key: string, grams: number) =>
-  send<{ result: { scale: number; resolutionG: number; points: Array<{ grams: number; errorG: number }> }; loadCells: LoadCellInfo[] }>(
+  send<{ result: { scale: number; resolutionG: number }; loadCells: LoadCellInfo[] }>(
     "POST", `/api/hardware/load-cells/${key}/calibrate`, { grams });
 /** This computer's addresses on the local network, for "Open on phone". */
 export const getNetworkAddresses = async () => (await get<{ addresses: string[] }>("/api/network")).addresses;

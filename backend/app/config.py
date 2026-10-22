@@ -92,7 +92,8 @@ HARDWARE_DEFAULTS: dict = {
         "poll_seconds": 1.0,
         "offline_after_seconds": 3.5,
         "mixer_max_rpm": 1544,           # the sketch's MAX_RPM (used until the ESP32 reports its own)
-        "mixer_kick_seconds": 0.0,       # optional: each mixer start at full speed this long first (0 = no)
+        "mixer_min_pwm": 90,             # only for an older sketch with MIN_PWM 0 (the current one has MIN_PWM 90)
+        "mixer_kick_seconds": 1.0,       # every mixer start: this long at full speed first
         # Greenova job -> ESP32 device name(s) in esp32_process_control.ino ("" = not fitted)
         "devices": {
             "heater": "heater",
@@ -132,18 +133,12 @@ HARDWARE_DEFAULTS: dict = {
     "load_cells": {
         # ESP32 mode: the output load cell is the HX711 on DT 17 / SCK 27, with the calibration from the
         # Pi control panel's config.json (offset 41028.54; factor 145759 per kg = 145.759 counts per gram).
-        "reactor": {"enabled": False, "data_pin": 5, "clock_pin": 6, "offset": 0, "scale": 420.0, "samples": 20,
-                    "cal_seconds": 5.0, "capacity_kg": 5, "vessel_kg": 0},
+        "reactor": {"enabled": False, "data_pin": 5, "clock_pin": 6, "offset": 0, "scale": 420.0, "samples": 10,
+                    "cal_seconds": 3.0, "capacity_kg": 5, "vessel_kg": 0},
         "output": {"enabled": True, "data_pin": 17, "clock_pin": 27, "offset": 41028.54, "scale": 145.759,
-                   "samples": 20, "cal_seconds": 5.0, "capacity_kg": 5, "vessel_kg": 0},
+                   "samples": 10, "cal_seconds": 3.0, "capacity_kg": 5, "vessel_kg": 0},
     },
     "power_monitor": {"type": "none", "i2c_bus": 1, "address": 0x40, "shunt_ohms": 0.02},
-    # Rated power (W) of each part, for the batch's energy (energy.py: power × time on). Replace
-    # them with the values on each part's label or datasheet. The heater is Settings → Heater power;
-    # the electrodes are measured (INA226) or the stage's voltage × current limit.
-    "energy": {"stirrer_w": 24, "purification_stirrer_w": 24, "centrifuge_w": 120,
-               "oil_pump_w": 24, "catalyst_pump_w": 12, "acid_pump_w": 12,
-               "reactor_pump_w": 24, "pumpin_w": 24, "pumpout_w": 30},
     "rpm": {
         "stirrer": {"enabled": False, "pin": 21, "pulses_per_rev": 1},
         "centrifuge": {"enabled": False, "pin": 19, "pulses_per_rev": 1},

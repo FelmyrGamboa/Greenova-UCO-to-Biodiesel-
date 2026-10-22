@@ -583,10 +583,8 @@ function StageControls({
       {(state === "running" || state === "paused") && (
         <Button variant="danger" onClick={() => setState("fault")}>{t("Emergency stop")}</Button>
       )}
-      {/* a stopped stage needs no reset: it can be started again straight away */}
-      {state === "fault" && <Status tone="red">{t("Stopped")}</Status>}
-      {state === "fault" && <Button disabled={Boolean(startBlocked)} onClick={() => setState("running")}>{t("Start again")}</Button>}
-      {state === "fault" && startBlocked && <span className="text-xs text-amber-400">{startBlocked}</span>}
+      {state === "fault" && <Status tone="red">{t("Fault — controller reset required")}</Status>}
+      {state === "fault" && onReset && <Button variant="secondary" onClick={onReset}>{t("Reset controller")}</Button>}
     </div>
     {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
     </>
@@ -1628,7 +1626,7 @@ export default function NewBatch() {
     setActionError(null);
     try {
       let result: StageStatus;
-      if (nextState === "running" && (current === "ready" || current === "fault")) {
+      if (nextState === "running" && current === "ready") {
         // the batch's separation time and speed go with each start: the Pi starts the separation
         // by itself after transesterification (and a Separation start uses them directly)
         const separation = { separationTime: Number(sepTime), separationSpeed: Number(sepSpeed) };
@@ -1783,7 +1781,7 @@ export default function NewBatch() {
   const showManualStart = purification.phase === "ready" && !purification.stopReason && !autoStartPending
     && separationState !== "running" && separationState !== "paused";
 
-  /** The batch record the website saves. The Pi adds what it measured itself (temperatures, energy,
+  /** The batch record the website saves (energy is not measured: it stays 0). The Pi adds what it measured itself (temperatures,
    * purification, output weight and yield). Every number goes through num(), so no field is ever
    * missing or NaN (a missing value used to stop the save with "Field required"). */
   function batchRecord(): Partial<BatchData> & { id: string } {
@@ -2879,7 +2877,6 @@ export default function NewBatch() {
               />
               <Metric label={t("Biodiesel output")} value={savedBatch?.biodieselOutputMl ? t("{ml} mL · {pct}% yield", { ml: savedBatch.biodieselOutputMl.toFixed(1), pct: savedBatch.yield }) : t("Not measured")} sub={savedBatch?.biodieselOutputMl ? `${t("Output load cell")}${savedBatch.purification?.outputWeightG ? ` · ${savedBatch.purification.outputWeightG.toFixed(1)} g` : ""}` : undefined} />
               {savedBatch && <Metric label={t("Average reaction temperature")} value={`${savedBatch.temperature} °C`} sub={t("Measured during transesterification")} />}
-              {savedBatch && <Metric label={t("Energy used")} value={savedBatch.energy ? `${savedBatch.energy.toFixed(3)} kWh` : "—"} sub={t("Power × time on of each part (see the timeline)")} />}
               <Metric label={t("Completion date")} value={completedAt ? completedAt.toLocaleString() : "—"} />
             </div>
             <div className="mt-7 flex flex-wrap gap-3">

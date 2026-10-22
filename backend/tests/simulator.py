@@ -142,11 +142,9 @@ class SimulatedMachine(Hardware):
 
     # the simulated power supply follows the stage's settings (as if the operator set them)
     def set_current_limit(self, amps: float) -> None:
-        super().set_current_limit(amps)
         self.supply_current_limit = amps
 
     def set_supply_voltage(self, volts: float) -> None:
-        super().set_supply_voltage(volts)
         self.supply_voltage = volts
 
     def full_speed_rpm(self, name: str):

@@ -167,8 +167,7 @@ def test_range_rows_on_sample_data():
     # yield: mean and range of the completed batches in the range (B-2026-019, -022, -024)
     assert r["recommendedBatchId"] == "B-2026-022" and r["completedBatches"] == 3
     assert approx(r["averageYield"], 88.37) and r["minimumYield"] == 87.6 and r["maximumYield"] == 89.1
-    assert r["yield"]["n"] == 3 and approx(r["costPerLiter"]["mean"], 102.66)
-    assert r["energyKwh"]["n"] == 3 and approx(r["energyKwh"]["mean"], 1.96) and r["energyKwh"]["max"] == 2.16
+    assert r["yield"]["n"] == 3 and approx(r["costPerLiter"]["mean"], 89.17)
     assert r["esterificationRun"] is False
     assert rows["4-5"]["recommendedParameters"]["esterificationVoltage"] == 20
     assert rows["5+"]["testedBatches"] == 0     # B-2026-023 is pending, B-2026-021 failed (not tested)
@@ -209,11 +208,10 @@ def test_summary_and_cost():
     assert approx(summary["averageYield"], 87.54)
     assert summary["minimumYield"] == 85.7 and summary["maximumYield"] == 89.1   # mean and range
     cost = analytics.cost_report(batches, S)
-    # completed batches, oldest first; materials + energy × electricity price, same formula as the website
+    # completed batches, oldest first; materials only (no energy), same formula as the website
     assert [r["id"] for r in cost["batches"]] == ["B-2026-019", "B-2026-020", "B-2026-022", "B-2026-023", "B-2026-024"]
-    assert approx(next(r for r in cost["batches"] if r["id"] == "B-2026-024")["costPerLiter"], 101.62)
-    assert approx(cost["minimumCost"], 98.53) and approx(cost["maximumCost"], 119.71)
-    assert summary["energyKwh"] == {"n": 5, "mean": pytest.approx(1.862), "min": 1.52, "max": 2.16}
+    assert approx(next(r for r in cost["batches"] if r["id"] == "B-2026-024")["costPerLiter"], 89.13)
+    assert approx(cost["minimumCost"], 88.43) and approx(cost["maximumCost"], 113.63)
     assert cost["targetCost"] == 27.5
 
 
@@ -864,66 +862,3 @@ def test_database(mysql_db):
 def test_failed_batches_are_not_tested():
     b = Batch.model_validate({"id": "B-1", "date": "2026-10-11", "oilVolume": 500, "status": "Failed"})
     assert b.lab_result == "Not tested"
-
-
-# ---------- energy used ----------
-def test_energy_is_power_times_time_on():
-    """No electricity meter: the energy is each part's power × the seconds it was on, counted at
-    every sensor reading (once per second)."""
-    from app.energy import EnergyMeter
-    hw = SimulatedMachine()
-    hw.fill_tank(400)
-    meter = EnergyMeter({"stirrer_w": 24, "purification_stirrer_w": 20, "centrifuge_w": 120, "oil_pump_w": 24,
-                         "catalyst_pump_w": 12, "acid_pump_w": 12, "reactor_pump_w": 24, "pumpin_w": 24,
-                         "pumpout_w": 30})
-    meter.heater_watts = 900
-    clock = {"t": 0.0}
-
-    def run(seconds, reading=None):
-        for _ in range(seconds):
-            clock["t"] += 1
-            meter.update(hw, reading or {}, now=clock["t"])
-    meter.update(hw, {}, now=0.0)
-    start = meter.totals()
-    hw.set_current_limit(1)
-    hw.set_supply_voltage(30)                    # the stage's 30 V × 1 A on the CC/CV module
-    hw.set_electrode_power(True)
-    hw.set_motor("stirrer", 0.5)                 # half speed: half its 24 W
-    run(3600)                                    # one hour
-    hw.set_electrode_power(False)
-    hw.set_motor("stirrer", 0)
-    hw.set_motor("purification_stirrer", 1.0)
-    hw.refresh()
-    hw.set_heater(True)
-    run(4)                                       # a 4 s heater pulse, mixer 2 on
-    hw.set_heater(False)
-    used = meter.used_since(start, meter.totals())
-    assert used["electrodes"] == pytest.approx(30.0) and used["stirrer"] == pytest.approx(12.0)
-    assert used["heater"] == pytest.approx(900 * 4 / 3600) and used["purification_stirrer"] == pytest.approx(20 * 4 / 3600)
-    kwh, line = meter.describe(used)
-    assert kwh == pytest.approx(0.043, abs=0.001) and line.startswith("Energy used: 0.043 kWh")
-    assert "electrodes 0.030" in line and "mixer 1 0.012" in line and "heater 0.001" in line
-    # a measured power monitor reading wins over the CC/CV setting
-    hw.set_electrode_power(True)
-    before = meter.totals()["electrodes"]
-    run(2, {"voltage": 24.0, "current": 0.5})
-    assert meter.totals()["electrodes"] - before == pytest.approx(24 * 0.5 * 2 / 3600)
-    # a long gap (a pause, a restart) isn't counted as hours of on-time
-    before = meter.totals()["electrodes"]
-    meter.update(hw, {"voltage": 24.0, "current": 0.5}, now=clock["t"] + 600)
-    assert meter.totals()["electrodes"] - before == pytest.approx(24 * 0.5 * 5 / 3600)
-
-
-def test_a_stopped_stage_starts_again_without_a_reset():
-    """No "controller reset required": after an emergency stop the stage can be started again."""
-    hw = _machine()
-    runner = StageRunner(hw, 2000)
-
-    async def scenario():
-        runner.start("Esterification", S, voltage=20, time_min=30, stirring=500)
-        await runner.emergency_stop("emergency stop")
-        assert runner.state["state"] == "fault" and not hw.electrode_power_on
-        runner.start("Esterification", S, voltage=25, time_min=30, stirring=500)
-        assert runner.state["state"] == "running" and runner.state["voltage"] == 25 and hw.electrode_power_on
-        await runner.emergency_stop("test over")
-    run(scenario())

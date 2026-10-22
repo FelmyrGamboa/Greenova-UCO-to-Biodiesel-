@@ -48,15 +48,14 @@ They run anywhere (a laptop too): the process tests use `tests/simulator.py`, a 
 | `app/main.py` | The app: reads the sensors every second, runs the watchdog, stops everything when the ESP32 is lost, starts purification after separation, serves the website |
 | `app/api.py` | All endpoints (see `API.md`) and the hand-offs between the processes |
 | `app/calculations.py` | Esterification, transesterification and adsorbent amounts (same as `calculateQuantityCards`) |
-| `app/analytics.py` | Statistical treatment: completion and lab pass rates; mean and range of yield, energy (kWh) and cost per liter (materials + electricity) per FFA range; recommended (Proven) settings |
-| `app/energy.py` | Energy used per batch: power × time on of each part, counted every second (heater, electrodes, mixers, centrifuge, pumps; ratings in `[energy]`) |
+| `app/analytics.py` | Statistical treatment: completion and lab pass rates; mean and range of yield and cost per liter (materials only) per FFA range; recommended (Proven) settings |
 | `app/stages.py` | Esterification, Transesterification and Separation (settle, then reactor pump + centrifuge + pumpin) |
 | `app/transfers.py` | The oil pump and the dispensers (pump A, pump B): on until the operator presses Done |
 | `app/purification.py` | Purification: methanol removal straight away (heater in 4 s pulses) → add Magnesol → contact → settle → drain until the output load cell is stable for 30 s |
 | `app/system.py` | System Status tiles and device list |
 | `app/hardware.py` | Safety interlocks and the older all-on-the-Pi wiring (`PiHardware`, `backend = "gpio"`) |
 | `app/esp32.py` | The machine (`backend = "esp32"`, the default): the ESP32 serial link (dead-man timer, status checks) and `Esp32Hardware` with the Pi's centrifuge and load cells |
-| `app/drivers.py` | Pi sensor drivers: HX711 load cells (spike filter, trimmed mean, zero tracking while idle, multi-weight calibration), INA226/INA219 power monitor, RPM counters, DS18B20, serial power supply |
+| `app/drivers.py` | Pi sensor drivers: HX711 load cells, INA226/INA219 power monitor, RPM counters, DS18B20, serial power supply |
 | `app/hwtest.py` | Bench test and calibration on the Pi: `python -m app.hwtest check / esp32 / read / outputs / pump / calibrate / i2c` |
 | `app/models.py` | Settings and batch fields, with their default values |
 | `app/db.py` | MySQL 8 storage: turns batches and settings into rows of the 8 tables and back; `python -m app.db` checks the connection |
@@ -93,9 +92,9 @@ The **System** badge at the bottom of the sidebar shows **Connected** (the Pi an
 | Purification | Pi | Starts by itself as soon as separation has finished (everything is in the purifier): section 6. |
 | Yield | Pi | The output load cell weighs the biodiesel container. When purification is done, everything is switched off and the website saves the batch (output volume and yield included) and shows Process Complete. |
 
-**Pumps.** The oil pump and the dispensers have no automatic stop: the containers hold exactly the computed amount, and the operator presses Done when a container is empty. A pump left running for 30 minutes stops by itself with a fault (forgotten, or a blocked line). Only one pump into the reactor runs at a time, never while the reactor pump is running. After an emergency stop, the stage shows Stopped and starts again with its Start again button (no controller reset), instead of by itself.
+**Pumps.** The oil pump and the dispensers have no automatic stop: the containers hold exactly the computed amount, and the operator presses Done when a container is empty. A pump left running for 30 minutes stops by itself with a fault (forgotten, or a blocked line). Only one pump into the reactor runs at a time, never while the reactor pump is running. After an emergency stop and a controller reset, the stage starts with its Start button instead of by itself.
 
-**RPM.** The mixers get exactly the set RPM (mixer 2: 200; mixer 1: the stage's stirring speed), sent to the ESP32 as `mixer1 on 5 500`, and the website shows the RPM the ESP32 reports back. The sketch turns it into PWM (`MIN_PWM + rpm × (255 − MIN_PWM) ÷ MAX_RPM`, with `MAX_RPM` 1544 and `MIN_PWM` 90, so slow speeds still turn). There are no RPM sensors, so it is open loop. The centrifuge's PWM = RPM ÷ `[centrifuge] max_rpm` (2500).
+**RPM.** There are no RPM sensors: the mixers and the centrifuge are driven open loop, and the RPM shown is the set speed (the ESP32 sketch's `MAX_RPM` 1544 for the mixers, `[centrifuge] max_rpm` 2500 for the centrifuge).
 
 **If separation doesn't start by itself** (for example after a fault), the Separation step shows **Start separation now** after a few seconds; it uses the batch's time and speed, without the settle.
 
@@ -122,7 +121,7 @@ With the optional level switch (`[level_switch]` in `hardware.toml`) the heater 
 - Pumps into the reactor (oil, A, B) never run while the reactor pump empties it (and the reverse), and only one at a time.
 - Every output is switched on with the ESP32's 5 s timer and refreshed every second: if the Pi, the backend or the USB cable stops, the ESP32 switches it off by itself. No status from the ESP32 for 3.5 s, or an output that doesn't follow its command, stops every process and switches everything off.
 - Every second, a watchdog turns off the heater above **95 °C**, when the temperature reading is lost, or when the level switch reads dry.
-- The reactions (esterification, transesterification) have **no temperature check**: they run with or without a temperature reading. They don't start while the ESP32 controller is offline or faulty, and a reaction stage stops on a measured current above the current setting (with a power monitor fitted). A stopped stage needs no controller reset: **Start again** starts it afresh.
+- The reactions (esterification, transesterification) have **no temperature check**: they run with or without a temperature reading. They don't start while the ESP32 controller is offline or faulty, and a reaction stage faults on a measured current above the current setting (with a power monitor fitted); it needs a controller reset before the next start.
 - Purification stops safely (heater, stirrer, valve and pumpout off) on lost temperature during methanol removal, above 95 °C, the level switch reading dry, an operator Stop, or any unexpected error; it won't start again until the stop is acknowledged.
 - Emergency stop (website) stops the stage, the pumps and purification and switches every output off. On startup and shutdown everything is off.
 

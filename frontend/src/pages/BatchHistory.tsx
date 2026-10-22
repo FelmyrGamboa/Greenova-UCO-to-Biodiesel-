@@ -50,7 +50,6 @@ type AnalyticsSettings = {
     acetone: number;
     bentonite: number;
     magnesol: number;
-    electricity: number;
     diesel: number;
   };
 };
@@ -89,7 +88,6 @@ function readAnalyticsSettings(): AnalyticsSettings {
       acetone: numberValue("acetonePrice", 100),
       bentonite: numberValue("bentonitePrice", 80),
       magnesol: numberValue("magnesolPrice", 250),
-      electricity: numberValue("electricityPrice", 12),
       diesel: numberValue("dieselPrice", 55),
     },
   };
@@ -159,8 +157,8 @@ function buildRangeRows(tested: BatchData[], settings: AnalyticsSettings) {
   });
 }
 
-/** Cost per liter = (Σ(material used × its price in Settings) + energy used × electricity price)
- * ÷ liters of biodiesel collected. The energy is power × time on of each part, worked out by the Pi. */
+/** Cost per liter = Σ(material used × its price in Settings) ÷ liters of biodiesel collected.
+ * Materials only: the energy is not measured, so it is not part of the cost. */
 function calculateCostPerLiter(batch: BatchData, settings: AnalyticsSettings) {
   if (!batch.materials || !batch.biodieselOutputMl || batch.biodieselOutputMl <= 0) return null;
   const materialCost =
@@ -170,8 +168,7 @@ function calculateCostPerLiter(batch: BatchData, settings: AnalyticsSettings) {
     batch.materials.sulfuricAcidL * settings.prices.sulfuricAcid +
     batch.materials.acetoneL * settings.prices.acetone +
     batch.materials.bentoniteKg * settings.prices.bentonite +
-    (batch.materials.magnesolKg ?? 0) * settings.prices.magnesol +
-    (batch.energy || 0) * settings.prices.electricity;
+    (batch.materials.magnesolKg ?? 0) * settings.prices.magnesol;
   return materialCost / (batch.biodieselOutputMl / 1000);
 }
 
@@ -188,9 +185,9 @@ function meanAndRange(values: number[]) {
 
 type Stats = ReturnType<typeof meanAndRange>;
 
-function formatStats(stats: Stats, unit: "%" | "₱" | "kWh", part: "mean" | "range") {
+function formatStats(stats: Stats, unit: "%" | "₱", part: "mean" | "range") {
   if (!stats) return "—";
-  const show = (value: number) => (unit === "₱" ? `₱${value.toFixed(2)}` : unit === "kWh" ? `${value.toFixed(3)} kWh` : `${value.toFixed(1)}%`);
+  const show = (value: number) => (unit === "₱" ? `₱${value.toFixed(2)}` : `${value.toFixed(1)}%`);
   return part === "mean" ? show(stats.mean) : `${show(stats.min)}–${show(stats.max)}`;
 }
 
@@ -250,9 +247,7 @@ export default function BatchHistory() {
   const yieldOf = (list: BatchData[]) => meanAndRange(list.filter((batch) => batch.yield > 0).map((batch) => batch.yield));
   const costOf = (list: BatchData[]) =>
     meanAndRange(list.map((batch) => calculateCostPerLiter(batch, settings)).filter((cost): cost is number => cost !== null));
-  const energyOf = (list: BatchData[]) => meanAndRange(list.filter((batch) => batch.energy > 0).map((batch) => batch.energy));
   const yieldAll = yieldOf(completed);
-  const energyAll = energyOf(completed);
   const costAll = costOf(completed);
   const targetCost = settings.prices.diesel / 2;
   const costTone = !costAll ? "neutral" : costAll.mean < targetCost ? "green" : costAll.mean < settings.prices.diesel ? "yellow" : "red";
@@ -285,8 +280,8 @@ export default function BatchHistory() {
             <p className="mt-1 text-xs text-gray-600">{source === "offline" ? t("The Raspberry Pi can't be reached: the batches show again when it is connected.") : t("Stored on the Raspberry Pi")}</p>
           </div>
           <div className="overflow-x-auto">
-            <table className="gv-table min-w-[1080px]">
-              <thead><tr><th>{t("Batch ID")}</th><th>{t("Date")}</th><th>{t("Oil Volume")}</th><th>{t("FFA %")}</th><th>{t("Biodiesel Yield")}</th><th>{t("Duration")}</th><th>{t("Energy Used")}</th><th>{t("Status")}</th><th>{t("Lab Test")}</th><th>{t("Details")}</th></tr></thead>
+            <table className="gv-table min-w-[980px]">
+              <thead><tr><th>{t("Batch ID")}</th><th>{t("Date")}</th><th>{t("Oil Volume")}</th><th>{t("FFA %")}</th><th>{t("Biodiesel Yield")}</th><th>{t("Duration")}</th><th>{t("Status")}</th><th>{t("Lab Test")}</th><th>{t("Details")}</th></tr></thead>
               <tbody>
                 {batches.length > 0 ? (
                   batches.map((batch) => {
@@ -300,7 +295,6 @@ export default function BatchHistory() {
                         <td>{running && !batch.oilVolume ? "—" : <><div>{formatFfa(batch)}</div>{batch.esterificationRun && <div className="mt-1 text-[10px] text-gray-600">{t("Esterified")}{batch.esterificationStages && batch.esterificationStages.length > 1 ? ` · ${t("{count} stages", { count: batch.esterificationStages.length })}` : ""}</div>}</>}</td>
                         <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
                         <td>{running ? "—" : `${batch.duration} min`}</td>
-                        <td>{running || !batch.energy ? "—" : `${batch.energy.toFixed(3)} kWh`}</td>
                         <td>
                           <Status tone={batchTone(batch.status)}>{t(batch.status)}</Status>
                           {running && <div className="mt-1 text-[10px] text-gray-600">{batch.currentStage ? t(batch.currentStage) : t("Starting")}</div>}
@@ -316,7 +310,7 @@ export default function BatchHistory() {
                     );
                   })) : (
                     <tr>
-                      <td colSpan={10} className="py-12 text-center">
+                      <td colSpan={9} className="py-12 text-center">
                         <div className="flex flex-col items-center gap-2">
                           <p className="text-sm font-medium text-gray-400">
                             {t("No batch records yet")}
@@ -339,7 +333,7 @@ export default function BatchHistory() {
             <Heading as="h2" className="mt-2 text-xl font-semibold">{t("How the batch analytics are computed")}</Heading>
             <ul className="mt-4 space-y-2 text-sm leading-6 text-gray-400">
               <li>{t("Frequencies and percentages: completion rate = completed ÷ finished batches × 100; lab pass rate = Passed ÷ lab-tested batches × 100 (PNS for CME and ASTM D6751).")}</li>
-              <li>{t("Means and ranges (minimum–maximum) per FFA range: yield = output load cell weight ÷ 0.88 g/mL ÷ oil volume × 100; energy used = each part's power × the time the Pi had it on (heater, electrodes, mixers, centrifuge, pumps); cost per liter = (materials used × Settings prices + energy × electricity price) ÷ liters of biodiesel, compared with the target of half the diesel price.")}</li>
+              <li>{t("Means and ranges (minimum–maximum) per FFA range: yield = output load cell weight ÷ 0.88 g/mL ÷ oil volume × 100; cost per liter = materials used × Settings prices ÷ liters of biodiesel, compared with the target of half the diesel price.")}</li>
               <li>{t("Proven settings: at least {count} lab-tested batches with the same settings in the same FFA range, all Passed, every yield within ±{tolerance} percentage points of their mean.", { count: settings.provenBatchCount, tolerance: settings.provenYieldTolerance })}</li>
               <li>{t("No machine learning. The chart of FFA against yield shows association only, not causation.")}</li>
             </ul>
@@ -348,17 +342,16 @@ export default function BatchHistory() {
           <Card className="overflow-hidden">
             <div className="border-b border-white/[0.06] p-6">
               <Heading as="h2" className="text-xl font-semibold">{t("Results per FFA Range")}</Heading>
-              <p className="mt-1 text-xs text-gray-600">{t("Yield, energy and cost: completed batches. Lab pass rate, recommended settings and status: lab-tested batches. Recommended = the settings with the highest mean yield among Passed batches.")}</p>
+              <p className="mt-1 text-xs text-gray-600">{t("Yield and cost: completed batches. Lab pass rate, recommended settings and status: lab-tested batches. Recommended = the settings with the highest mean yield among Passed batches.")}</p>
             </div>
             <div className="overflow-x-auto">
-              <table className="gv-table min-w-[1450px]">
-                <thead><tr><th>{t("FFA range")}</th><th>{t("Completed")}</th><th>{t("Lab pass rate")}</th><th>{t("Mean yield")}</th><th>{t("Yield range")}</th><th>{t("Mean energy")}</th><th>{t("Energy range")}</th><th>{t("Mean cost per liter")}</th><th>{t("Cost range")}</th><th>{t("Recommended parameters")}</th><th>{t("Status")}</th></tr></thead>
+              <table className="gv-table min-w-[1250px]">
+                <thead><tr><th>{t("FFA range")}</th><th>{t("Completed")}</th><th>{t("Lab pass rate")}</th><th>{t("Mean yield")}</th><th>{t("Yield range")}</th><th>{t("Mean cost per liter")}</th><th>{t("Cost range")}</th><th>{t("Recommended parameters")}</th><th>{t("Status")}</th></tr></thead>
                 <tbody>
                   {rangeRows.map((row) => {
                     const done = completed.filter((batch) => inRange(batch.ffa, row.range));
                     const yields = yieldOf(done);
                     const costs = costOf(done);
-                    const energies = energyOf(done);
                     return (
                       <tr key={row.range.key}>
                         <td className="font-medium !text-white">{t(row.range.label)}</td>
@@ -366,8 +359,6 @@ export default function BatchHistory() {
                         <td>{row.batches.length ? `${((row.passed.length / row.batches.length) * 100).toFixed(1)}% (${row.passed.length}/${row.batches.length})` : "—"}</td>
                         <td>{formatStats(yields, "%", "mean")}</td>
                         <td>{formatStats(yields, "%", "range")}</td>
-                        <td>{formatStats(energies, "kWh", "mean")}</td>
-                        <td>{formatStats(energies, "kWh", "range")}</td>
                         <td>{formatStats(costs, "₱", "mean")}</td>
                         <td>{formatStats(costs, "₱", "range")}</td>
                         <td className="max-w-md leading-5">{parameterDescription(t, row.recommended)}</td>
@@ -381,8 +372,6 @@ export default function BatchHistory() {
                     <td>{labPassRate === null ? "—" : `${labPassRate.toFixed(1)}% (${passed.length}/${tested.length})`}</td>
                     <td>{formatStats(yieldAll, "%", "mean")}</td>
                     <td>{formatStats(yieldAll, "%", "range")}</td>
-                    <td>{formatStats(energyAll, "kWh", "mean")}</td>
-                    <td>{formatStats(energyAll, "kWh", "range")}</td>
                     <td>{formatStats(costAll, "₱", "mean")}</td>
                     <td>{formatStats(costAll, "₱", "range")}</td>
                     <td />
@@ -397,7 +386,7 @@ export default function BatchHistory() {
             <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <Heading as="h2" className="text-xl font-semibold">{t("Cost per Liter")}</Heading>
-                <p className="mt-1 text-xs text-gray-600">{t("(Materials used × Settings prices + energy × electricity price) ÷ liters of biodiesel (completed batches)")}</p>
+                <p className="mt-1 text-xs text-gray-600">{t("Materials used × Settings prices ÷ liters of biodiesel (completed batches)")}</p>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <div><div className="gv-label">{t("Mean cost")}</div><Status tone={costTone}>{costAll ? `₱${costAll.mean.toFixed(2)}/L` : "—"}</Status></div>

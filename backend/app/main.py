@@ -23,7 +23,6 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from . import config, db
 from .api import auto_start_purification, emergency_stop_all, machine_active, router, stop_transfers
-from .energy import EnergyMeter
 from .hardware import create_hardware
 from .purification import MAXIMUM_TEMPERATURE_C, PurificationRunner
 from .stages import StageRunner
@@ -44,10 +43,8 @@ async def sensor_loop(app: FastAPI) -> None:
     interval = 1.0 / getattr(app.state.hw, "time_scale", 1.0)   # 1 s (the tests' simulated machine runs faster)
     while True:
         try:
-            reading = await asyncio.to_thread(app.state.hw.refresh)
+            await asyncio.to_thread(app.state.hw.refresh)
             s = app.state.settings
-            app.state.energy.heater_watts = s.heater_power_watts
-            app.state.energy.update(app.state.hw, reading)          # power × time on, for the batch record
             alarm = app.state.hw.watchdog(MAXIMUM_TEMPERATURE_C, s.reaction_maximum_temperature)
             if alarm:
                 app.state.alarm = alarm
@@ -128,7 +125,6 @@ async def lifespan(app: FastAPI):
     app.state.stage = StageRunner(app.state.hw, scale)      # the reaction stages and separation
     app.state.pump = PumpRunner(app.state.hw, scale)        # oil pump, pumps A and B (stopped by the operator)
     app.state.records = {}                       # measurements for batches not saved yet
-    app.state.energy = EnergyMeter(time_scale=scale)   # energy used (power × time on), per part
     app.state.alarm = None
     app.state.purification_armed = None          # batch waiting to start purification by itself
     app.state.purification_wait = None           # why it hasn't started yet (shown on the website)
