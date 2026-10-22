@@ -129,13 +129,13 @@ class HX711Scale:
                 time.sleep(0.002)
             value, slowest = 0, 0.0
             for _ in range(24):
-                t0 = clock()
                 lg.gpio_write(chip, sck, 1)
+                t0 = clock()                                # SCK is high from here ...
                 lg.gpio_write(chip, sck, 0)
-                slowest = max(slowest, clock() - t0)
+                slowest = max(slowest, clock() - t0)        # ... to here (at most)
                 value = (value << 1) | lg.gpio_read(chip, dout)
-            t0 = clock()
             lg.gpio_write(chip, sck, 1)                     # 25th pulse: channel A, gain 128 next time
+            t0 = clock()
             lg.gpio_write(chip, sck, 0)
             slowest = max(slowest, clock() - t0)
             ready_again = lg.gpio_read(chip, dout)          # the 25th pulse pulls DT high until the next value
@@ -358,37 +358,86 @@ class CalibrationStore:
 
 
 class LoadCell:
-    """An HX711 read all the time in its own thread; the reading is the median of the last
-    `samples` conversions (10 at 10 samples/s = the last second), so one bad conversion never shows.
+    """An HX711 read all the time in its own thread.
 
         grams = (raw - offset) / scale        (scale = raw counts per gram; negative is fine)
 
+    Steady reading: each conversion that jumps far from the others (a bit error) is dropped unless
+    the next ones agree (a real change, e.g. the container put down), and the reading is the
+    trimmed mean of the last `samples` conversions (the highest and lowest 20 % left out).
+
+    Zero tracking: while nothing is switched on and the reading stays within ±ZERO_BAND_G of zero
+    and steady, the zero follows the slow drift of the HX711 and the load cell (as kitchen and lab
+    scales do), so an empty container keeps reading 0.
+
     Calibration, from the website (Settings -> Hardware) or `python -m app.hwtest calibrate`:
-      Tare       nothing on the scale (or the empty container) -> offset = average raw reading
-      Calibrate  a known weight on it -> scale = (average raw - offset) / grams
-    Each step averages `cal_seconds` of readings and drops the highest and lowest 20 %."""
+      1. Tare: nothing on the scale (or only the empty container) -> the zero point.
+      2. Add weight: a known weight on it, its grams typed in. Add more known weights for a more
+         accurate result: the scale is the straight line through the zero and all the weights
+         (least squares), and each weight's error in grams is shown.
+    Each step averages `cal_seconds` of readings (the highest and lowest 20 % left out) and refuses
+    a reading that isn't steady. A weight needs a Tare in the same session (TARE_VALID_S)."""
 
     POLL_S = 0.02
     MAX_AGE_S = 2.0          # no good conversion for this long = no reading (None)
+    SPIKE_G = 30.0           # a conversion this far from the others ...
+    SPIKE_CONFIRM = 3        # ... counts only when this many in a row agree (a real change)
+    ZERO_BAND_G = 2.0        # zero tracking: only this close to zero ...
+    ZERO_STEADY_S = 5.0      # ... steady (within ZERO_STEADY_G) for this long ...
+    ZERO_STEADY_G = 0.6
+    ZERO_RATE = 0.2          # ... and the zero moves this share of the way each second
+    STEADY_G = 1.5           # Tare / Add weight refuse a reading noisier than this (± g)
+    TARE_VALID_S = 30 * 60   # Add weight needs a Tare within this time
 
-    def __init__(self, hx: "HX711Scale", key: str, offset: float = 0.0, scale: float = 1.0, samples: int = 10,
-                 cal_seconds: float = 3.0, store: Optional[CalibrationStore] = None):
+    def __init__(self, hx: "HX711Scale", key: str, offset: float = 0.0, scale: float = 1.0, samples: int = 20,
+                 cal_seconds: float = 5.0, store: Optional[CalibrationStore] = None):
         self.hx, self.key, self.store = hx, key, store
         saved = store.get(key) if store else {}
         self.offset = float(saved.get("offset", offset))
         self.scale = float(saved.get("scale", scale)) or 1.0
         self.calibrated_at: Optional[str] = saved.get("calibratedAt")
         self.tared_at: Optional[str] = saved.get("taredAt")
-        self.samples = max(1, int(samples))
+        self.points: list[dict] = saved.get("points") or []     # the last calibration: grams, error
+        self.samples = max(5, int(samples))
         self.cal_seconds = float(cal_seconds)
+        self.zero_tracking = lambda: True      # set by the machine: only while nothing is switched on
+        self.zero_tracked_g = 0.0              # how far zero tracking has moved the zero since the tare
         self._buf: deque = deque(maxlen=self.samples)
+        self._pending: list = []               # conversions that jumped, waiting for confirmation
         self._collect: Optional[list] = None
+        self._session: Optional[dict] = None   # this Tare: its time and the calibration points
+        self._steady: deque = deque()          # (time, grams) for zero tracking
+        self._last_zero_check = 0.0
         self._last_ok = 0.0
         self._lock = threading.Lock()
         self._cal_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name=f"greenova-loadcell-{key}", daemon=True)
         self._thread.start()
+
+    # ----- reading -----
+    def _spike_counts(self) -> float:
+        return abs(self.SPIKE_G * self.scale)
+
+    def _accept(self, value: int) -> None:
+        """Adds one conversion, dropping a lone jump (called with the lock held)."""
+        if len(self._buf) >= 5:
+            middle = statistics.median(self._buf)
+            if abs(value - middle) > self._spike_counts():
+                self._pending.append(value)
+                agree = (len(self._pending) >= self.SPIKE_CONFIRM and
+                         max(self._pending) - min(self._pending) <= self._spike_counts())
+                if agree:                        # a real change: start again from the new level
+                    self._buf.clear()
+                    self._buf.extend(self._pending)
+                    self._pending = []
+                elif len(self._pending) >= self.SPIKE_CONFIRM:
+                    self._pending = self._pending[1:]
+                return
+        self._pending = []
+        self._buf.append(value)
+        if self._collect is not None:
+            self._collect.append(value)
 
     def _loop(self) -> None:
         last_error = None
@@ -404,11 +453,17 @@ class LoadCell:
                 self._stop.wait(0.5)
             if value is not None:
                 with self._lock:
-                    self._buf.append(value)
-                    if self._collect is not None:
-                        self._collect.append(value)
+                    self._accept(value)
                     self._last_ok = time.monotonic()
+            self._track_zero()
             self._stop.wait(self.POLL_S)
+
+    @staticmethod
+    def _trimmed_mean(values) -> float:
+        ordered = sorted(values)
+        cut = len(ordered) // 5
+        core = ordered[cut:len(ordered) - cut] or ordered
+        return sum(core) / len(core)
 
     @property
     def ok(self) -> bool:
@@ -418,12 +473,42 @@ class LoadCell:
         with self._lock:
             if not self._buf or not self.ok:
                 return None
-            return statistics.median(self._buf)
+            return self._trimmed_mean(self._buf)
 
     def grams(self) -> Optional[float]:
         raw = self.raw()
         return None if raw is None else round((raw - self.offset) / self.scale, 1)
 
+    def _track_zero(self) -> None:
+        """Automatic zero tracking, once a second (see the class docstring)."""
+        now = time.monotonic()
+        if now - self._last_zero_check < 1.0:
+            return
+        self._last_zero_check = now
+        raw = self.raw()
+        allowed = False
+        try:
+            allowed = bool(self.zero_tracking())
+        except Exception:
+            pass
+        if raw is None or not allowed or self._cal_lock.locked():
+            self._steady.clear()
+            return
+        g = (raw - self.offset) / self.scale
+        if abs(g) > self.ZERO_BAND_G:
+            self._steady.clear()
+            return
+        self._steady.append((now, g))
+        while now - self._steady[0][0] > self.ZERO_STEADY_S + 0.5:
+            self._steady.popleft()
+        values = [v for _, v in self._steady]
+        if (now - self._steady[0][0] >= self.ZERO_STEADY_S - 0.5 and len(values) >= 2
+                and max(values) - min(values) <= self.ZERO_STEADY_G):
+            shift = self.ZERO_RATE * (raw - self.offset)
+            self.offset += shift
+            self.zero_tracked_g += shift / self.scale
+
+    # ----- calibration -----
     def _average(self) -> tuple[Optional[float], float, int]:
         with self._lock:
             self._collect = []
@@ -437,41 +522,72 @@ class LoadCell:
         core = values[cut:len(values) - cut] or values
         return sum(core) / len(core), statistics.pstdev(core), len(values)
 
+    def _steady_average(self) -> tuple[float, float, int]:
+        average, noise, n = self._average()
+        if average is None:
+            raise ValueError(f"Not enough readings from the HX711 ({n}). Check its wiring (VCC 3.3 V, GND, DT, SCK).")
+        return average, noise, n
+
+    def _check_steady(self, noise: float, scale: float, step: str) -> None:
+        noise_g = abs(noise / scale)
+        if noise_g > self.STEADY_G:
+            raise ValueError(f"The reading isn't steady (±{noise_g:.1f} g) during {step}. Keep the scale still, out of "
+                             "drafts and off the vibrating frame, wait a few seconds and try again.")
+
     def tare(self) -> dict:
-        """Zero: nothing on the scale (or only the empty container). Takes cal_seconds."""
+        """Zero: nothing on the scale (or only the empty container). Starts a calibration session."""
         with self._cal_lock:
-            average, noise, n = self._average()
-            if average is None:
-                raise ValueError(f"Not enough readings from the HX711 ({n}). Check its wiring (VCC 3.3 V, GND, DT, SCK).")
+            average, noise, n = self._steady_average()
             self.offset = round(average, 2)
+            self.zero_tracked_g = 0.0
             self.tared_at = datetime.now().isoformat(timespec="seconds")
+            self._session = {"time": time.monotonic(), "points": [(average, 0.0)], "noise": [noise]}
             if self.store:
                 self.store.save(self.key, {"offset": self.offset, "taredAt": self.tared_at})
-            return {"offset": self.offset, "noiseRaw": round(noise, 1), "samples": n}
+            return {"offset": self.offset, "noiseG": round(abs(noise / self.scale), 2), "samples": n}
 
     def calibrate(self, grams: float) -> dict:
-        """A known weight (in grams) is on the scale: works out the scale factor. Tare first."""
+        """A known weight (grams) is on the scale: adds it as a calibration point and fits the scale
+        through the Tare point and every weight of this session by least squares. Tare first."""
         if grams is None or grams <= 0:
             raise ValueError("Enter the known weight in grams (more than 0).")
+        session = self._session
+        if session is None or time.monotonic() - session["time"] > self.TARE_VALID_S:
+            raise ValueError("Tare first: empty the scale (or only the empty container), press Tare, then put the "
+                             "known weight on and add it.")
         with self._cal_lock:
-            average, noise, n = self._average()
-            if average is None:
-                raise ValueError(f"Not enough readings from the HX711 ({n}). Check its wiring.")
-            diff = average - self.offset
-            if abs(diff) < max(50.0, 10 * noise):
-                raise ValueError(f"The reading barely changed ({diff:.0f} counts). Tare with the scale empty, "
-                                 "then put the weight on and try again.")
-            self.scale = round(diff / grams, 6)
+            average, noise, n = self._steady_average()
+            zero_raw = session["points"][0][0]
+            if abs(average - zero_raw) < max(50.0, 10 * noise):
+                raise ValueError(f"The reading barely changed ({average - zero_raw:.0f} counts). Is the weight on the "
+                                 "scale? Tare with the scale empty, then put the weight on and try again.")
+            points = [p for p in session["points"] if p[1] != grams] + [(average, float(grams))]
+            # least squares through the Tare point (the zero stays exactly where it was tared):
+            # scale = Σ g × (raw - raw at zero) ÷ Σ g²
+            offset = zero_raw
+            weights = [(r, g) for r, g in points if g > 0]
+            scale = sum(g * (r - offset) for r, g in weights) / sum(g * g for _, g in weights)
+            # steady? judged in grams with the new scale, for the Tare and for this weight
+            self._check_steady(session["noise"][0], scale, "Tare")
+            self._check_steady(noise, scale, "the weight")
+            session["points"] = points
+            self.scale, self.offset = round(scale, 6), round(offset, 2)
+            self.zero_tracked_g = 0.0
+            self.points = [{"grams": g, "errorG": round((r - offset) / scale - g, 2)} for r, g in points if g > 0]
             self.calibrated_at = datetime.now().isoformat(timespec="seconds")
             if self.store:
-                self.store.save(self.key, {"offset": self.offset, "scale": self.scale, "calibratedAt": self.calibrated_at})
-            return {"scale": self.scale, "offset": self.offset, "samples": n,
+                self.store.save(self.key, {"offset": self.offset, "scale": self.scale, "points": self.points,
+                                           "calibratedAt": self.calibrated_at})
+            return {"scale": self.scale, "offset": self.offset, "samples": n, "points": self.points,
                     "resolutionG": round(abs(noise / self.scale), 2)}
 
     def status(self) -> dict:
+        session = self._session
         return {"grams": self.grams(), "raw": self.raw(), "ok": self.ok, "offset": round(self.offset, 2),
                 "scale": self.scale, "busy": self._cal_lock.locked(), "calibratedAt": self.calibrated_at,
-                "taredAt": self.tared_at, "spoiledReadings": getattr(self.hx, "spoiled", 0)}
+                "taredAt": self.tared_at, "points": self.points,
+                "taredThisSession": session is not None and time.monotonic() - session["time"] <= self.TARE_VALID_S,
+                "zeroTrackedG": round(self.zero_tracked_g, 2), "spoiledReadings": getattr(self.hx, "spoiled", 0)}
 
     def close(self) -> None:
         self._stop.set()

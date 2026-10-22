@@ -13,8 +13,7 @@ The website always drives the real machine: the Greenova backend on the Raspberr
 | Transesterification | `electrode`, `mixer1` | the reaction time |
 | Settle | nothing (everything off) | 1 minute |
 | Separation | `reactorpump` + the centrifuge (BTS7960 on the Pi, at the batch's speed) + `pumpin`, together | the batch's separation time (set in Volume & Parameters) |
-| Purification: heating | `mixer2` (200 RPM), `heater` | 90 °C (the heater switches off) |
-| Methanol removal | `mixer2`, `heater` on at 87 °C / off at 90 °C | `methanolRemovalTime` (10 min) |
+| Methanol removal (straight after separation, no heating step) | `mixer2` at 200 RPM, `heater` in 4 s pulses (the next pulse when the temperature starts dropping; none from 90 °C) | `methanolRemovalTime` (10 min) |
 | Add Magnesol | `mixer2` (heater off) | the operator confirms |
 | Contact | `mixer2` at 200 RPM | `contactTime` |
 | Settle | nothing | 1 minute |
@@ -91,14 +90,30 @@ Check which dispenser holds which premix. Change any line to match the real mach
 - **Dead-man timer.** Every ESP32 output is switched on with the sketch's timed ON (`heater on 5`) and refreshed every second. If the backend, the Pi or the USB cable stops, the ESP32 switches the output off by itself within 5 s (`lease_seconds`).
 - **Controller faults stop everything.** No status from the ESP32 for 3.5 s, an output that doesn't follow its command, or a device in `[esp32.devices]` the sketch doesn't have: the backend stops the stage, purification and pumps, switches everything off and shows why (alarm, the **Output Controller** tile, Settings → Hardware). Nothing switches back on by itself when the ESP32 returns.
 - The sketch's own Wi-Fi page can switch outputs past these rules. Greenova switches its outputs back off within a second, but leave `WIFI_SSID` as `YOUR_WIFI_NAME` so the ESP32 stays off the network.
-- Mixers: the sketch's RPM → PWM line starts at 0, so slow speeds (200 RPM = PWM 33) don't turn the motors. Greenova starts each mixer with 1 s at full speed (`mixer_kick_seconds`) and gives the lowest speed `mixer_min_pwm` (90 of 255) under `[esp32]` in `hardware.toml`. If a mixer still hums without turning, find its value with `python -m app.hwtest mixer purification_stirrer` (or `stirrer`; in Docker `bash start-machine.sh --test-mixers`) and set it.
+- Mixers: Greenova sends exactly the set RPM (mixer 2: 200; mixer 1: the stage's stirring speed, e.g. 500), and the ESP32 reports that same RPM. The sketch's `MIN_PWM 90` (was 0) makes slow speeds turn (200 RPM = PWM 111 instead of 33). If a mixer still hums without turning, find the value with `python -m app.hwtest mixer purification_stirrer` (or `stirrer`; in Docker `bash start-machine.sh --test-mixers`) and raise `MIN_PWM` in the sketch; `mixer_kick_seconds` under `[esp32]` can also start each mixer at full speed for a moment (off by default).
 - RPM is open loop (there are no speed sensors): the mixers and the centrifuge are driven at the set speed, and the website shows that speed as the RPM reading. Mixers use the sketch's RPM (`MAX_RPM` 1544); the centrifuge is PWM from `[centrifuge] max_rpm` (2500), so a batch's centrifuge speed can be at most 2500 RPM.
 
 ### Load cells
 
-The output load cell (DT 17 / SCK 27) is required: purification ends when its reading has been stable for 30 s. The starting calibration comes from the Pi control panel's `config.json` (`offset` 41028.54, `calibration_factor` 145759). That file labels the factor "g", but 145759 counts per gram would put the whole range of the load cell under about 15 g, so it is used as a per-**kilogram** factor (`scale = 145.759` counts per gram). If it is really per gram, every weight reads 1000 times too small and draining never counts as started, so **re-calibrate on the Pi before the first batch** and check a known weight: **Settings → Hardware → Output load cell**: empty the container and press **Tare**, then put a known weight on it, type its grams and press **Calibrate** (or `python -m app.hwtest calibrate output`). The result is saved in `backend/loadcell_calibration.json` and wins over `hardware.toml`.
+The output load cell (DT 17 / SCK 27) is required: purification ends when its reading has been stable for 30 s, and the yield is its weight. The starting calibration comes from the Pi control panel's `config.json` (`offset` 41028.54, `calibration_factor` 145759, used as 145.759 counts per gram). **Re-calibrate on the Pi before the first batch:**
+
+1. **Settings → Hardware → Output load cell**: empty the container (or leave only the empty container), keep it still and press **1. Tare (empty)** (5 s).
+2. Put a known weight on it (a weighed bottle of water is fine), type its grams and press **2. Add weight** (5 s).
+3. Add two or three different weights the same way (for example 200 g, 500 g, 1000 g). The scale is fitted through the Tare and all of them (least squares), and **Last calibration** shows how far each weight is off (for example `500 g → +0.4 g`). More than a few grams off means something touched the frame: Tare and do it again.
+
+Or on the command line: `python -m app.hwtest calibrate output` (it asks for the weights one by one). The result is saved in `backend/data/loadcell_calibration.json` (Docker) or `backend/loadcell_calibration.json` and wins over `hardware.toml`.
+
+What the reading does against the three usual problems:
+
+- **Jumps around**: one wrong HX711 reading (a disturbed clock pulse, or a single wild value) is thrown away; the reading is the trimmed mean of the last 20 readings. `Spoiled readings` in the status counts the thrown-away ones: a number that keeps climbing fast means a loose DT/SCK wire or a long cable next to a motor wire.
+- **Drifts / wrong zero**: while the machine is idle (no output on) and the reading stays within ±2 g of zero for 5 s, the zero follows the drift by itself. It never moves while anything runs, so a drain is never "zeroed away". Calibrating needs a fresh Tare (within 30 min).
+- **Wrong by a factor**: the scale comes from your own known weights, not from the old panel's number. A reading that isn't steady (more than ±1.5 g of noise) is refused with the reason (keep the scale still, out of drafts, off the vibrating frame).
 
 The reactor load cell is optional (`[load_cells.reactor] enabled = false`) and not needed: the operator measures the oil and each premix into its container and presses Done when it is empty.
+
+### Energy used per batch
+
+The Pi counts each batch's energy as **power × time on**: every second, for each output it has on, it adds that part's power. The heater uses **Settings → Heater power** (900 W by default), the electrodes the INA226's measured volts × amps (without one: the stage's voltage × current limit you set on the CC/CV module), and the mixers, centrifuge and pumps their rated power from `[energy]` in `hardware.toml` (motors in proportion to their speed). **Replace the `[energy]` values with the wattage on each part's label** (or volts × amps); the defaults are placeholders. The result (kWh) is saved with the batch, its timeline has the breakdown ("Energy used: 0.031 kWh (power × time on: heater 0.027, …)"), and the batch's cost per liter includes energy × **Settings → Electricity price** (₱/kWh). The electricity price alone can't replace it: the cost is the kWh × the price.
 
 ### First start
 
@@ -145,10 +160,11 @@ It stops the old Pi control panel and a native `greenova` service (both would ta
 - The backend container gets the whole `/dev` (`privileged: true`), so it finds the ESP32 as `/dev/ttyUSB0` or `/dev/ttyACM0` (also after a replug) and the header's GPIO chip on a Pi 4 or Pi 5 by itself. No `GPIO_CHIP` or device list to edit.
 - `backend/data` holds `hardware.toml` (optional: without it the built-in pins are used, which match the supplied wiring) and `loadcell_calibration.json` (Tare / Calibrate), so they survive a rebuild.
 - A few seconds after it starts, the backend writes a **Hardware check:** line for each part to its log (`docker compose logs backend`).
+- **The website opens by itself.** Step 5 of `start-machine.sh` opens Chromium on the Pi's screen at `http://localhost:8443/dashboard` as soon as the website answers, and installs `~/.config/autostart/greenova-website.desktop`, so after every reboot (the containers start by themselves) the website opens again at login. If you start the containers with plain `docker compose up -d`, run `bash open-website.sh` after it (a container can't open a window on the Pi's desktop). `GREENOVA_KIOSK=1 bash open-website.sh` opens it full screen; `GREENOVA_NO_BROWSER=1 bash start-machine.sh` skips the browser.
 
-### "Fault — controller reset required" in esterification or transesterification
+### When esterification or transesterification stops
 
-The reactions no longer check the temperature, so a missing DS18B20 reading can't stop them. A reaction doesn't start while the ESP32 controller is offline or faulty (the page says why). If it stops while running, the reason is under **Stopped:** on the stage and in the alarm. The usual one is the ESP32 restarting: when the backend sees its boot messages it says "the ESP32 stopped answering: its supply voltage dipped (brownout)…". That happens when mixer 1 or the electrode relay switches on and the ESP32, the relay board and the L298N share the Pi's USB power. Give them their own 5 V supply (GND shared) and use a short, good USB data cable. Press **Reset controller**, then start again.
+There is no "controller reset" any more: a stopped stage shows **Stopped** and a **Start again** button. The reactions don't check the temperature, so a missing DS18B20 reading can't stop them. A reaction doesn't start while the ESP32 controller is offline (the page says why). If it stops while running, the reason is in the alarm and the batch timeline. The usual one is the ESP32 restarting: when the backend sees its boot messages it says "the ESP32 stopped answering: its supply voltage dipped (brownout)…". That happens when mixer 1 or the electrode relay switches on and the ESP32, the relay board and the L298N share the Pi's USB power. Give them their own 5 V supply (GND shared) and use a short, good USB data cable, then press **Start again**.
 
 ### When separation doesn't go on to purification
 

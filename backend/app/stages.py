@@ -3,9 +3,9 @@
 Matches the website's stage controls (NewBatch.tsx): state is "ready", "running", "paused",
 "complete" or "fault", with Start, Pause, Resume, Record completion and Emergency stop.
 
-- Reactions: electrode power relay ON and the stirrer running. They stop by themselves when the
-  reaction time is over, and fault if the temperature passes reactionMaximumTemperature, or if
-  the measured current stays above the current setting (default 1 A) for 2 seconds.
+- Reactions: electrode power relay ON and the stirrer running at the stage's RPM. They stop by
+  themselves when the reaction time is over, or if the measured current stays above the current
+  setting (default 1 A) for 2 seconds. No temperature check (the reading is only recorded).
   When the Pi can set the power supply's current limit (config.POWER_SUPPLY_CURRENT_CONTROL), it
   sets it to the current setting at the start; otherwise the operator sets it on the supply.
 - Separation (starts by itself when transesterification has finished): the mixture first
@@ -16,9 +16,10 @@ Matches the website's stage controls (NewBatch.tsx): state is "ready", "running"
   purification starts (api.py). The separation time and speed are set per batch on the website
   (Volume & Parameters), with Settings separationTime / separationSpeed as the defaults.
 - Pause switches everything off and stops the timer; Resume switches it back on.
-Stirrer and centrifuge speeds are set open-loop (PWM = RPM ÷ the RPM at full speed: the ESP32
-sketch's MAX_RPM and [centrifuge] max_rpm in ESP32 mode, otherwise the max RPM in Settings) until
-you add closed-loop control with your RPM sensors.
+- A stopped stage (emergency stop, over-current, controller offline) needs no reset: Start again
+  begins it afresh.
+Stirrer speeds go to the ESP32 as the exact RPM (the sketch turns it into PWM with its MAX_RPM and
+MIN_PWM); the centrifuge's PWM = RPM ÷ [centrifuge] max_rpm.
 """
 import asyncio
 from typing import Callable, Optional
@@ -84,8 +85,8 @@ class StageRunner:
         defaults), after settle_seconds in the reactor."""
         if self.active:
             raise StageError(f"{self.state['stage']} is still {self.state['state']}.")
-        if self.state["state"] == "fault":
-            raise StageError("Fault — controller reset required.")
+        # A stage that was stopped (emergency stop, controller fault, over-current) needs no reset
+        # step: starting a stage again begins it afresh (nothing restarts without the operator).
         if stage in REACTIONS:
             # Checked now, so the stage doesn't start and then fault a second later. (No temperature
             # check: the reactions run with or without a temperature reading.)
@@ -165,7 +166,7 @@ class StageRunner:
         await self._stop_task()
 
     def reset(self) -> None:
-        """"Controller reset" after a fault, or before the next stage."""
+        """Back to "ready" (the website no longer needs it: a stopped stage starts again directly)."""
         if self.active:
             raise StageError("Stop the running stage first.")
         self.state = self._ready_state()

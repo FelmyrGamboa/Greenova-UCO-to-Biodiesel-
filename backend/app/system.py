@@ -58,9 +58,9 @@ def status(reading: dict, stage_state: dict, purification_state: dict, pump_stat
         _tile("Power Supply", "On" if power_on else "Ready",
               f"Output {'on' if power_on else 'off'} · 0–30 V DC"
               + (f" · {voltage:g} V" if power_on and voltage is not None else "")),
+        # a stopped stage needs no reset: it can simply be started again
         _tile("Electrodes", "Graphite – graphite",
-              "Fault — controller reset required" if stage_fault else "Connected",
-              "fault" if stage_fault else "ready"),
+              f"Last stage stopped: {stage_state.get('faultReason') or 'stopped'}" if stage_fault else "Connected"),
         *([_controller_tile(reading)] if "controllerOnline" in reading else []),
         _motor_tile("Reactor Stirrer", reading.get("stirrerRpm"), duty.get("stirrer"), estimated),
         _motor_tile("Centrifuge Motor", reading.get("centrifugeRpm"), duty.get("centrifuge"), estimated),

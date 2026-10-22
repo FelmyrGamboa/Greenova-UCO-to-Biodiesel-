@@ -3,8 +3,8 @@
 greenovaData.ts, so the website and the Pi always show the same numbers.
 
 Statistical treatment (the thesis' evaluation): frequencies and percentages for the completion
-and lab pass rates; means and ranges (minimum-maximum) for yield and cost per liter, per FFA range
-and overall. No energy figure (energy isn't measured) and no machine learning.
+and lab pass rates; means and ranges (minimum-maximum) for yield, energy and cost per liter, per
+FFA range and overall. No machine learning.
 
 - Only batches with a Passed or Failed lab result count as tested.
 - FFA ranges come from ffaRangeBoundaries: a batch is in a range when min <= FFA < max.
@@ -40,6 +40,11 @@ def _completed(batches: list[Batch]) -> list[Batch]:
 def yield_stats(batches: list[Batch]) -> Optional[dict]:
     """Mean and range of the yield of the completed batches (a batch without output is left out)."""
     return mean_and_range([b.yield_ for b in _completed(batches) if b.yield_ > 0])
+
+
+def energy_stats(batches: list[Batch]) -> Optional[dict]:
+    """Mean and range of the energy used (kWh) by the completed batches that have it."""
+    return mean_and_range([b.energy for b in _completed(batches) if b.energy and b.energy > 0])
 
 
 def cost_stats(batches: list[Batch], s: Settings) -> Optional[dict]:
@@ -139,6 +144,7 @@ def range_rows(batches: list[Batch], s: Settings) -> list[dict]:
             "averageYield": yields["mean"] if yields else None,
             "minimumYield": yields["min"] if yields else None,
             "maximumYield": yields["max"] if yields else None,
+            "energyKwh": energy_stats(done),
             "costPerLiter": cost_stats(done, s),
             "status": "No data" if not in_r else "Proven" if proven else "Testing",
         })
@@ -159,8 +165,7 @@ def recommended_parameters(ffa: float, batches: list[Batch], s: Settings) -> Opt
 
 
 def cost_per_liter(b: Batch, s: Settings) -> Optional[float]:
-    """Σ(material used × its price in Settings) ÷ liters of biodiesel. Materials only: the energy
-    isn't measured, so electricity isn't part of it."""
+    """(Σ(material used × its price) + energy used × electricity price) ÷ liters of biodiesel."""
     if b.materials is None or not b.biodiesel_output_ml or b.biodiesel_output_ml <= 0:
         return None
     m = s
@@ -171,7 +176,8 @@ def cost_per_liter(b: Batch, s: Settings) -> Optional[float]:
             + b.materials.sulfuric_acid_l * m.sulfuric_acid_price
             + b.materials.acetone_l * m.acetone_price
             + b.materials.bentonite_kg * m.bentonite_price
-            + b.materials.magnesol_kg * m.magnesol_price)
+            + b.materials.magnesol_kg * m.magnesol_price
+            + (b.energy or 0) * m.electricity_price)
     return cost / (b.biodiesel_output_ml / 1000)
 
 
@@ -206,4 +212,5 @@ def summary(batches: list[Batch]) -> dict:
         "averageYield": yields["mean"] if yields else 0,
         "minimumYield": yields["min"] if yields else None,
         "maximumYield": yields["max"] if yields else None,
+        "energyKwh": energy_stats(batches),
     }

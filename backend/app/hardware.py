@@ -59,6 +59,7 @@ class Hardware:
         self.valves = {name: False for name in VALVES}
         self.motor_duty = {name: 0.0 for name in MOTORS}
         self.pumps = {name: False for name in pumps}      # only the pumps this machine has
+        self.supply_setting: tuple = (None, None)          # the stage's (volts, amps) for the electrodes
         self._snapshot: Optional[dict] = None
 
     # ----- outputs, with interlocks -----
@@ -79,11 +80,13 @@ class Hardware:
         return config.POWER_SUPPLY_CURRENT_CONTROL
 
     def set_current_limit(self, amps: float) -> None:
+        self.supply_setting = (self.supply_setting[0], amps)   # also for the energy figure (energy.py)
         if self.current_limit_control:
             self._write_current_limit(amps)
 
     def set_supply_voltage(self, volts: float) -> None:
         """Sets the power supply's voltage when the Pi controls the supply (otherwise the operator does)."""
+        self.supply_setting = (volts, self.supply_setting[1])
         if self.current_limit_control:
             self._write_voltage(volts)
 

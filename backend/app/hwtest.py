@@ -195,20 +195,25 @@ def calibrate(which: str) -> int:
     lgpio, chip = drivers.open_gpiochip(config.HARDWARE.get("gpiochip"))
     hx = drivers.HX711Scale(lgpio, chip, cell["data_pin"], cell["clock_pin"])
     store = drivers.CalibrationStore(config.CALIBRATION_FILE)
-    scale = drivers.LoadCell(hx, which, cell.get("offset", 0), cell.get("scale", 1.0), cell.get("samples", 10),
-                             cell.get("cal_seconds", 3.0), store)
+    scale = drivers.LoadCell(hx, which, cell.get("offset", 0), cell.get("scale", 1.0), cell.get("samples", 20),
+                             cell.get("cal_seconds", 5.0), store)
     try:
-        time.sleep(1.5)
+        time.sleep(2.5)
         if scale.raw() is None:
             sys.exit(f"No reading from the HX711 on DT GPIO{cell['data_pin']} / SCK GPIO{cell['clock_pin']}. "
                      "Check VCC (3.3 V), GND, DT and SCK, and the pins in hardware.toml.")
         print(f"Now: {scale.grams()} g (raw {scale.raw():.0f}, offset {scale.offset}, scale {scale.scale})")
-        input(f"\n1. Empty the {which} load cell (empty reactor / empty container in place), then press Enter.")
-        print(f"   offset = {scale.tare()['offset']}")
-        grams = float(input("2. Put a known weight on it. How many grams is it? ").strip())
-        result = scale.calibrate(grams)
-        print(f"   scale = {result['scale']} counts per gram (noise about {result['resolutionG']} g)")
-        time.sleep(1.2)
+        input(f"\n1. Empty the {which} load cell (empty reactor / empty container in place), keep it still, press Enter.")
+        print(f"   zero set (noise about {scale.tare()['noiseG']} g)")
+        print("2. Put a known weight on it. Add two or three different weights for the best accuracy.")
+        while True:
+            answer = input("   How many grams is the weight on it now? (Enter = done) ").strip()
+            if not answer:
+                break
+            result = scale.calibrate(float(answer))
+            print(f"   scale = {result['scale']} counts per gram; error per weight: "
+                  + ", ".join(f"{p['grams']:g} g {p['errorG']:+.1f} g" for p in result["points"]))
+        time.sleep(2.5)
         print(f"   reading now: {scale.grams()} g")
         print(f"\nSaved in {config.CALIBRATION_FILE}. A negative scale is fine (the cell is mounted the other way round).")
     except ValueError as e:

@@ -104,10 +104,11 @@ export default function BatchDetails() {
           <Link to="/process" className="btn-primary">{t("Continue Process")} →</Link>
         </Card>
       )}
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card className="p-5"><Metric label={t("Oil volume")} value={`${batch.oilVolume.toLocaleString()} mL`} /></Card>
         <Card className="p-5"><Metric label={t("Biodiesel yield")} value={batch.yield ? `${batch.yield}%` : "—"} accent /></Card>
         <Card className="p-5"><Metric label={t("Process duration")} value={`${batch.duration} min`} /></Card>
+        <Card className="p-5"><Metric label={t("Energy used")} value={batch.energy ? `${batch.energy.toFixed(3)} kWh` : "—"} sub={t("Power × time on of each part (see the timeline)")} /></Card>
       </div>
       <div className="grid gap-6 xl:grid-cols-[0.75fr_1.25fr]">
         <Card className="p-6">

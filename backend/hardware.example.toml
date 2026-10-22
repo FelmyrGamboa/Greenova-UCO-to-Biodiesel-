@@ -32,12 +32,11 @@ lease_seconds = 5
 poll_seconds = 1.0           # how often the Pi asks for the ESP32's status ("json")
 offline_after_seconds = 3.5  # no status for this long = controller offline -> every process stops
 mixer_max_rpm = 1544         # the sketch's MAX_RPM (the ESP32 reports its own; this is the fallback)
-# Mixers (open loop). The current sketch has MIN_PWM 90 (the PWM for its lowest speed) and reports
-# it, so the RPM sent is exactly the set RPM and the ESP32 shows the same RPM as the website; change
-# MIN_PWM in the sketch if a mixer hums but doesn't turn (find it: python -m app.hwtest mixer
-# purification_stirrer). mixer_min_pwm is only used with an older sketch that has MIN_PWM 0.
-mixer_min_pwm = 90
-mixer_kick_seconds = 1.0     # every start: this long at full speed first, then the set speed
+# Mixers (open loop): the RPM sent is exactly the set RPM (mixer 2: 200; mixer 1: the stage's
+# stirring speed), and the ESP32 reports that same RPM. The sketch turns it into PWM from its MIN_PWM
+# (90). If a mixer hums but doesn't turn, raise MIN_PWM in the sketch (find it: python -m app.hwtest
+# mixer purification_stirrer), or start each mixer at full speed for a moment:
+mixer_kick_seconds = 0       # e.g. 1.0 = 1 s at full speed (1544) at each start, then the set RPM
 
 [esp32.devices]
 # Which ESP32 output does which Greenova job. The names are the sketch's device ids:
@@ -79,15 +78,15 @@ rpwm = 21               # physical pin 40
 [load_cells.output]
 # HX711 under the biodiesel output container: the yield, and the end of the purification drain
 # (stable for 30 s). Wiring: VCC -> 3.3 V (pin 1, NOT 5 V), GND -> GND, DT -> data_pin, SCK -> clock_pin.
-# Calibrate on the website (Settings -> Hardware: Tare, then Calibrate with a known weight); that
-# calibration is saved in backend/loadcell_calibration.json and wins over the numbers here.
+# Calibrate on the website (Settings -> Hardware: Tare, then Add weight with one or more known
+# weights); that calibration is saved in loadcell_calibration.json and wins over the numbers here.
 enabled = true
 data_pin = 17           # HX711 DT  (physical pin 11)
 clock_pin = 27          # HX711 SCK (physical pin 13)
 offset = 41028.54       # raw reading with the empty container (from the Pi control panel's config.json)
 scale = 145.759         # raw counts per GRAM (its calibration_factor 145759 was per kg)
-samples = 10            # median of the last 10 conversions (about 1 s)
-cal_seconds = 3.0       # how long Tare / Calibrate average the readings
+samples = 20            # the reading = trimmed mean of the last 20 conversions (about 2 s at 10 per second)
+cal_seconds = 5.0       # how long Tare / Add weight average the readings
 capacity_kg = 5
 vessel_kg = 0
 
@@ -99,8 +98,8 @@ data_pin = 5            # physical pin 29
 clock_pin = 6           # physical pin 31
 offset = 0
 scale = 420.0
-samples = 10
-cal_seconds = 3.0
+samples = 20
+cal_seconds = 5.0
 capacity_kg = 5
 vessel_kg = 0
 
@@ -118,6 +117,22 @@ type = "none"
 i2c_bus = 1
 address = 0x40
 shunt_ohms = 0.02
+
+[energy]
+# Rated power (W) of each part, for the batch's energy used = power × the time each part was on
+# (counted by the Pi every second, app/energy.py). Put the value from each part's label or datasheet
+# (or volts × amps). Motors count in proportion to their speed setting. Not listed here: the heater
+# (Settings -> Heater power, 900 W) and the electrodes (measured with an INA226, otherwise the
+# stage's voltage × current limit set on the CC/CV module).
+stirrer_w = 24               # mixer 1 (reactor), 12 V
+purification_stirrer_w = 24  # mixer 2 (dry wash), 12 V
+centrifuge_w = 120           # centrifuge motor, 24 V, at full speed
+oil_pump_w = 24
+catalyst_pump_w = 12         # dispenser A
+acid_pump_w = 12             # dispenser B
+reactor_pump_w = 24
+pumpin_w = 24
+pumpout_w = 30               # valve + pumpout together
 
 [power_supply]
 # control = "manual": you set the voltage and current on the supply's knobs.

@@ -264,13 +264,14 @@ def test_outputs_go_through_the_esp32_with_a_dead_man_timer(lg, tmp_path):
         assert r["temperature"] == 31.2 and r["controllerOnline"] is True and r["controllerError"] is None
         assert r["purificationStirrerRpm"] == 0 and r["stirrerRpm"] == 0
 
-        # dry wash stirrer at 200 RPM: the ESP32's own RPM scale (MAX_RPM 1544) is used; it starts
-        # with the 1 s kick at full speed, then exactly 200 RPM (the sketch's MIN_PWM makes it turn)
+        # dry wash stirrer at 200 RPM: the ESP32's own RPM scale (MAX_RPM 1544) is used, and exactly
+        # 200 RPM is sent from the first command on (the sketch's MIN_PWM makes it turn)
         full = hw.full_speed_rpm("purification_stirrer")
         assert full == 1544
         hw.set_motor("purification_stirrer", 200 / full)
-        assert "mixer2 on 5 1544" in esp.lines and esp.on("mixer2")
+        assert esp.lines[-1] == "mixer2 on 5 200" and esp.on("mixer2") and esp.devs["mixer2"]["rpm"] == 200
         wait_until(lambda: esp.lines.count("mixer2 on 5 200") >= 3, what="the dead-man refresh")
+        assert not any(line.startswith("mixer2 on 5 1544") for line in esp.lines)   # no kick by default
 
         hw.set_heater(True)                                  # interlock: only with the stirrer running
         assert esp.on("heater") and "heater on 5" in esp.lines
@@ -709,40 +710,42 @@ def test_an_esp32_brownout_is_named_in_the_fault(lg, tmp_path):
 
 
 def test_mixers_run_at_exactly_the_set_rpm(lg, tmp_path):
-    """The ESP32 reports exactly the RPM that was set (200 for mixer 2, the stage's speed for mixer 1):
-    the sketch's own MIN_PWM (90) makes slow speeds turn. Each start begins with a short kick at
-    full speed. The website shows the ESP32's reading."""
-    hw, esp = _machine(lg, tmp_path, **{"esp32.mixer_kick_seconds": 0.3})
+    """The ESP32 gets and reports exactly the RPM that was set: 200 for mixer 2, the stage's speed
+    for mixer 1 (500 for a 500 RPM esterification). The website shows the ESP32's reading."""
+    hw, esp = _machine(lg, tmp_path)
     try:
-        wait_until(lambda: hw.sketch_min_pwm() == 90, what="the sketch's MIN_PWM")
         hw.set_motor("purification_stirrer", 200 / 1544)
-        assert esp.devs["mixer2"]["rpm"] == 1544                  # the kick
-        time.sleep(0.45)
-        hw._refresh_outputs()
-        assert esp.devs["mixer2"]["rpm"] == 200                   # exactly the set RPM on the ESP32
+        assert esp.devs["mixer2"]["rpm"] == 200
         wait_until(lambda: hw.refresh()["purificationStirrerRpm"] == 200, what="the ESP32's 200 RPM shown")
-        hw.set_motor("stirrer", 700 / 1544)                        # mixer 1 at a stage's 700 RPM
-        time.sleep(0.45)
-        hw._refresh_outputs()
-        assert esp.devs["mixer1"]["rpm"] == 700
-        wait_until(lambda: hw.refresh()["stirrerRpm"] == 700, what="the ESP32's 700 RPM shown")
+        for rpm in (500, 700, 400):                               # the stage's stirring speed
+            hw.set_motor("stirrer", rpm / 1544)
+            hw._refresh_outputs()
+            assert esp.devs["mixer1"]["rpm"] == rpm
+            wait_until(lambda: hw.refresh()["stirrerRpm"] == rpm, what=f"the ESP32's {rpm} RPM shown")
         hw.set_motor("purification_stirrer", 1.0)
-        hw._refresh_outputs()
         assert esp.devs["mixer2"]["rpm"] == 1544
     finally:
         hw.close()
 
 
-def test_an_older_sketch_without_min_pwm_still_turns_the_mixers(lg, tmp_path):
-    """A sketch with MIN_PWM 0 (no "minPwm" in STATUS): the backend moves slow speeds up to
-    mixer_min_pwm itself (200 RPM -> PWM 111)."""
-    hw, esp = _machine(lg, tmp_path, FakeEsp32(min_pwm=None), **{"esp32.mixer_kick_seconds": 0.3,
-                                                                  "esp32.mixer_min_pwm": 90})
+def test_a_sketch_without_min_pwm_still_gets_the_exact_rpm(lg, tmp_path):
+    """Older sketch (no "minPwm"), or mixer_min_pwm left in a hardware.toml: the RPM is still sent
+    as it is (no extra floor on top)."""
+    hw, esp = _machine(lg, tmp_path, FakeEsp32(min_pwm=None), **{"esp32.mixer_min_pwm": 90})
     try:
-        hw.refresh()
         hw.set_motor("purification_stirrer", 200 / 1544)
+        assert esp.devs["mixer2"]["rpm"] == 200
+    finally:
+        hw.close()
+
+
+def test_optional_start_kick(lg, tmp_path):
+    hw, esp = _machine(lg, tmp_path, **{"esp32.mixer_kick_seconds": 0.3})
+    try:
+        hw.set_motor("purification_stirrer", 200 / 1544)
+        assert esp.devs["mixer2"]["rpm"] == 1544                  # the kick
         time.sleep(0.45)
         hw._refresh_outputs()
-        assert esp.devs["mixer2"]["rpm"] == round(90 / 255 * 1544 + 200 * 165 / 255)
+        assert esp.devs["mixer2"]["rpm"] == 200
     finally:
         hw.close()

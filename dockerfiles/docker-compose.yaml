@@ -6,6 +6,8 @@
 #    and centrifuge and tells you what doesn't work)
 # By hand:
 #     docker compose up -d --build      start everything in the background
+#     bash open-website.sh              then open the website in the Pi's browser (start-machine.sh does
+#                                       this, and sets it up to open by itself after every reboot)
 #     docker compose logs -f backend    the backend's log (the "Hardware check:" lines)
 #     docker compose down               stop it (the MySQL data is kept)
 #

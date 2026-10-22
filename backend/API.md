@@ -17,7 +17,7 @@ The FastAPI service runs on the Raspberry Pi that drives the machine, listens on
 - `POST /api/batches/{batch_id}/cancel` — cancel an ongoing batch (every output is switched off).
 - Batch lab-result endpoints update the batch's single `batch_lab_results` row in place and append history to `batch_timeline`.
 - `GET /api/hardware` — Settings → Hardware: `backend` (`esp32` or `gpio`), `fault`, `controller` (ESP32: `online`, `port`, `temperature`, `leaseSeconds`, its `devices` and recent `messages`), `roles` (each Greenova job and the ESP32 device(s) doing it), `centrifuge` (Pi BTS7960: `rpm`, `targetRpm`, `duty`, `maxRpm`) and `loadCells`.
-- `POST /api/hardware/load-cells/{key}/tare` and `POST /api/hardware/load-cells/{key}/calibrate` (`{"grams": 500}`) — Tare / Calibrate a load cell, about 3 s each; refused (409) while a process runs.
+- `POST /api/hardware/load-cells/{key}/tare` and `POST /api/hardware/load-cells/{key}/calibrate` (`{"grams": 500}`) — Tare, then add one or more known weights (about 5 s each; refused while a process runs). Each weight is a calibration point: the scale is fitted by least squares through the Tare and every weight since it, and `points` gives each weight's error in grams. Calibrate needs a Tare within the last 30 min and a steady reading (±1.5 g). `loadCells` also carry `points`, `taredThisSession`, `zeroTrackedG` (how far the idle zero tracking has moved the zero) and `spoiledReadings` (HX711 readings thrown away).
 
 ## The oil pump and the dispensers (stopped by the operator)
 
@@ -31,10 +31,14 @@ The FastAPI service runs on the Raspberry Pi that drives the machine, listens on
 ## Stages and the hand-offs
 
 - `POST /api/process/stage/start` — `stage`, `batchId`, the reaction settings (`voltage`, `time`, `stirring`, `current`), `oilMassG`, `adsorbent`, and the batch's separation: `separationTime` (min) and `separationSpeed` (RPM). Send them with the **Transesterification** start: the Pi uses them for the separation it starts by itself. A **Separation** start uses them directly (no settle).
-- `POST /api/process/stage/{pause|resume|complete|emergency-stop|reset}`.
+- `POST /api/process/stage/{pause|resume|complete|emergency-stop|reset}`. A stopped stage (`fault`) needs no `reset`: `stage/start` starts it again (the website's **Start again**).
 - When **Transesterification** completes, **Separation starts by itself**: `phase` `settling` for 60 s (`settleRemainingSeconds`, everything off), then `separating`: the reactor pump (`reactor_outlet`), the centrifuge (at `speedRpm`) and pumpin (`centrifuge_outlet`) run together for `timeMinutes`. All three stop at the end.
 - When **Separation** completes, **purification starts by itself** (`purificationAutoStart`; with a level switch fitted, it waits for the biodiesel to cover the heater). Without a temperature or output load cell reading, or with an earlier purification safety stop not acknowledged, it waits with nothing on (`purificationWaiting`) and starts once that is fixed.
 - **Purification:** methanol removal straight away (`methanolRemovalTime`; stirrer on, heater in 4 s pulses, the next one when the temperature is 0.2 °C below its highest point since the last pulse, none at or above 90 °C; `heaterPulses` counts them) → add adsorbent (`POST /api/process/purification/magnesol-added`) → contact at 200 RPM, heater off (`contactTime`) → `settle` (60 s, stirrer off) → `drain` (valve + pumpout) until the output load cell has been stable (±2 g) for 30 s → `complete`, and every output is switched off. `GET /api/process/purification`: `stirrerRpm` (the ESP32's reading) during `methanol` and `contact`; `settleTotalSeconds` / `settleRemainingSeconds`; `stableSeconds` / `stableTargetSeconds` during the drain. `POST /api/process/purification/{start|abort|acknowledge}`.
+
+## Energy
+
+The Pi counts every part's power × the time it is on, every second (`app/energy.py`): the heater (Settings `heaterPowerWatts`), the electrodes (measured V × A, otherwise the stage's voltage × current limit), the mixers and centrifuge (rated W × speed share) and the pumps (rated W while on), with the ratings in `hardware.toml` `[energy]`. When the batch in progress is saved (completed or cancelled), its `energy` (kWh) is set from the batch's start, and a timeline line gives each part's share. The analytics give the mean and range of `energyKwh` per FFA range, and the cost per liter includes `energy × electricityPrice`.
 
 ## Persistence and schema
 

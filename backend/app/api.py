@@ -138,12 +138,14 @@ def _merge_purification(website: Optional[PurificationRecord], measured: Optiona
         return website
 
 
-def _apply_pending(app, b: Batch, s: Settings) -> Batch:
+def _apply_pending(app, b: Batch, s: Settings, ongoing: bool = True) -> Batch:
     """Fill in what the Pi measured itself. Measured values replace the website's placeholders
-    (temperature 27, yield 0). Energy is not measured or recorded (the energy column stays 0)."""
+    (temperature 27, yield 0, energy 0). Energy = power × time on of every part since the batch
+    started (energy.py), with a timeline line showing each part's share."""
     rec = app.state.records.pop(b.id, None)
     if rec is None:
-        return b
+        # nothing measured for it in this run of the backend (it restarted): energy since the start
+        rec = {"timeline": [], "temperature": {}, "purification": None}
     if b.adsorbent is None and rec.get("adsorbent"):
         b.adsorbent = rec["adsorbent"]
     b.timeline = sorted(b.timeline + [TimelineEvent.model_validate(e) for e in rec["timeline"]],
@@ -154,6 +156,14 @@ def _apply_pending(app, b: Batch, s: Settings) -> Batch:
         b.temperature = measured_temp
     if rec["purification"]:
         b.purification = _merge_purification(b.purification, rec["purification"])
+    meter = getattr(app.state, "energy", None)
+    # counted from the batch's start; after a backend restart, from the restart (a batch that was
+    # never started on this machine gets nothing)
+    if meter is not None and not b.energy and (ongoing or rec.get("energyStart") is not None):
+        used = meter.used_since(rec.get("energyStart"), meter.totals())
+        kwh, line = meter.describe(used)
+        b.energy = kwh
+        b.timeline.append(TimelineEvent(label=line[:500], time=datetime.now()))
     return b
 
 
@@ -366,6 +376,9 @@ def _start(app, s: Settings, b: Batch) -> dict:
             started = db.start_batch(b, s.batch_format, date.today().year)
         except db.ActiveBatchError as e:
             raise HTTPException(409, str(e))
+        meter = getattr(app.state, "energy", None)
+        if meter is not None:                     # the batch's energy is counted from here
+            _pending(app, started.id)["energyStart"] = meter.totals()
         return _active_dump(started)
 
 
@@ -439,7 +452,7 @@ def save_batch(data: BatchIn, request: Request):
         b = Batch.model_validate(fields | {"id": batch_id})
         if existing is not None:
             b = _finish_ongoing(existing, b)
-        b = _apply_pending(request.app, b, s)
+        b = _apply_pending(request.app, b, s, ongoing=existing is not None)
         if getattr(request.app.state, "purification_armed", None) == batch_id:
             request.app.state.purification_armed = None      # the batch is finished: nothing more starts for it
         b.timeline.append(TimelineEvent(label="Batch saved", time=datetime.now()))
@@ -593,9 +606,8 @@ def _auto_start_separation(app, batch_id: Optional[str]) -> None:
     if not batch_id:
         return
     runner = app.state.stage
-    busy = ("another stage is running" if runner.active else "a stage fault must be reset first"
-            if runner.state["state"] == "fault" else "a pump into the reactor is running" if app.state.pump.running
-            else "purification is running" if app.state.purification.running else None)
+    busy = ("another stage is running" if runner.active else "a pump into the reactor is running"
+            if app.state.pump.running else "purification is running" if app.state.purification.running else None)
     if busy:
         app.state.alarm = f"Separation did not start by itself: {busy}."
         return

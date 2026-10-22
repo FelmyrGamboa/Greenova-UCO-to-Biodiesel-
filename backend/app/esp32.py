@@ -382,15 +382,11 @@ class Esp32Hardware(Hardware):
         self._lease = max(0, int(e.get("lease_seconds", 5)))
         self._max_on = {role: int(s) for role, s in (e.get("max_on_seconds") or {}).items() if s}
         self._mixer_max_rpm = float(e.get("mixer_max_rpm", 1544))
-        # The sketch turns RPM into PWM in a straight line from its MIN_PWM. The current sketch has
-        # MIN_PWM 90 and reports it ("minPwm"): then the RPM sent is exactly the set RPM, so the
-        # ESP32 reports the same RPM as the website. Only an older sketch (MIN_PWM 0, no "minPwm")
-        # gets mixer_min_pwm applied here instead, so its mixers still turn at low speeds. Every
-        # start begins with mixer_kick_seconds at full speed so the motor gets going.
-        floor = e.get("mixer_min_pwm", 90)
-        self._min_pwm = {role: float(floor.get(role, 90) if isinstance(floor, dict) else floor)
-                         for role in MOTOR_ROLES}
-        self._kick_s = max(0.0, float(e.get("mixer_kick_seconds", 1.0)))
+        # Mixers: the RPM sent is exactly the set RPM (mixer 2: 200; mixer 1: the stage's stirring
+        # speed), so the ESP32 shows the same RPM as the website. The sketch turns it into PWM from
+        # its MIN_PWM (90: slow speeds still turn the motor). mixer_kick_seconds (0 = none) can start
+        # each mixer at full speed for a moment if one doesn't get going on its own.
+        self._kick_s = max(0.0, float(e.get("mixer_kick_seconds", 0.0)))
         self._kick_until: dict[str, float] = {}
         self._want: dict[str, int] = {}               # role -> 1/0 (relays) or RPM (mixers, 0 = off)
         self._switched_at: dict[str, float] = {}
@@ -415,7 +411,9 @@ class Esp32Hardware(Hardware):
         for key, c in cells.items():
             hx = drivers.HX711Scale(self._lg, self._chip, c["data_pin"], c["clock_pin"])
             self._cells[key] = drivers.LoadCell(hx, key, c.get("offset", 0), c.get("scale", 1.0),
-                                                c.get("samples", 10), c.get("cal_seconds", 3.0), store)
+                                                c.get("samples", 20), c.get("cal_seconds", 5.0), store)
+            # the zero follows the drift only while the machine is idle (never during a drain)
+            self._cells[key].zero_tracking = lambda: not self.any_output_on()
         self._level_pin = None
         self._level_closed_is_liquid = cfg["level_switch"].get("closed_means_liquid", True)
         if cfg["level_switch"].get("enabled"):
@@ -456,20 +454,15 @@ class Esp32Hardware(Hardware):
         if not value:
             return f"{device} off"
         if role in MOTOR_ROLES:
-            return f"{device} on {seconds} {self._command_rpm(role, value)}"   # "mixer2 on 5 674": 0 s = no timer
+            return f"{device} on {seconds} {self._command_rpm(role, value)}"   # "mixer2 on 5 200": 0 s = no timer
         return f"{device} on {seconds}" if seconds else f"{device} on"
 
     def _command_rpm(self, role: str, rpm: float) -> int:
-        """The RPM to send for a target speed: full speed during the start kick, otherwise the
-        target moved up so the lowest speed gets mixer_min_pwm (the sketch: PWM = RPM × 255 / MAX_RPM)."""
+        """The RPM to send: exactly the set RPM (full speed only during an optional start kick)."""
         top = self.full_speed_rpm(role) or self._mixer_max_rpm
         if time.monotonic() < self._kick_until.get(role, 0.0):
             return int(top)
-        rpm = min(max(float(rpm), 0.0), top)
-        if self.sketch_min_pwm() is not None:
-            return round(rpm)                 # the sketch applies its own MIN_PWM: send the set RPM as it is
-        floor = min(max(self._min_pwm.get(role, 0.0), 0.0), 254.0)
-        return min(int(top), round(floor / 255 * top + rpm * (255 - floor) / 255))
+        return round(min(max(float(rpm), 0.0), top))
 
     def sketch_min_pwm(self) -> Optional[int]:
         """The sketch's own MIN_PWM, when its STATUS reports it (the current sketch: 90); None for an
