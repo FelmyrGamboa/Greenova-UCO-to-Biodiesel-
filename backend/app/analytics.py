@@ -1,6 +1,10 @@
 """Batch analytics, using exactly the same rules as the website's Batch History page
-(buildRangeRows, calculateCostPerLiter) and getRecommendedParametersForFfa in greenovaData.ts,
-so the website and the Pi always show the same numbers.
+(buildRangeRows, calculateCostPerLiter, meanAndRange) and getRecommendedParametersForFfa in
+greenovaData.ts, so the website and the Pi always show the same numbers.
+
+Statistical treatment (the thesis' evaluation): frequencies and percentages for the completion
+and lab pass rates; means and ranges (minimum-maximum) for yield and cost per liter, per FFA range
+and overall. No energy figure (energy isn't measured) and no machine learning.
 
 - Only batches with a Passed or Failed lab result count as tested.
 - FFA ranges come from ffaRangeBoundaries: a batch is in a range when min <= FFA < max.
@@ -22,12 +26,40 @@ def _mean(values: list[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
+def mean_and_range(values: list[float]) -> Optional[dict]:
+    """n, mean, minimum and maximum (None for no values): the statistic shown for yield and cost."""
+    if not values:
+        return None
+    return {"n": len(values), "mean": sum(values) / len(values), "min": min(values), "max": max(values)}
+
+
+def _completed(batches: list[Batch]) -> list[Batch]:
+    return [b for b in batches if b.status == "Completed"]
+
+
+def yield_stats(batches: list[Batch]) -> Optional[dict]:
+    """Mean and range of the yield of the completed batches (a batch without output is left out)."""
+    return mean_and_range([b.yield_ for b in _completed(batches) if b.yield_ > 0])
+
+
+def cost_stats(batches: list[Batch], s: Settings) -> Optional[dict]:
+    """Mean and range of the cost per liter of the completed batches."""
+    return mean_and_range([c for b in _completed(batches) if (c := cost_per_liter(b, s)) is not None])
+
+
 def ffa_ranges(s: Settings) -> list[dict]:
     bounds = s.boundaries()
-    ranges = [{"key": f"{lo:g}-{hi:g}", "label": f"{lo:g}–{hi:g}%", "min": lo, "max": hi}
-              for lo, hi in zip(bounds, bounds[1:])]
+    ranges = []
+    for lo, hi in zip(bounds, bounds[1:]):
+        if lo == 0 and hi == 4:
+            label = "0–3% — straight to transesterification"
+        elif lo == 4 and hi == 5:
+            label = "4% — esterified"
+        else:
+            label = f"{lo:g}–{hi - 1:g}%"
+        ranges.append({"key": f"{lo:g}-{hi:g}", "label": label, "min": lo, "max": hi})
     last = bounds[-1]
-    ranges.append({"key": f"{last:g}+", "label": f"{last:g}% and above", "min": last, "max": None})
+    ranges.append({"key": f"{last:g}+", "label": f"{last:g}%+ — esterified", "min": last, "max": None})
     return ranges
 
 
@@ -76,10 +108,13 @@ def _best_group(passed: list[Batch]) -> Optional[tuple]:
 
 
 def range_rows(batches: list[Batch], s: Settings) -> list[dict]:
+    """Per FFA range: lab pass rate, recommended settings and status from the lab-tested batches;
+    yield and cost (mean and range) from the completed batches."""
     tested = [b for b in batches if is_tested(b)]
     rows = []
     for r in ffa_ranges(s):
         in_r = [b for b in tested if in_range(b.ffa, r)]
+        done = [b for b in _completed(batches) if in_range(b.ffa, r)]
         passed = [b for b in in_r if b.lab_result == "Passed"]
         best = _best_group(passed)
         recommended, proven = None, False
@@ -90,18 +125,21 @@ def range_rows(batches: list[Batch], s: Settings) -> list[dict]:
             proven = (len(matching) >= s.proven_batch_count
                       and all(b.lab_result == "Passed" for b in matching)
                       and all(abs(b.yield_ - average) <= s.proven_yield_tolerance for b in matching))
-        yields = [b.yield_ for b in in_r]
+        yields = yield_stats(done)
         rows.append({
             "range": r,
+            "completedBatches": len(done),
             "testedBatches": len(in_r),
             "passedBatches": len(passed),
             "labPassRate": len(passed) / len(in_r) * 100 if in_r else None,
             "recommendedBatchId": recommended.id if recommended else None,
             "recommendedParameters": parameters_of(recommended) if recommended else None,
             "esterificationRun": recommended.esterification_run if recommended else None,
-            "averageYield": _mean(yields),
-            "minimumYield": min(yields) if yields else None,
-            "maximumYield": max(yields) if yields else None,
+            "yield": yields,
+            "averageYield": yields["mean"] if yields else None,
+            "minimumYield": yields["min"] if yields else None,
+            "maximumYield": yields["max"] if yields else None,
+            "costPerLiter": cost_stats(done, s),
             "status": "No data" if not in_r else "Proven" if proven else "Testing",
         })
     return rows
@@ -121,6 +159,8 @@ def recommended_parameters(ffa: float, batches: list[Batch], s: Settings) -> Opt
 
 
 def cost_per_liter(b: Batch, s: Settings) -> Optional[float]:
+    """Σ(material used × its price in Settings) ÷ liters of biodiesel. Materials only: the energy
+    isn't measured, so electricity isn't part of it."""
     if b.materials is None or not b.biodiesel_output_ml or b.biodiesel_output_ml <= 0:
         return None
     m = s
@@ -131,32 +171,39 @@ def cost_per_liter(b: Batch, s: Settings) -> Optional[float]:
             + b.materials.sulfuric_acid_l * m.sulfuric_acid_price
             + b.materials.acetone_l * m.acetone_price
             + b.materials.bentonite_kg * m.bentonite_price
-            + b.materials.magnesol_kg * m.magnesol_price
-            + b.energy * m.electricity_price)
+            + b.materials.magnesol_kg * m.magnesol_price)
     return cost / (b.biodiesel_output_ml / 1000)
 
 
 def cost_report(batches: list[Batch], s: Settings) -> dict:
-    tested = [b for b in reversed(batches) if is_tested(b)]   # oldest first, like the website charts
-    rows = [{"id": b.id, "costPerLiter": c} for b in tested if (c := cost_per_liter(b, s)) is not None]
-    average = _mean([r["costPerLiter"] for r in rows])
+    """Cost per liter of the completed batches (oldest first), its mean and range, and the target
+    (half the diesel price)."""
+    done = list(reversed(_completed(batches)))
+    rows = [{"id": b.id, "costPerLiter": c} for b in done if (c := cost_per_liter(b, s)) is not None]
+    stats = mean_and_range([r["costPerLiter"] for r in rows])
+    average = stats["mean"] if stats else None
     target = s.diesel_price / 2
     tone = ("neutral" if average is None else "green" if average < target
             else "yellow" if average < s.diesel_price else "red")
-    return {"batches": rows, "averageCost": average, "dieselPrice": s.diesel_price,
+    return {"batches": rows, "averageCost": average, "minimumCost": stats["min"] if stats else None,
+            "maximumCost": stats["max"] if stats else None, "dieselPrice": s.diesel_price,
             "targetCost": target, "tone": tone}
 
 
 def summary(batches: list[Batch]) -> dict:
     completed = [b for b in batches if b.status == "Completed"]
+    finished = [b for b in batches if b.status != "In Progress"]   # the ongoing batch isn't a failure
     tested = [b for b in batches if is_tested(b)]
     passed = [b for b in tested if b.lab_result == "Passed"]
+    yields = yield_stats(batches)
     return {
         "totalBatches": len(batches),
         "completed": len(completed),
-        "completionRate": len(completed) / len(batches) * 100 if batches else 0,
+        "completionRate": len(completed) / len(finished) * 100 if finished else 0,
         "tested": len(tested),
         "passed": len(passed),
         "labPassRate": len(passed) / len(tested) * 100 if tested else None,
-        "averageYield": sum(b.yield_ for b in completed) / max(len(completed), 1),
+        "averageYield": yields["mean"] if yields else 0,
+        "minimumYield": yields["min"] if yields else None,
+        "maximumYield": yields["max"] if yields else None,
     }

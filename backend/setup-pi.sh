@@ -5,26 +5,61 @@
 #     cd ~/Greenova-UCO-to-Biodiesel-/backend
 #     bash setup-pi.sh
 #
-# It installs the system packages, turns on I2C and 1-Wire, creates .venv, copies
-# hardware.example.toml to hardware.toml (if you don't have one yet) and installs the
-# "greenova" service. It does NOT start the machine: edit hardware.toml and run the checks first.
+# It installs packages, creates .venv, copies the hardware template if needed, stops the old Pi
+# control panel (pi-control, which would take the ESP32's serial port and the GPIO pins) and installs
+# the "greenova" service. The website always drives the real machine: the ESP32 controller on USB
+# plus the Pi's centrifuge and load cell (there is no demo mode).
 # Guide: docs/RASPBERRY_PI_SETUP.md
+#
+# The batches and settings live in the project's MySQL 8 database (not MariaDB). It is created
+# once by importing backend/greenova_db_ver2.sql as it is, on the computer running MySQL 8; that
+# file also creates the MySQL user greenova@localhost (no password) the backend logs in with.
+# This script does not install a database server.
+#     bash setup-pi.sh --kiosk           optionally launch Chromium full-screen on the touchscreen at boot
 set -euo pipefail
 
 cd "$(dirname "$0")"
 BACKEND="$(pwd)"
 RUN_AS="$(id -un)"
+KIOSK=0
+for arg in "$@"; do
+  case "$arg" in
+    --kiosk) KIOSK=1 ;;
+    --hardware) ;;   # the only mode now (kept so older instructions still work)
+    --demo) echo "--demo was removed: Greenova always drives the real machine (ESP32 + Raspberry Pi)." >&2; exit 2 ;;
+    --with-mariadb) echo "--with-mariadb was removed: Greenova uses MySQL 8 (import greenova_db_ver2.sql)." >&2; exit 2 ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
 
 if [ "$RUN_AS" = "root" ]; then
   echo "Run this as your normal user (e.g. pi), not with sudo. It asks for sudo itself." >&2
   exit 1
 fi
 
+# The backend also serves the production-built React website. Build it on the development
+# computer with Node.js 22, then copy frontend/dist to the Pi with the rest of the project.
+# We deliberately do not install a separate Node toolchain on the Pi just to serve static files.
+if [ ! -f "$BACKEND/../frontend/dist/index.html" ] && [ ! -f "$BACKEND/frontend/dist/index.html" ]; then
+  cat >&2 <<'EOF'
+The built Greenova website was not found (frontend/dist/index.html).
+
+Before running this installer, build the website on a computer with Node.js 22:
+  cd frontend
+  npm ci
+  npm run build
+
+Then copy the complete project, including frontend/dist, to the Raspberry Pi and run this script again.
+See docs/PI_DEPLOYMENT.md for the full steps.
+EOF
+  exit 1
+fi
+
 echo "==> System packages"
 sudo apt update
-sudo apt install -y python3-venv python3-pip python3-gpiozero python3-lgpio i2c-tools
+sudo apt install -y python3-venv python3-pip python3-gpiozero python3-lgpio python3-serial i2c-tools avahi-daemon
 
-echo "==> I2C (power monitor, strip reader) and 1-Wire (DS18B20 temperature probe)"
+echo "==> I2C (optional power monitor) and 1-Wire (DS18B20 temperature probe, older gpio wiring)"
 if command -v raspi-config >/dev/null; then
   sudo raspi-config nonint do_i2c 0 || true
   sudo raspi-config nonint do_onewire 0 || true
@@ -43,22 +78,65 @@ if [ ! -f hardware.toml ]; then
   echo "==> Created hardware.toml from hardware.example.toml: edit it to match your wiring."
 fi
 
+if [ ! -f .env ]; then
+  cp .env.example .env
+  chmod 600 .env
+  cat <<'EOF'
+==> Created .env from .env.example. Its defaults are MySQL 8 on this Pi with the greenova_db
+    database and the user greenova@localhost from greenova_db_ver2.sql. If MySQL runs on another
+    computer, put that computer's address in DB_HOST and a MySQL account that may log in from this
+    Pi in DB_USER / DB_PASSWORD (greenova@localhost only accepts logins from MySQL's own computer).
+EOF
+fi
+
+echo "==> Stopping the old Pi control panel (it would take the ESP32's port and the GPIO pins)"
+if systemctl list-unit-files pi-control.service 2>/dev/null | grep -q pi-control; then
+  sudo systemctl disable --now pi-control || true
+  echo "    pi-control service stopped and disabled."
+fi
+if [ -f "$HOME/.config/autostart/pi-control.desktop" ]; then
+  mv "$HOME/.config/autostart/pi-control.desktop" "$HOME/.config/autostart/pi-control.desktop.disabled"
+  echo "    pi-control desktop autostart disabled (renamed to pi-control.desktop.disabled)."
+fi
+pkill -f "pi_control/app.py" 2>/dev/null || true
+
 echo "==> Service (starts the backend when the Pi boots)"
 sed -e "s#__USER__#$RUN_AS#g" -e "s#__BACKEND__#$BACKEND#g" greenova.service \
   | sudo tee /etc/systemd/system/greenova.service >/dev/null
 sudo systemctl daemon-reload
 
+if [ "$KIOSK" = 1 ]; then
+  echo "==> Chromium touchscreen kiosk"
+  sudo apt install -y chromium
+  mkdir -p "$HOME/.config/autostart"
+  cat > "$HOME/.config/autostart/greenova-kiosk.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Greenova Kiosk
+Exec=chromium --kiosk --noerrdialogs --disable-infobars --check-for-update-interval=31536000 http://localhost:8000
+X-GNOME-Autostart-enabled=true
+DESKTOP
+  chmod 644 "$HOME/.config/autostart/greenova-kiosk.desktop"
+fi
+sudo systemctl enable --now avahi-daemon || true
+
+IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 cat <<EOF
 
-Done. Next steps (reboot first if I2C or 1-Wire was just turned on):
+Done. Next steps (reboot first: the dialout/gpio groups and I2C need it):
 
-  1. Edit the wiring:       nano $BACKEND/hardware.toml
-  2. Check it:              .venv/bin/python -m app.hwtest check
-  3. Read the sensors:      .venv/bin/python -m app.hwtest read
-  4. Click each output:     .venv/bin/python -m app.hwtest outputs    (heater and supply unplugged!)
-  5. Calibrate load cells:  .venv/bin/python -m app.hwtest calibrate reactor   (and: output)
-  6. Start the service:     sudo systemctl enable --now greenova
+  0. Check the database:    .venv/bin/python -m app.db      (MySQL login: nano $BACKEND/.env)
+  1. Check the wiring file: .venv/bin/python -m app.hwtest check
+                            Edit [esp32.devices] in $BACKEND/hardware.toml so each Greenova job
+                            (heater, oil pump, dispensers, reactorpump, pumpin, valve + pumpout,
+                            the mixers) names the right ESP32 output.
+  2. Upload firmware/esp32_process_control/esp32_process_control.ino to the ESP32 and plug it into the Pi.
+                            .venv/bin/python -m app.hwtest esp32        (should show its outputs and temperature)
+  3. Bench test (heater and electrode supply UNPLUGGED, centrifuge rotor out):
+                            .venv/bin/python -m app.hwtest outputs
+  4. Start the backend:     sudo systemctl enable --now greenova
                             journalctl -u greenova -f
-  7. Open the website:      http://$(hostname -I 2>/dev/null | awk '{print $1}'):8000
+  5. Open on the Pi:        http://localhost:8000      over Wi-Fi: http://$IP:8000  (or http://greenova.local:8000)
+     Settings -> Hardware: check the ESP32 is online, then Tare and Calibrate the output load cell.
 
 EOF

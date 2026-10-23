@@ -1,4 +1,6 @@
-"""API tests with the real FastAPI. They need FastAPI and httpx:  python -m pytest"""
+"""API tests with the real FastAPI. They need FastAPI and httpx:  python -m pytest
+The machine is the tests' simulated machine (tests/simulator.py), 100x faster than real time,
+with a level switch at the heater."""
 import time
 
 import pytest
@@ -8,26 +10,47 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import config  # noqa: E402
+from app import main  # noqa: E402
 from app.main import app  # noqa: E402
+from tests.simulator import SimulatedMachine  # noqa: E402
+
+SCALE = 100   # 1 simulated minute = 0.6 s
 
 
 @pytest.fixture()
-def client(tmp_path):
-    config.DB_PATH = tmp_path / "api.db"
+def client(mysql_db, monkeypatch):
+    """The API on an empty MySQL test database (fixture mysql_db in conftest.py) and the
+    simulated machine."""
+    monkeypatch.setattr(main, "create_hardware", lambda: SimulatedMachine(SCALE, level_switch=True))
     with TestClient(app) as c:
         yield c
 
 
+def _quick(client):
+    """The shortest purification the Settings allow: 5 min methanol removal, 1 min contact."""
+    client.put("/api/settings", json={"methanolRemovalTime": 5, "contactTime": 1})
+
+
 def _wait_for(client, path, key, values, timeout=6.0):
-    """Polls a state endpoint until state[key] is one of values."""
-    end = time.time() + timeout
+    """Polls a state endpoint until state[key] is one of values. The time limit is generous: on
+    Windows the simulated machine's "seconds" take about 16 ms instead of 10 ms."""
+    end = time.time() + max(timeout * 3, 20)
     while True:
         st = client.get(path).json()
         if st[key] in values or time.time() > end:
             assert st[key] in values, st
             return st
         time.sleep(0.1)
+
+
+def _open_gate_valve(client, batch_id):
+    """After transesterification: wait for the gate valve prompt, then confirm it (separation starts)."""
+    end = time.time() + 20
+    while client.get("/api/live").json().get("gateValveWaiting") != batch_id:
+        assert time.time() < end, "no gate valve prompt"
+        time.sleep(0.05)
+    r = client.post("/api/process/separation/gate-valve-opened")
+    assert r.status_code == 200, r.json()
 
 
 def test_health_and_config(client):
@@ -37,13 +60,18 @@ def test_health_and_config(client):
     assert cfg["transesterification"]["time"] == {"min": 30, "max": 180, "default": 120}
     assert cfg["esterification"]["current"] == {"min": 1, "max": 2, "default": 1}
     assert cfg["powerSupply"]["currentControl"] is False
-    assert cfg["ffaThreshold"] == 1 and cfg["wholeNumberInputs"] is True and cfg["autoAdvance"] is True
+    assert cfg["ffaThreshold"] == 3 and cfg["wholeNumberInputs"] is True and cfg["autoAdvance"] is True
     assert cfg["esterification"]["designFfa"] == 10 and cfg["esterification"]["stripMaxFfa"] == 5
-    assert cfg["pumps"]["acidRateMlPerMinute"] == 100 and cfg["drains"]["reactorMinutes"] == 1
-    assert cfg["drains"]["centrifugeMinutes"] == 2
+    # the oil pump and the dispensers run until the operator presses Done
+    assert cfg["pumps"] == {"oilPump": True, "stopStyle": "manual", "maxRunMinutes": 30}
+    assert "drains" not in cfg
+    # separation: per batch; the centrifuge speed is 800-1000 RPM, 900 by default
+    assert cfg["separation"] == {"timeMinutes": 60, "speedRpm": 900, "timeMin": 1, "timeMax": 180,
+                                 "speedMin": 800, "speedMax": 1000, "settleSeconds": 60}
     pur = cfg["purification"]
-    assert (pur["holdTemperature"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 95, 200)
-    assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settlingMinutes"], pur["maxDrainTemperature"]) == (10, 15, 10, 50)
+    assert (pur["holdTemperature"], pur["heaterPulseSeconds"], pur["maximumTemperature"], pur["stirringSpeedRpm"]) == (90, 10, 95, 200)
+    assert pur["pulseDropC"] == 0.2 and "holdBand" not in pur and "heatingTimeoutMinutes" not in pur
+    assert (pur["methanolRemovalMinutes"], pur["contactMinutes"], pur["settleSeconds"]) == (10, 10, 60)
     assert pur["magnesolGramsPerMlOil"] == 0.0092 and pur["bentoniteGramsPerMlOil"] == 0.0184
     assert pur["adsorbents"] == ["Magnesol", "Bentonite"] and pur["defaultAdsorbent"] == "Magnesol"
 
@@ -58,15 +86,28 @@ def test_settings_partial_update(client):
 
 
 def test_calculate(client):
-    q = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6, "catalyst": "NaOH"}).json()
-    assert round(q["esterificationMethanolMl"], 1) == 130.6 and round(q["catalystToWeighG"], 2) == 5.36
+    q = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 5, "catalyst": "NaOH"}).json()
+    assert round(q["esterificationMethanolMl"], 1) == 130.6 and round(q["catalystToWeighG"], 2) == 6.69
     assert q["uniformDose"] is True and q["doseFfa"] == 10
     assert q["magnesolG"] == 4.6                                        # 500 mL × 0.0092
-    assert client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6, "methanolRatio": 12}).status_code == 400
+    assert client.post("/api/calculate", json={"oilMassG": 460, "ffa": 5, "methanolRatio": 12}).status_code == 400
+    assert client.post("/api/calculate", json={"oilMassG": 460, "ffa": 6}).status_code == 422
     r = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 2.5})            # FFA is a whole percent
     assert r.status_code == 422 and r.json()["detail"] == "ffa: Use a whole number (no decimals)."
     b = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 1, "adsorbent": "Bentonite"}).json()
     assert b["esterificationNeeded"] is False and b["adsorbentG"] == 9.2
+
+
+def test_ffa_pathway_and_after_esterification_threshold(client):
+    direct = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 3}).json()
+    assert direct["esterificationNeeded"] is False
+    esterify = client.post("/api/calculate", json={"oilMassG": 460, "ffa": 4}).json()
+    assert esterify["esterificationNeeded"] is True
+    accepted = client.post("/api/calculate/after-esterification", json={"oilMassG": 460, "ffaAfter": 3}).json()
+    assert accepted["action"] == "transesterification" and accepted["ffa"] == 3
+    not_yet = client.post("/api/calculate/after-esterification", json={"oilMassG": 460, "ffaAfter": 4}).json()
+    assert not_yet["action"] == "anotherStage"
+    assert client.post("/api/calculate/after-esterification", json={"oilMassG": 460, "ffaAfter": 6}).status_code == 422
 
 
 def test_save_batch_and_lab_result(client):
@@ -84,9 +125,13 @@ def test_stage_controls(client):
     r = client.post("/api/process/stage/start", json={"stage": "Transesterification", "voltage": 30,
                                                       "time": 30, "stirring": 500})
     assert r.json()["state"] == "running"
-    assert client.post("/api/process/stage/pause").json()["state"] == "paused"
-    assert client.post("/api/process/stage/resume").json()["state"] == "running"
+    assert client.post("/api/process/stage/pause").status_code == 404      # no Pause / Resume any more
+    assert client.post("/api/process/stage/resume").status_code == 404
     assert client.post("/api/process/stage/complete").json()["state"] == "complete"
+    # separation waits for the gate valve after transesterification (no batch here: it doesn't)
+    assert client.get("/api/live").json()["gateValveWaiting"] is None
+    assert client.post("/api/process/separation/gate-valve-opened").status_code == 409
+    assert client.get("/api/process/stage").json()["stage"] == "Transesterification"
     bad = client.post("/api/process/stage/start", json={"stage": "Esterification", "voltage": 35})
     assert bad.status_code == 409
     client.post("/api/process/stage/reset")
@@ -97,14 +142,13 @@ def test_stage_controls(client):
 
 
 def test_purification_rules(client):
-    time.sleep(1.2)   # let the sensor loop take a reading
+    time.sleep(0.1)   # let the sensor loop take a reading
     assert client.post("/api/process/purification/start", json={"heaterSubmerged": True}).status_code == 409  # empty tank
-    client.post("/api/demo/load-oil", json={"volumeMl": 500})
-    client.post("/api/demo/add", json={"place": "purificationTank", "grams": 391})
-    time.sleep(1.2)
+    app.state.hw.fill_tank(391)
+    time.sleep(0.1)
     r = client.post("/api/process/purification/start", json={})   # level switch confirms it
     assert r.status_code == 200, r.json()
-    assert r.status_code == 200 and r.json()["phase"] == "heating"
+    assert r.status_code == 200 and r.json()["phase"] == "methanol"          # no heating step
     client.post("/api/process/purification/abort")
     assert client.get("/api/process/purification").json()["phase"] == "fault"
     assert client.post("/api/process/purification/acknowledge").json()["phase"] == "ready"
@@ -116,10 +160,9 @@ def test_heater_interlock(client):
     assert client.post("/api/control/all-off").json()["sensors"]["meshBedValveOpen"] is False
 
 
-def test_unexpected_error_returns_json(tmp_path):
+def test_unexpected_error_returns_json(mysql_db):
     """An unexpected error must come back as JSON, so the website shows it instead of going offline."""
     from app import db
-    config.DB_PATH = tmp_path / "api.db"
     original = db.list_batches
     db.list_batches = lambda: 1 / 0
     try:
@@ -133,125 +176,259 @@ def test_unexpected_error_returns_json(tmp_path):
 
 
 def test_whole_batch_moves_through_the_machine(client):
-    """Pumps load the doses, the outlet valves open by themselves after transesterification and
-    separation, and purification starts by itself once the biodiesel reaches the heater."""
+    """Oil pump and dispensers until Done; after transesterification a 1 min settle, then the
+    reactor pump, the centrifuge and pumpin together; purification starts when separation ends.
+    The handoffs are automatic even if the legacy stored flags are off."""
+    app.state.settings.auto_advance = False
+    app.state.settings.purification_auto_start = False
+    _quick(client)
     b = "B-FLOW-1"
-    client.post("/api/demo/load-oil", json={"volumeMl": 300})              # 276 g of oil
-    time.sleep(1.2)
-    assert client.get("/api/live").json()["sensors"]["oilMassG"] == 276
     app.state.purification.state["phase"] = "complete"                     # the previous batch's finished run
 
-    # esterification: pump B loads the H2SO4 + methanol premix
-    r = client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 63.5, "volumeMl": 79.1,
-                                                     "batchId": b, "stage": "Esterification"})
-    assert r.status_code == 200 and r.json()["phase"] == "pumping" and r.json()["startWeightG"] == 276
-    assert client.get("/api/live").json()["sensors"]["pumps"]["acid"] is True
+    # oil loading: the oil pump runs until the operator presses Done
+    r = client.post("/api/process/pump/start", json={"pump": "oil", "targetG": 276, "volumeMl": 300,
+                                                     "batchId": b, "stage": "Oil Loading"})
+    assert r.status_code == 200 and r.json()["phase"] == "pumping"
     busy = client.post("/api/process/stage/start", json={"stage": "Esterification", "batchId": b})
-    assert busy.status_code == 409 and "still loading" in busy.json()["detail"]
-    client.post("/api/process/pump/skip")
-    assert _wait_for(client, "/api/process/pump", "phase", ["done"])["deliveredG"] == 63.5
+    assert busy.status_code == 409 and "still pumping" in busy.json()["detail"]
+    time.sleep(0.3)
+    assert client.get("/api/process/pump").json()["phase"] == "pumping"    # no automatic stop
+    done = client.post("/api/process/pump/finish").json()
+    assert done["phase"] == "done" and done["deliveredG"] == 276
+    assert client.get("/api/live").json()["sensors"]["pumps"]["oil"] is False
+    assert client.post("/api/process/pump/finish").status_code == 409     # nothing running now
+
+    # esterification: pump B (H2SO4 + methanol), Done when its container is empty
+    client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 63.5, "volumeMl": 79.1,
+                                                 "batchId": b, "stage": "Esterification"})
+    assert client.get("/api/live").json()["sensors"]["pumps"]["acid"] is True
+    assert client.post("/api/process/pump/finish").json()["deliveredG"] == 63.5
     assert client.post("/api/process/stage/start", json={"stage": "Esterification", "batchId": b}).status_code == 200
     busy = client.post("/api/process/pump/start", json={"pump": "catalyst", "targetG": 10, "volumeMl": 10})
-    assert busy.status_code == 409                                         # no loading during a stage
+    assert busy.status_code == 409                                         # no pumping during a stage
     client.post("/api/process/stage/complete")
     client.post("/api/process/stage/reset")
 
-    # transesterification: pump A loads the NaOH + methanol premix
+    # transesterification: pump A (NaOH + methanol); the batch's separation time and speed go with it
     client.post("/api/process/pump/start", json={"pump": "catalyst", "targetG": 72.0, "volumeMl": 88.8,
                                                  "batchId": b, "stage": "Transesterification"})
-    client.post("/api/process/pump/skip")
-    _wait_for(client, "/api/process/pump", "phase", ["done"])
-    client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 276})
-    client.post("/api/process/stage/complete")
-    d = client.get("/api/process/drain").json()
-    assert d["valve"] == "reactor_outlet" and d["phase"] == "draining" and d["totalSeconds"] == 60   # 1 min
-    assert client.get("/api/live").json()["sensors"]["reactorValveOpen"] is True
-    client.post("/api/process/stage/reset")
-    busy = client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b})
-    assert busy.status_code == 409 and "reactor outlet" in busy.json()["detail"]
-    client.post("/api/process/drain/skip")
-    _wait_for(client, "/api/process/drain", "phase", ["done"])
-    assert client.get("/api/live").json()["sensors"]["reactorValveOpen"] is False
+    client.post("/api/process/pump/finish")
+    r = client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 276,
+                                                      "separationTime": 1, "separationSpeed": 1000})
+    assert r.status_code == 200, r.json()
+    done = client.post("/api/process/stage/complete").json()
+    assert done["stage"] == "Transesterification" and done["state"] == "complete"
 
-    # the reactor has drained: separation starts by itself (autoAdvance), then the centrifuge
-    # outlet opens and the biodiesel reaches the purification tank
-    st = _wait_for(client, "/api/process/stage", "state", ["running"])
-    assert st["stage"] == "Separation" and st["batchId"] == b
-    client.post("/api/process/stage/complete")
-    d = client.get("/api/process/drain").json()
-    assert d["valve"] == "centrifuge_outlet" and d["phase"] in ("waiting", "draining")
-    assert client.get("/api/live").json()["purificationAutoStart"] is None   # not while it drains
-    busy = client.post("/api/process/purification/start", json={"heaterSubmerged": True})
-    assert busy.status_code == 409
-    client.post("/api/process/drain/skip")
-    _wait_for(client, "/api/process/drain", "phase", ["done"])
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=3)
-    assert p["batchId"] == b and p["automatic"] is True and p["heaterOn"] is True
-    assert p["stirrerOn"] is True and p["stirringSpeed"] == 200 and p["targetTemperature"] == 90
+    # the operator is asked to open the gate valve (by hand, to 30°); separation waits for it
+    live = _live_until(client, lambda live: live.get("gateValveWaiting") == b)
+    assert live["gateValveWaiting"] == b and live["stage"]["stage"] == "Transesterification"
+    time.sleep(0.3)
+    assert client.get("/api/process/stage").json()["stage"] == "Transesterification"   # still waiting
+    opened = client.post("/api/process/separation/gate-valve-opened")
+    assert opened.status_code == 200, opened.json()
+    assert client.get("/api/live").json()["gateValveWaiting"] is None
+
+    # then separation starts: 1 min settle in the reactor (everything off) ...
+    st = _wait_for(client, "/api/process/stage", "stage", ["Separation"])
+    assert st["batchId"] == b and st["phase"] == "settling" and st["settleTotalSeconds"] == 60
+    sensors = client.get("/api/live").json()["sensors"]
+    assert not sensors["reactorValveOpen"] and not sensors["centrifugeValveOpen"]
+    # ... then the reactor pump, the centrifuge (1000 RPM) and pumpin together
+    st = _wait_for(client, "/api/process/stage", "phase", ["separating"], timeout=3)
+    assert st["timeMinutes"] == 1 and st["speedRpm"] == 1000
+    sensors = client.get("/api/live").json()["sensors"]
+    assert sensors["reactorValveOpen"] and sensors["centrifugeValveOpen"] and sensors["centrifugeRpm"] == 1000
+
+    # the separation timer ends: all three stop and purification starts at once
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=4)
+    sensors = client.get("/api/live").json()["sensors"]
+    assert not sensors["reactorValveOpen"] and not sensors["centrifugeValveOpen"] and sensors["centrifugeRpm"] == 0
+    assert p["batchId"] == b and p["automatic"] is True and p["heaterPulses"] >= 1   # first 10 s pulse at once
+    assert p["stirrerOn"] is True and p["stirrerRpm"] in (None, 200)         # RPM shown in methanol removal
+    assert p["stirringSpeed"] == 200 and p["targetTemperature"] == 90
     # from the batch's oil: 276 g ÷ 0.92 g/mL = 300 mL; Magnesol = 300 × 0.0092 = 2.76 -> 2.8 g
     assert p["magnesolG"] == 2.8 and p["oilWeightG"] == 276
-    assert p["methanolTotalSeconds"] == 600 and p["contactTotalSeconds"] == 900
+    assert p["methanolTotalSeconds"] == 300 and p["contactTotalSeconds"] == 60 and p["settleTotalSeconds"] == 60
     client.post("/api/process/purification/abort")
+    assert not any(client.get("/api/live").json()["sensors"]["valves"].values())
 
     saved = client.post("/api/batches", json={"id": b, "oilVolume": 300, "ffa": 5, "ffaAboveStrip": True,
                                               "esterificationRun": True}).json()
     labels = [e["label"] for e in saved["timeline"]]
-    for expected in ("Pump B loaded 63.5 g for Esterification", "Pump A loaded 72 g for Transesterification",
-                     "Reactor outlet valve opened", "Separation started", "Centrifuge outlet valve opened",
+    for expected in ("Oil pump started", "Pump B started", "Transesterification completed",
+                     "Waiting for the operator to open the gate valve (by hand, to 30°)",
+                     "Gate valve opened (by hand, to 30°)", "Separation started",
+                     "Separation pumps and centrifuge started", "Separation completed",
                      "Purification started automatically"):
         assert expected in labels, labels
-    assert any(label.startswith("Reactor outlet valve closed") for label in labels)
+    for prefix in ("Oil pump: all 276 g pumped in", "Pump B: all 63.5 g pumped in", "Pump A: all 72 g pumped in"):
+        assert any(label.startswith(prefix) for label in labels), labels
+    assert labels.index("Separation started") < labels.index("Separation pumps and centrifuge started")
+    assert labels.index("Gate valve opened (by hand, to 30°)") < labels.index("Separation started")
     assert saved["ffaAboveStrip"] is True
 
 
-def test_drain_time_zero_means_by_hand(client):
-    """With centrifugeDrainTime 0 the operator moves the biodiesel; purification is armed at once."""
-    client.put("/api/settings", json={"centrifugeDrainTime": 0})
-    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-HAND-1"})
+def test_emergency_stop_stops_the_separation(client):
+    client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": "B-ESTOP-1"})
     client.post("/api/process/stage/complete")
-    assert client.get("/api/process/drain").json()["phase"] == "idle"
-    assert client.get("/api/live").json()["purificationAutoStart"] == "B-HAND-1"
+    _live_until(client, lambda live: live.get("gateValveWaiting") == "B-ESTOP-1")
+    assert client.post("/api/process/separation/gate-valve-opened").status_code == 200
+    _wait_for(client, "/api/process/stage", "phase", ["separating"], timeout=3)
+    assert client.get("/api/live").json()["sensors"]["reactorValveOpen"] is True
+    live = client.post("/api/control/all-off").json()
+    assert not any(live["sensors"]["valves"].values()) and live["stage"]["state"] == "fault"
+    assert live["sensors"]["motorDuty"]["centrifuge"] == 0
+
+
+def test_emergency_stop_then_continue_with_the_time_left(client):
+    """No Pause: Emergency stop, then Start for the same stage and batch continues with the time it
+    had left (not from the beginning)."""
+    b = "B-CONT-1"
+    r = client.post("/api/process/stage/start", json={"stage": "Esterification", "batchId": b, "voltage": 20,
+                                                      "time": 30, "stirring": 500})
+    assert r.status_code == 200, r.json()
+    _wait_for(client, "/api/process/stage", "elapsedSeconds", list(range(3, 200)), timeout=6)
+    stopped = client.post("/api/process/stage/emergency-stop").json()
+    assert stopped["state"] == "fault" and stopped["faultReason"] == "emergency stop"
+    left = stopped["remainingSeconds"]
+    assert 0 < left < 30 * 60
+    time.sleep(0.3)
+    assert client.get("/api/process/stage").json()["remainingSeconds"] == left   # stopped: no countdown
+    again = client.post("/api/process/stage/start", json={"stage": "Esterification", "batchId": b, "voltage": 20,
+                                                          "time": 30, "stirring": 500}).json()
+    assert again["state"] == "running" and again["remainingSeconds"] <= left and again["elapsedSeconds"] > 0
+    client.post("/api/process/stage/emergency-stop")
+    labels = [e["label"] for e in app.state.records[b]["timeline"]]     # no saved batch: kept for the save
+    assert labels[:2] == ["Esterification started", "Esterification stopped (emergency stop)"], labels
+    assert labels[2].startswith("Esterification continued (") and labels[2].endswith(" s left)"), labels
+
+
+def test_settings_centrifuge_speed_800_to_1000(client):
+    assert client.put("/api/settings", json={"separationSpeed": 2600}).status_code == 400
+    assert client.put("/api/settings", json={"separationSpeed": 799}).status_code == 400
+    assert client.put("/api/settings", json={"separationSpeed": 950}).json()["separationSpeed"] == 950
+    assert client.get("/api/config").json()["separation"]["speedRpm"] == 950
+    client.put("/api/settings", json={"separationSpeed": 900})
+
+
+def test_separation_started_by_hand(client):
+    """The Separation step's Start (when it didn't start by itself): no settle, the batch's time
+    and speed, and purification is armed when it ends."""
+    r = client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-HAND-1",
+                                                      "separationTime": 1, "separationSpeed": 950})
+    st = r.json()
+    assert st["phase"] == "separating" and st["speedRpm"] == 950 and st["timeMinutes"] == 1
+    assert client.get("/api/live").json()["sensors"]["centrifugeValveOpen"] is True
+    bad = client.post("/api/process/stage/start", json={"stage": "Transesterification", "separationSpeed": 2600})
+    assert bad.status_code == 400 and "between 800 and 1000 RPM" in bad.json()["detail"]
+    _wait_for(client, "/api/process/stage", "state", ["complete"], timeout=3)
+    assert client.get("/api/live").json()["purificationAutoStart"] == "B-HAND-1"   # empty purifier: waits
+
+
+def _live_until(client, condition, timeout=6.0):
+    end = time.time() + max(timeout * 3, 20)
+    while True:
+        live = client.get("/api/live").json()
+        if condition(live) or time.time() > end:
+            assert condition(live), live
+            return live
+        time.sleep(0.1)
+
+
+def test_purification_waits_until_its_sensors_read_and_an_earlier_stop_is_acknowledged(client):
+    """After separation, purification never gives up by itself: with no temperature reading it
+    waits (nothing on) and says why, and starts once the reading is back. An earlier batch's safety
+    stop holds it until it is acknowledged."""
+    hw = app.state.hw
+    _quick(client)
+    hw.unplug("temperature")
+    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-WAIT-1", "separationTime": 1})
+    _wait_for(client, "/api/process/stage", "state", ["complete"], timeout=3)
+    hw.fill_tank(500)                                                   # the purifier is full
+    live = _live_until(client, lambda live: live["purificationWaiting"])
+    assert live["purificationAutoStart"] == "B-WAIT-1" and "No temperature reading" in live["purificationWaiting"]
+    assert live["alarm"].startswith("Purification is waiting: No temperature reading")
+    assert live["purification"]["phase"] == "ready" and not live["sensors"]["heaterOn"]
+    time.sleep(0.3)
+    assert client.get("/api/live").json()["purificationAutoStart"] == "B-WAIT-1"   # still waiting
+    hw.plug_in("temperature")
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=3)
+    assert p["batchId"] == "B-WAIT-1" and p["automatic"] is True
+    live = client.get("/api/live").json()
+    assert live["purificationAutoStart"] is None and live["purificationWaiting"] is None
+
+    # stopped by the operator: a safety stop the next batch has to see acknowledged
+    client.post("/api/process/purification/abort")
+    assert client.get("/api/process/purification").json()["phase"] == "fault"
+    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-WAIT-2", "separationTime": 1})
+    _wait_for(client, "/api/process/stage", "state", ["complete"], timeout=3)
+    hw.fill_tank(500)
+    live = _live_until(client, lambda live: live["purificationWaiting"])
+    assert "safety stop (stopped by operator)" in live["purificationWaiting"]
+    assert live["purification"]["phase"] == "fault" and live["purification"]["batchId"] == "B-WAIT-1"
+    client.post("/api/process/purification/acknowledge")
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=3)
+    assert p["batchId"] == "B-WAIT-2"
+    client.post("/api/process/purification/abort")
 
 
 def test_pump_and_valve_rules(client):
     client.post("/api/control/valve", json={"name": "reactor_outlet", "open": True})
     r = client.post("/api/control/pump", json={"name": "acid", "on": True})
-    assert r.status_code == 409 and "reactor outlet" in r.json()["detail"]
+    assert r.status_code == 409 and "reactor pump" in r.json()["detail"]
     r = client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 10, "volumeMl": 10})
     assert r.status_code == 409
     client.post("/api/control/valve", json={"name": "reactor_outlet", "open": False})
     assert client.post("/api/control/pump", json={"name": "acid", "on": True}).json()["pumps"]["acid"] is True
     off = client.post("/api/control/all-off").json()
-    assert off["sensors"]["pumps"] == {"catalyst": False, "acid": False}
+    assert off["sensors"]["pumps"] == {"catalyst": False, "acid": False, "oil": False}
 
 
 def test_emergency_stop_stops_pump(client):
-    client.post("/api/demo/load-oil", json={"volumeMl": 300})
-    time.sleep(1.2)
     client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 60, "volumeMl": 75})
     live = client.post("/api/control/all-off").json()
     assert live["pump"]["phase"] == "stopped" and live["sensors"]["pumps"]["acid"] is False
 
 
 def test_system_status_lists_the_new_parts(client):
-    time.sleep(1.2)
+    time.sleep(0.1)
     st = client.get("/api/system/status").json()
+    assert st["mode"] == "live"
     labels = [t["label"] for t in st["tiles"]]
-    assert {"Dosing Pumps", "Outlet Valves", "Output Load Cell", "Reactor Load Cell"} <= set(labels)
+    assert {"Dispensers", "Transfer Pumps", "Output Load Cell", "Oil Input"} <= set(labels)
+    assert "Reactor Load Cell" not in labels                       # not fitted
     tiles = {t["label"]: t for t in st["tiles"]}
     for name in ("Reactor Stirrer", "Centrifuge Motor", "Purification Stirrer", "Heater"):
         assert tiles[name]["value"] == "Ready" and tiles[name]["state"] == "ready"
     assert tiles["Electrodes"]["value"] == "Graphite – graphite"
+    assert tiles["Oil Input"]["value"] == "Oil pump"
     devices = {d["label"]: d["status"] for d in st["devices"]}
-    assert devices["Reactor outlet valve"] == "Closed" and devices["Dry wash stirrer"] == "Ready"
+    assert devices["Reactor pump (reactor → centrifuge)"] == "Off" and devices["Dry wash stirrer"] == "Ready"
     assert devices["Pump B (H₂SO₄ + methanol)"] == "Ready"
 
 
 def test_level_switch_blocks_and_stops_heater(client):
     """No biodiesel at the heater: manual start is refused, even with the confirmation ticked."""
-    time.sleep(1.2)   # demo machine starts empty
+    time.sleep(0.1)   # the purifier starts empty
     r = client.post("/api/process/purification/start", json={"heaterSubmerged": True})
     assert r.status_code == 409 and "level switch" in r.json()["detail"]
+
+
+def test_record_completion_of_purification_needs_a_running_purification(client):
+    r = client.post("/api/process/purification/complete")
+    assert r.status_code == 409 and "isn't running" in r.json()["detail"]
+
+
+def test_hardware_endpoints_without_the_esp32(client):
+    """Settings -> Hardware: without the ESP32 there is no controller, and Tare / Calibrate are refused."""
+    info = client.get("/api/hardware").json()
+    assert info["backend"] == "simulated" and "mock" not in info and info["fault"] is None
+    assert info["controller"] is None and info["loadCells"] == []
+    r = client.post("/api/hardware/load-cells/output/tare")
+    assert r.status_code == 409 and "ESP32 hardware mode" in r.json()["detail"]
+    assert client.post("/api/hardware/load-cells/output/calibrate", json={"grams": 0}).status_code == 422
+    r = client.post("/api/hardware/load-cells/output/check", json={"grams": 500})
+    assert r.status_code == 409 and "ESP32 hardware mode" in r.json()["detail"]
 
 
 def test_network_addresses(client):
@@ -261,16 +438,14 @@ def test_network_addresses(client):
 
 
 def test_magnesol_step_waits_for_the_operator(client):
-    client.post("/api/demo/load-oil", json={"volumeMl": 500})
-    client.post("/api/demo/add", json={"place": "purificationTank", "grams": 391})
-    time.sleep(1.2)
+    _quick(client)
+    app.state.hw.fill_tank(391)
+    time.sleep(0.1)
     r = client.post("/api/process/purification/start", json={"batchId": "B-MAG-1", "oilVolumeMl": 500})
     assert r.status_code == 200 and r.json()["magnesolG"] == 4.6
     assert client.post("/api/process/purification/magnesol-added").status_code == 409   # not asked yet
-    client.post("/api/process/purification/skip")                                        # heating
-    _wait_for(client, "/api/process/purification", "phase", ["methanol"])
-    client.post("/api/process/purification/skip")                                        # methanol removal
-    p = _wait_for(client, "/api/process/purification", "phase", ["magnesol"])
+    assert r.json()["phase"] == "methanol"                                              # straight away
+    p = _wait_for(client, "/api/process/purification", "phase", ["magnesol"], timeout=6)  # after 5 min
     assert p["heaterOn"] is False and p["stirrerOn"] is True
     time.sleep(1.5)
     assert client.get("/api/process/purification").json()["phase"] == "magnesol"         # still waiting
@@ -292,8 +467,8 @@ def test_overcurrent_stops_electrodes_with_a_warning(client):
 
 
 def test_heater_needs_the_stirrer(client):
-    client.post("/api/demo/add", json={"place": "purificationTank", "grams": 391})
-    time.sleep(1.2)
+    app.state.hw.fill_tank(391)
+    time.sleep(0.1)
     r = client.post("/api/control/heater", json={"on": True})
     assert r.status_code == 409 and "stirrer" in r.json()["detail"]
     client.post("/api/control/motor", json={"name": "purification_stirrer", "duty": 0.33})
@@ -301,15 +476,15 @@ def test_heater_needs_the_stirrer(client):
     client.post("/api/control/all-off")
 
 
-def test_auto_advance_can_be_turned_off(client):
-    """autoAdvance off: after the reactor drains, the operator starts the separation."""
+def test_legacy_auto_advance_setting_is_ignored(client):
+    """autoAdvance is a legacy column: the next process always starts at once (separation once the
+    gate valve is open)."""
     client.put("/api/settings", json={"autoAdvance": False})
     client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": "B-MAN-1"})
     client.post("/api/process/stage/complete")
-    client.post("/api/process/drain/skip")
-    _wait_for(client, "/api/process/drain", "phase", ["done"])
-    time.sleep(0.3)
-    assert client.get("/api/process/stage").json()["stage"] == "Transesterification"
+    _open_gate_valve(client, "B-MAN-1")
+    st = _wait_for(client, "/api/process/stage", "stage", ["Separation"])
+    assert st["state"] == "running"
 
 
 def test_saving_a_batch_never_fails_on_the_purification_record(client):
@@ -328,37 +503,184 @@ def test_whole_numbers_and_readable_errors(client):
     assert r.status_code == 422 and r.json()["detail"] == "voltage: Use a whole number (no decimals)."
     r = client.post("/api/process/pump/start", json={"pump": "acid", "volumeMl": 10})
     assert r.status_code == 422 and r.json()["detail"] == "targetG: Field required"   # names the field
-    assert client.post("/api/strip/read").json()["ffa"] in range(0, 6)
 
 
 def test_bentonite_batch(client):
-    """The adsorbent sent with the stages is used when purification starts by itself, and the
-    saved batch's materials count bentonite instead of Magnesol."""
+    """The adsorbent sent with the stages is used when purification starts by itself, the run goes
+    contact -> 1 min settle -> drain, and the saved batch's materials count bentonite."""
+    _quick(client)
     b = "B-BEN-1"
-    client.post("/api/demo/load-oil", json={"volumeMl": 500})
-    time.sleep(1.2)
+    app.state.hw.load_oil(500)
     client.post("/api/process/stage/start", json={"stage": "Transesterification", "batchId": b, "oilMassG": 460,
-                                                   "adsorbent": "Bentonite"})
+                                                   "adsorbent": "Bentonite", "separationTime": 1})
     client.post("/api/process/stage/complete")
-    client.post("/api/process/drain/skip")
-    _wait_for(client, "/api/process/stage", "stage", ["Separation"])
-    client.post("/api/process/stage/complete")
-    _wait_for(client, "/api/process/drain", "phase", ["waiting", "draining", "done"])
-    client.post("/api/process/drain/skip")
-    p = _wait_for(client, "/api/process/purification", "phase", ["heating"], timeout=4)
+    _open_gate_valve(client, b)
+    p = _wait_for(client, "/api/process/purification", "phase", ["methanol"], timeout=5)
     assert p["adsorbent"] == "Bentonite" and p["adsorbentG"] == 9.2 and p["magnesolG"] == 9.2
-    client.post("/api/process/purification/skip")
-    _wait_for(client, "/api/process/purification", "phase", ["methanol"])
-    client.post("/api/process/purification/skip")
-    _wait_for(client, "/api/process/purification", "phase", ["magnesol"])
+    _wait_for(client, "/api/process/purification", "phase", ["magnesol"], timeout=8)
     client.post("/api/process/purification/magnesol-added")
-    for _ in range(60):                                     # contact, settling, cooling, drain
-        if client.get("/api/process/purification").json()["phase"] in ("complete", "fault"):
-            break
-        client.post("/api/process/purification/skip")
-        time.sleep(0.15)
+    p = _wait_for(client, "/api/process/purification", "phase", ["settle"], timeout=3)
+    assert p["stirrerOn"] is False and p["valveOpen"] is False
+    p = _wait_for(client, "/api/process/purification", "phase", ["drain"], timeout=3)
+    assert client.get("/api/live").json()["sensors"]["meshBedValveOpen"] is True        # valve + pumpout
     p = _wait_for(client, "/api/process/purification", "phase", ["complete"], timeout=8)
+    assert p["stableSeconds"] >= 30 and 385 < p["outputWeightG"] < 395
+    assert not client.get("/api/live").json()["sensors"]["meshBedValveOpen"]
     saved = client.post("/api/batches", json={"id": b, "oilVolume": 500, "ffa": 1, "adsorbent": "Bentonite"}).json()
     assert saved["adsorbent"] == "Bentonite" and saved["purification"]["adsorbent"] == "Bentonite"
+    assert saved["purification"]["settlingTimeSeconds"] == 60
     assert saved["materials"]["bentoniteKg"] == 0.0092 and saved["materials"]["magnesolKg"] == 0
     assert "Bentonite added (9.2 g)" in [e["label"] for e in saved["timeline"]]
+
+
+# ---------- one batch at a time: start, continue, complete, cancel ----------
+def _count(sql, *args):
+    from app import db
+    with db.transaction() as cur:
+        cur.execute(sql, args)
+        return cur.fetchone()["n"]
+
+
+def test_only_one_batch_in_progress(client):
+    assert client.get("/api/batches/active").json() is None
+    preview = client.get("/api/batches/next-id").json()["id"]
+    r = client.post("/api/batches/start", json={"id": preview})
+    assert r.status_code == 201
+    b = r.json()
+    assert b["id"] == preview and b["status"] == "In Progress" and b["progress"] is None
+    assert [e["label"] for e in b["timeline"]] == ["Batch started"]
+    # it is in Batch History at once, and the next ID moves on
+    listed = client.get("/api/batches").json()
+    assert [(x["id"], x["status"]) for x in listed] == [(preview, "In Progress")]
+    assert client.get("/api/batches/next-id").json()["id"] != preview
+    # a second batch is refused; starting the same one again just returns it
+    r = client.post("/api/batches/start", json={})
+    assert r.status_code == 409 and f"Batch {preview} is still in progress" in r.json()["detail"]
+    r = client.post("/api/batches", json={"oilVolume": 500, "status": "In Progress"})
+    assert r.status_code == 409
+    assert client.post("/api/batches/start", json={"id": preview}).json()["id"] == preview
+    assert client.get("/api/batches/active").json()["id"] == preview
+    assert _count("SELECT COUNT(*) AS n FROM production_batches") == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_lab_results") == 0   # no lab result while it runs
+    # the analytics don't count it as an unfinished (failed) batch
+    assert client.get("/api/analytics/summary").json()["completionRate"] == 0
+
+
+def test_progress_is_saved_for_continuing(client):
+    b = client.post("/api/batches/start").json()["id"]
+    state = {"version": 1, "step": 3, "ffa": "4", "loads": {"Esterification 1": {"completedG": 63.5}}}
+    r = client.put(f"/api/batches/{b}/progress", json={
+        "stage": "Esterification", "state": state,
+        "batch": {"oilVolume": 500, "oilMassG": 460, "ffa": 4, "esterificationRun": True, "catalystType": "KOH",
+                  "yield": 99, "status": "Completed", "labResult": "Passed"}})   # results are ignored
+    assert r.status_code == 200
+    active = client.get("/api/batches/active").json()
+    assert active["progress"]["stage"] == "Esterification" and active["progress"]["state"] == state
+    assert active["currentStage"] == "Esterification"
+    assert (active["oilVolume"], active["ffa"], active["catalystType"]) == (500, 4, "KOH")
+    assert (active["status"], active["yield"], active["labResult"]) == ("In Progress", 0, "Pending")
+    assert client.get("/api/batches").json()[0]["currentStage"] == "Esterification"
+    # saved again: the same progress row is updated
+    client.put(f"/api/batches/{b}/progress", json={"stage": "Transesterification", "state": {"step": 4}})
+    assert _count("SELECT COUNT(*) AS n FROM batch_progress") == 1
+    assert client.get(f"/api/batches/{b}").json()["currentStage"] == "Transesterification"
+    assert client.put("/api/batches/B-NONE/progress", json={"stage": "Oil Loading"}).status_code == 404
+
+
+def test_completing_the_ongoing_batch_updates_its_row(client):
+    b = client.post("/api/batches/start").json()["id"]
+    client.put(f"/api/batches/{b}/progress", json={"stage": "Separation", "state": {}})
+    # what the machine does is written to the ongoing batch's timeline as it happens
+    client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b})
+    client.post("/api/process/stage/complete")
+    labels = [e["label"] for e in client.get(f"/api/batches/{b}").json()["timeline"]]
+    assert labels[:3] == ["Batch started", "Separation started", "Separation completed"]
+    client.post("/api/process/stage/reset")
+
+    saved = client.post("/api/batches", json={"id": b, "oilVolume": 500, "ffa": 1, "status": "Completed",
+                                              "biodieselOutputMl": 440, "reactionTime": 120}).json()
+    assert saved["status"] == "Completed" and saved["yield"] == 88.0 and saved["labResult"] == "Pending"
+    labels = [e["label"] for e in saved["timeline"]]
+    assert labels[0] == "Batch started" and labels[-1] == "Batch saved" and "Separation completed" in labels
+    # one row for the batch, one lab result row, no progress left; nothing is ongoing any more
+    assert _count("SELECT COUNT(*) AS n FROM production_batches WHERE batch_id = %s", b) == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_lab_results WHERE batch_id = %s", b) == 1
+    assert _count("SELECT COUNT(*) AS n FROM batch_progress") == 0
+    assert client.get("/api/batches/active").json() is None
+    assert "currentStage" not in client.get(f"/api/batches/{b}").json()
+    # saving it again changes nothing, and it can't be continued any more
+    again = client.post("/api/batches", json={"id": b, "oilVolume": 999, "status": "Completed"}).json()
+    assert again["oilVolume"] == 500 and len(again["timeline"]) == len(saved["timeline"])
+    assert client.put(f"/api/batches/{b}/progress", json={"stage": "Separation"}).status_code == 409
+    assert client.patch(f"/api/batches/{b}", json={"status": "In Progress"}).status_code == 409
+    # and the next batch can start
+    assert client.post("/api/batches/start").status_code == 201
+
+
+def test_cancel_the_ongoing_batch(client):
+    b = client.post("/api/batches/start").json()["id"]
+    cancelled = client.post(f"/api/batches/{b}/cancel").json()
+    assert cancelled["status"] == "Cancelled" and cancelled["labResult"] == "Not tested"
+    assert cancelled["timeline"][-1]["label"] == "Batch cancelled"
+    assert client.get("/api/batches/active").json() is None
+    assert client.post(f"/api/batches/{b}/cancel").status_code == 409
+    assert client.put(f"/api/batches/{b}/progress", json={"stage": "Oil Loading"}).status_code == 409
+    nxt = client.post("/api/batches/start").json()
+    assert nxt["id"] != b and nxt["status"] == "In Progress"
+    statuses = {x["id"]: x["status"] for x in client.get("/api/batches").json()}
+    assert statuses == {b: "Cancelled", nxt["id"]: "In Progress"}
+
+
+def test_the_machine_runs_only_the_ongoing_batch(client):
+    b = client.post("/api/batches/start").json()["id"]
+    r = client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": "B-OTHER"})
+    assert r.status_code == 409 and f"Batch {b} is in progress" in r.json()["detail"]
+    r = client.post("/api/process/pump/start", json={"pump": "acid", "targetG": 10, "volumeMl": 10, "batchId": "B-OTHER"})
+    assert r.status_code == 409
+    assert client.post("/api/process/stage/start", json={"stage": "Separation", "batchId": b}).status_code == 200
+    r = client.post(f"/api/batches/{b}/cancel")                   # not while it runs
+    assert r.status_code == 409 and "Separation is running" in r.json()["detail"]
+    client.post("/api/control/all-off")
+    assert client.post(f"/api/batches/{b}/cancel").status_code == 200
+
+
+def test_no_new_batch_while_the_machine_is_busy(client):
+    client.post("/api/process/stage/start", json={"stage": "Separation"})   # running without a batch
+    r = client.post("/api/batches/start")
+    assert r.status_code == 409 and "machine is still busy" in r.json()["detail"]
+    client.post("/api/control/all-off")
+    assert client.post("/api/batches/start").status_code == 201
+
+
+# ---------- lab results: one row per batch, its time kept ----------
+def test_lab_result_updates_one_row_and_keeps_its_time(client):
+    from datetime import datetime as dt
+
+    b = client.post("/api/batches", json={"oilVolume": 500, "ffa": 1, "status": "Completed"}).json()["id"]
+    lab_rows = lambda: _count("SELECT COUNT(*) AS n FROM batch_lab_results WHERE batch_id = %s", b)
+    assert lab_rows() == 1 and client.get(f"/api/batches/{b}").json()["labResult"] == "Pending"
+
+    # recorded on the website at 02:50:53 UTC: saved in the Pi's local time, in the same row
+    sent = "2026-10-15T02:50:53.250Z"
+    local = dt.fromisoformat("2026-10-15T02:50:53.250+00:00").astimezone().replace(tzinfo=None).isoformat()
+    r = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Passed", "labReference": "L-1", "testedAt": sent})
+    passed = r.json()
+    assert (passed["labResult"], passed["labReference"], passed["labTestedAt"]) == ("Passed", "L-1", local)
+    assert lab_rows() == 1
+    events = [e["label"] for e in passed["timeline"]]
+    assert events[-1] == "Lab result recorded: Passed (L-1)" and passed["timeline"][-1]["time"] == local
+
+    # the same result again: nothing changes, the first time stays
+    again = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Passed", "testedAt": "2026-10-16T00:00:00Z"}).json()
+    assert again["labTestedAt"] == local and len(again["timeline"]) == len(passed["timeline"])
+
+    # changed to Failed (no reference typed: the saved one stays), with a new time; still one row
+    failed = client.post(f"/api/batches/{b}/lab-result", json={"labResult": "Failed"}).json()
+    assert (failed["labResult"], failed["labReference"]) == ("Failed", "L-1") and failed["labTestedAt"] > local
+    assert lab_rows() == 1 and failed["timeline"][-1]["label"] == "Lab result recorded: Failed (L-1)"
+
+    # other saves of the batch never clear the time, even when asked to
+    for updates in ({"notes": "checked"}, {"labTestedAt": None}):
+        assert client.patch(f"/api/batches/{b}", json=updates).json()["labTestedAt"] == failed["labTestedAt"]
+    assert lab_rows() == 1
+    assert client.get("/api/batches").json()[0]["labTestedAt"] == failed["labTestedAt"]

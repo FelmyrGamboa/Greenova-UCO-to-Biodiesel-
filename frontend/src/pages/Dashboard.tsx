@@ -1,29 +1,14 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router";
-import { Card, Heading, Metric, Progress, Status } from "../components/ui";
+import { Link, useNavigate } from "react-router";
+import { batchTone, Button, Card, Dialog, Heading, Metric, Progress, Status } from "../components/ui";
 import { useLiveData } from "../contexts/LiveContext";
-import { getSystemStatus, useBatches, type PurificationPhase, type SystemStatus } from "../lib/api";
+import { getSystemStatus, useActiveBatch, useBatches, type PurificationPhase, type SystemStatus } from "../lib/api";
 import { useT } from "../lib/i18n";
 
-const demoDevices = [
-  { label: "Raspberry Pi", status: "Connected" },
-  { label: "Temperature Sensor", status: "Connected" },
-  { label: "Reaction Tank", status: "Ready" },
-  { label: "Pump A (NaOH/KOH + methanol)", status: "Ready" },
-  { label: "Pump B (H₂SO₄ + methanol)", status: "Ready" },
-  { label: "Reactor outlet valve", status: "Closed" },
-  { label: "Centrifuge", status: "Ready" },
-  { label: "Centrifuge outlet valve", status: "Closed" },
-  { label: "Dry wash stirrer", status: "Ready" },
-  { label: "Purification outlet valve", status: "Closed" },
-  { label: "Output load cell", status: "0.0 g" },
-];
-
-const PUMP_LABELS = { catalyst: "Pump A · NaOH/KOH + methanol", acid: "Pump B · H₂SO₄ + methanol" } as const;
-const VALVE_LABELS = { reactor_outlet: "reactor outlet", centrifuge_outlet: "centrifuge outlet" } as const;
+const PUMP_LABELS = { catalyst: "Pump A · NaOH/KOH + methanol", acid: "Pump B · H₂SO₄ + methanol", oil: "Oil pump" } as const;
 const PURIFICATION_STEP: Partial<Record<PurificationPhase, string>> = {
   heating: "Heating", methanol: "Methanol removal", magnesol: "Add adsorbent", contact: "Contact",
-  settling: "Settling", cooling: "Cooling", drain: "Draining",
+  settle: "Settling", drain: "Draining",
 };
 
 function deviceTone(status: string) {
@@ -34,11 +19,16 @@ function deviceTone(status: string) {
 
 export default function Dashboard() {
   const t = useT();
+  const navigate = useNavigate();
   const { batches, source } = useBatches();
   const { live, backend } = useLiveData();
+  // The batch in progress (only one at a time): it is continued, never started again.
+  const { active } = useActiveBatch();
+  const [startBlocked, setStartBlocked] = useState(false);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const completed = batches.filter((batch) => batch.status === "Completed");
-  const successRate = batches.length ? (completed.length / batches.length) * 100 : 0;
+  const finished = batches.filter((batch) => batch.status !== "In Progress");
+  const successRate = finished.length ? (completed.length / finished.length) * 100 : 0;
   const recent = batches.slice(0, 5);
 
   useEffect(() => {
@@ -58,24 +48,27 @@ export default function Dashboard() {
 
   const stage = live ? live.stage : null;
   const purification = live ? live.purification : null;
-  const stageActive = stage !== null && stage.stage !== null && (stage.state === "running" || stage.state === "paused");
+  const stageActive = stage !== null && stage.stage !== null && stage.state === "running";
   const purifying = purification !== null && purification.phase in PURIFICATION_STEP;
   const pump = live && live.pump.phase === "pumping" ? live.pump : null;
-  const drain = live && (live.drain.phase === "waiting" || live.drain.phase === "draining") ? live.drain : null;
-  const activeBatchId = stageActive && stage ? stage.batchId : purifying && purification ? purification.batchId
-    : pump ? pump.batchId : drain ? drain.batchId : null;
-  const activeStage = stageActive && stage && stage.stage
-    ? `${t(stage.stage)} · ${t(stage.state)}`
+  const liveBatchId = stageActive && stage ? stage.batchId : purifying && purification ? purification.batchId
+    : pump ? pump.batchId : null;
+  const settling = stageActive && stage?.stage === "Separation" && stage.phase === "settling";
+  // What the machine is doing right now (null when it is idle)
+  const liveStage = stageActive && stage && stage.stage
+    ? `${t(stage.stage)} · ${settling ? t("settling") : t(stage.state)}`
     : purifying && purification
       ? `${t("Purification")} · ${t(PURIFICATION_STEP[purification.phase] ?? "")}`
       : pump && pump.pump
-        ? `${t("Loading")} · ${pump.pump === "catalyst" ? t("pump A") : t("pump B")}`
-        : drain && drain.valve
-          ? `${t("Draining")} · ${t(VALVE_LABELS[drain.valve])}`
-          : null;
+        ? `${t("Pumping")} · ${t(PUMP_LABELS[pump.pump])}`
+        : null;
+  // A batch is ongoing while it is In Progress, even between steps when the machine is idle.
+  const ongoing = active !== null || liveStage !== null;
+  const ongoingId = active?.id ?? liveBatchId;
+  const stageText = liveStage ?? (active ? t(active.currentStage || "Volume & Parameters") : null);
   const sensors = live?.sensors;
-  const devices = systemStatus?.devices ?? demoDevices;
-  const readiness = systemStatus?.readiness ?? 100;
+  const devices = systemStatus?.devices ?? [];
+  const readiness = systemStatus?.readiness ?? 0;
 
   return (
     <div className="space-y-6">
@@ -85,13 +78,33 @@ export default function Dashboard() {
           <Heading as="h1" className="mt-2 text-3xl font-bold tracking-tight">{t("Dashboard")}</Heading>
           <p className="mt-2 text-sm text-gray-500">{t("A concise view of the current process, devices, and recent batch performance.")}</p>
         </div>
-        <Link to="/process" className="btn-primary">{t("Start New Process")} <span>→</span></Link>
+        {ongoing ? (
+          // Only one batch at a time: starting another is refused, and the ongoing one is offered instead.
+          <Button onClick={() => setStartBlocked(true)}>{t("Start New Process")} <span>→</span></Button>
+        ) : (
+          <Link to="/process" className="btn-primary">{t("Start New Process")} <span>→</span></Link>
+        )}
       </div>
 
+      {startBlocked && (
+        <Dialog
+          title={t("A batch is already in progress")}
+          onClose={() => setStartBlocked(false)}
+          actions={
+            <>
+              <Button variant="ghost" onClick={() => setStartBlocked(false)}>{t("Close")}</Button>
+              <Button onClick={() => navigate("/process")}>{t("Continue Process")} →</Button>
+            </>
+          }
+        >
+          {t("Batch {id} is still being processed ({stage}). Only one batch can be processed at a time: continue it, or cancel it on the Process page, before starting a new one.", { id: ongoingId ?? t("A batch"), stage: stageText ?? "—" })}
+        </Dialog>
+      )}
+
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Card className="p-5"><Metric label={t("Current Batch")} value={activeBatchId || (activeStage ? t("Unassigned") : t("No active batch"))} sub={activeStage ? t("In progress") : t("System ready")} /></Card>
-        <Card className="p-5"><Metric label={t("Current Stage")} value={activeStage ?? "—"} sub={activeStage ? (live?.mock ? t("Demonstration backend") : t("Live from the Raspberry Pi")) : t("Start a new process")} /></Card>
-        <Card className="p-5"><Metric label={t("Total Batches")} value={batches.length} sub={source === "backend" ? t("Raspberry Pi records") : t("Prototype dataset")} accent /></Card>
+        <Card className="p-5"><Metric label={t("Current Batch")} value={ongoingId || (ongoing ? t("Unassigned") : t("No active batch"))} sub={ongoing ? t("In progress") : t("System ready")} /></Card>
+        <Card className="p-5"><Metric label={t("Current Stage")} value={stageText ?? "—"} sub={liveStage ? t("Live from the Raspberry Pi") : ongoing ? t("Waiting for the operator") : t("Start a new process")} /></Card>
+        <Card className="p-5"><Metric label={t("Total Batches")} value={batches.length} sub={source === "offline" ? t("Raspberry Pi offline") : t("Raspberry Pi records")} accent /></Card>
         <Card className="p-5"><Metric label={t("Success Rate")} value={`${successRate.toFixed(1)}%`} sub={t("Completed batches")} accent /></Card>
       </div>
 
@@ -100,16 +113,32 @@ export default function Dashboard() {
           <div className="flex flex-col gap-4 border-b border-white/[0.06] p-6 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <Heading as="h2" className="text-lg font-semibold">{t("Current Process")}</Heading>
-              <p className="mt-1 text-sm text-gray-500">{activeStage ? t("{batch} is running.", { batch: activeBatchId ?? t("A batch") }) : t("No production batch is currently running.")}</p>
+              <p className="mt-1 text-sm text-gray-500">
+                {liveStage
+                  ? t("{batch} is running.", { batch: ongoingId ?? t("A batch") })
+                  : ongoing
+                    ? t("{batch} is in progress.", { batch: ongoingId ?? t("A batch") })
+                    : t("No production batch is currently running.")}
+              </p>
             </div>
-            {activeStage ? <Status tone="blue">{t("In progress")}</Status> : <Status>{t("System ready")}</Status>}
+            {ongoing ? <Status tone="blue">{t("In progress")}</Status> : <Status>{t("System ready")}</Status>}
           </div>
           <div className="p-6">
-            {activeStage !== null && stage !== null ? (
+            {ongoing && (liveStage === null || stage === null) ? (
+              // In progress, between steps (the machine is idle): waiting for the operator to continue it.
+              <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-6">
+                <div className="grid gap-5 sm:grid-cols-2">
+                  <Metric label={t("Batch")} value={ongoingId ?? "—"} accent />
+                  <Metric label={t("Stage")} value={stageText ?? "—"} />
+                </div>
+                <p className="mt-4 text-sm text-gray-500">{t("The batch is waiting for its next step. Continue it on the Process page: a new batch can't be started until this one is finished or cancelled.")}</p>
+                <Link to="/process" className="btn-primary mt-5">{t("Continue Process")} →</Link>
+              </div>
+            ) : liveStage !== null && stage !== null ? (
               <div className="rounded-xl border border-white/[0.07] bg-gv-inset p-6">
                 {/* only the running stage's own live readings */}
                 <div className="grid gap-5 sm:grid-cols-4">
-                  <Metric label={t("Stage")} value={stageActive && stage.stage ? t(stage.stage) : purifying ? t("Purification") : pump ? t("Loading") : t("Draining")} />
+                  <Metric label={t("Stage")} value={stageActive && stage.stage ? t(stage.stage) : purifying ? t("Purification") : t("Pumping")} />
                   {stageActive && stage.stage !== "Separation" && (
                     <>
                       <Metric label={t("Temperature")} value={sensors?.temperature == null ? "—" : `${sensors.temperature.toFixed(1)} °C`} />
@@ -117,13 +146,22 @@ export default function Dashboard() {
                       <Metric label={t("Current")} value={sensors?.current == null ? "—" : `${sensors.current.toFixed(2)} A`} />
                     </>
                   )}
-                  {stageActive && stage.stage === "Separation" && (
-                    <Metric label={t("Centrifuge")} value={sensors?.centrifugeRpm == null ? "—" : `${sensors.centrifugeRpm.toLocaleString()} RPM`} />
-                  )}
+                  {stageActive && stage.stage === "Separation" && (settling ? (
+                    <Metric label={t("Settling in the reactor")} value={`${stage.settleRemainingSeconds ?? 0} s`} />
+                  ) : (
+                    <>
+                      <Metric label={t("Centrifuge")} value={sensors?.centrifugeRpm == null ? "—" : `${sensors.centrifugeRpm.toLocaleString()} RPM`} sub={t("set speed")} />
+                      <Metric label={t("Reactor pump")} value={sensors?.reactorValveOpen ? t("On") : t("Off")} />
+                      <Metric label={t("Pumpin")} value={sensors?.centrifugeValveOpen ? t("On") : t("Off")} />
+                    </>
+                  ))}
                   {!stageActive && purifying && purification && (
                     <>
                       <Metric label={t("Temperature")} value={purification.liveTemperature == null ? "—" : `${purification.liveTemperature.toFixed(1)} °C`} />
-                      <Metric label={t("Stirrer")} value={purification.stirrerOn ? `${purification.stirrerRpm ?? "—"} / ${purification.stirringSpeed} RPM` : t("Off")} />
+                      {/* the stirrer's RPM (the speed the Pi's motor driver runs it at) is shown during methanol removal and contact */}
+                      {(purification.phase === "methanol" || purification.phase === "contact") && (
+                        <Metric label={t("Stirrer")} value={purification.stirrerOn ? `${purification.stirrerRpm ?? "—"} / ${purification.stirringSpeed} RPM` : t("Off")} />
+                      )}
                       {purification.phase === "drain" && <Metric label={t("Collected")} value={`${(purification.outputWeightG ?? 0).toFixed(1)} g`} />}
                     </>
                   )}
@@ -132,17 +170,11 @@ export default function Dashboard() {
                   <div className="mt-5"><Progress value={(stage.elapsedSeconds / (stage.timeMinutes * 60)) * 100} /></div>
                 ) : null}
                 {pump && pump.pump && (
-                  <div className="mt-5">
-                    <div className="mb-2 flex justify-between text-xs text-gray-500"><span>{t(PUMP_LABELS[pump.pump])}</span><span className="font-mono">{pump.deliveredG.toFixed(1)} / {pump.targetG.toFixed(1)} g</span></div>
-                    <Progress value={pump.targetG ? (pump.deliveredG / pump.targetG) * 100 : 0} />
-                  </div>
-                )}
-                {drain && drain.valve && (
                   <p className="mt-5 text-xs text-gray-500">
-                    {drain.phase === "waiting" ? t("Waiting for the centrifuge to stop, then the {valve} opens.", { valve: t(VALVE_LABELS[drain.valve]) }) : t("The {valve} is open · {time} left.", { valve: t(VALVE_LABELS[drain.valve]), time: `${Math.floor(drain.remainingSeconds / 60)}:${String(drain.remainingSeconds % 60).padStart(2, "0")}` })}
+                    {t("{pump} is emptying its container ({grams} g measured) into the reactor · {seconds} s. Press Done on the Process page when it is empty.", { pump: t(PUMP_LABELS[pump.pump]), grams: pump.targetG.toFixed(1), seconds: pump.elapsedSeconds })}
                   </p>
                 )}
-                <Link to="/process" className="btn-secondary mt-5">{t("Open Process")}</Link>
+                <Link to="/process" className="btn-primary mt-5">{t("Continue Process")} →</Link>
               </div>
             ) : (
               <div className="rounded-xl border border-dashed border-white/[0.1] bg-gv-inset px-6 py-10 text-center">
@@ -164,8 +196,11 @@ export default function Dashboard() {
         <Card className="p-6">
           <div className="flex items-center justify-between">
             <Heading as="h2" className="text-lg font-semibold">{t("System Status")}</Heading>
-            <span className="text-[10px] uppercase tracking-widest text-gray-600">{systemStatus ? t("Live") : t("Demo")}</span>
+            <span className="text-[10px] uppercase tracking-widest text-gray-600">{systemStatus ? t("Live") : t("Offline")}</span>
           </div>
+          {!systemStatus && (
+            <p className="mt-5 text-sm text-gray-500">{backend ? t("Reading the devices…") : t("The Raspberry Pi can't be reached. Check that it is on and on the same network, and that the Greenova service is running.")}</p>
+          )}
           <div className="mt-5 space-y-1">
             {devices.map((device) => (
               <div key={device.label} className="flex items-center justify-between border-b border-white/[0.05] py-3 last:border-0">
@@ -188,26 +223,33 @@ export default function Dashboard() {
         <div className="flex items-center justify-between border-b border-white/[0.06] px-6 py-5">
           <div>
             <Heading as="h2" className="text-lg font-semibold">{t("Recent Batch Performance")}</Heading>
-            <p className="mt-1 text-xs text-gray-600">{source === "backend" ? t("Raspberry Pi records") : t("Sample prototype values")}</p>
+            <p className="mt-1 text-xs text-gray-600">{source === "offline" ? t("Raspberry Pi offline") : t("Raspberry Pi records")}</p>
           </div>
           <Link to="/batches" className="text-sm font-medium text-green-400 hover:text-green-300">{t("View Batch History")} →</Link>
         </div>
         <div className="overflow-x-auto">
           <table className="gv-table min-w-[700px]">
-            <thead><tr><th>{t("Batch")}</th><th>{t("Yield")}</th><th>{t("Energy")}</th><th>{t("Duration")}</th><th>{t("Status")}</th></tr></thead>
+            <thead><tr><th>{t("Batch")}</th><th>{t("Date")}</th><th>{t("Yield")}</th><th>{t("Duration")}</th><th>{t("Lab Test")}</th><th>{t("Status")}</th></tr></thead>
             <tbody>
               {recent.length > 0 ? (
-                recent.map((batch) => (
-                  <tr key={batch.id}>
-                    <td className="font-mono !text-green-400">{batch.id}</td>
-                    <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
-                    <td>{batch.energy} kWh</td>
-                    <td>{batch.duration} min</td>
-                    <td><Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status></td>
-                  </tr>
-                ))) : (
+                recent.map((batch) => {
+                  const running = batch.status === "In Progress";
+                  return (
+                    <tr key={batch.id}>
+                      <td className="font-mono !text-green-400">{running ? <Link to="/process">{batch.id}</Link> : batch.id}</td>
+                      <td>{new Date(batch.date).toLocaleDateString()}</td>
+                      <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
+                      <td>{running ? "—" : `${batch.duration} min`}</td>
+                      <td>{running ? "—" : <Status tone={batch.labResult === "Passed" ? "green" : batch.labResult === "Failed" ? "red" : batch.labResult === "Pending" ? "yellow" : "neutral"}>{t(batch.labResult)}</Status>}</td>
+                      <td>
+                        <Status tone={batchTone(batch.status)}>{t(batch.status)}</Status>
+                        {running && batch.currentStage && <div className="mt-1 text-[10px] text-gray-600">{t(batch.currentStage)}</div>}
+                      </td>
+                    </tr>
+                  );
+                })) : (
                   <tr>
-                    <td colSpan={5} className="py-12 text-center">
+                    <td colSpan={6} className="py-12 text-center">
                       <div className="flex flex-col items-center gap-2">
                         <p className="text-sm font-medium text-gray-400">
                           {t("No batch records yet")}
@@ -219,15 +261,6 @@ export default function Dashboard() {
                     </td>
                   </tr>
                 )}
-              {/* {recent.map((batch) => (
-                <tr key={batch.id}>
-                  <td className="font-mono !text-green-400">{batch.id}</td>
-                  <td>{batch.yield ? `${batch.yield}%` : "—"}</td>
-                  <td>{batch.energy} kWh</td>
-                  <td>{batch.duration} min</td>
-                  <td><Status tone={batch.status === "Completed" ? "green" : "red"}>{t(batch.status)}</Status></td>
-                </tr>
-              ))} */}
             </tbody>
           </table>
         </div>

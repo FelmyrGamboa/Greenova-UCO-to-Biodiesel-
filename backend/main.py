@@ -27,6 +27,7 @@ def main() -> int:
     sys.path.insert(0, str(BACKEND))
     try:
         import fastapi  # noqa: F401
+        import pymysql  # noqa: F401   (MySQL driver)
         import uvicorn
     except ImportError:
         python = venv_python()
@@ -39,6 +40,9 @@ def main() -> int:
               "Then run  python main.py  again.")
         return 1
 
+    from app import config                 # the MySQL login: backend/.env or app/config.py
+    print(f"MySQL: {config.DB_USER}@{config.DB_HOST}:{config.DB_PORT}, database {config.DB_NAME}"
+          + ("" if config.ENV_FILE.is_file() else "   (no backend\\.env: using app/config.py)"))
     print("Greenova backend: http://localhost:8000   (API docs: http://localhost:8000/docs)")
     print("Leave this window open. Press Ctrl+C to stop.")
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, reload_dirs=[str(BACKEND / "app")])

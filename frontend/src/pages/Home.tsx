@@ -18,7 +18,7 @@ const features = [
   ["Electrochemical Processing", "Supports electrochemical esterification and transesterification stages."],
   ["Live Parameters", "Follow temperature, reaction time, stirring speed, power, and stage status."],
   ["Centrifugal Separation", "Tracks the automatic separation of biodiesel and glycerin."],
-  ["Batch Analytics", "Records production volume, energy use, yield, and total process duration."],
+  ["Batch Analytics", "Completion and lab pass rates, mean and range of yield and cost per liter per FFA range, and the proven settings."],
   ["Historical Comparison", "Compare previous batches and observe relationships in recorded data."],
 ];
 
@@ -94,7 +94,7 @@ export default function Home() {
                 {t("Greenova is an electrochemical biodiesel production and monitoring platform focused on process control, operator guidance, and reliable batch documentation.")}
               </p>
               <p>
-                {t("It brings electrochemical production, centrifugal separation, dry-wash purification, energy and yield tracking, and historical batch comparison into one simple operating workspace.")}
+                {t("It brings electrochemical production, centrifugal separation, dry-wash purification, yield tracking, and historical batch comparison into one simple operating workspace.")}
               </p>
             </div>
           </div>
