@@ -1,0 +1,12 @@
+# Not copied into the Docker image (dockerfiles/backend.Dockerfile)
+.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.env
+data/
+hardware.toml
+loadcell_calibration.json
+loadcell_calibration.json.tmp
+frontend/
+tests/
